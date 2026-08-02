@@ -158,6 +158,36 @@ describe("adaptive run decision v1", () => {
     })).toBeNull();
   });
 
+  test("rejects hash-valid-looking decisions whose hashed body was tampered", () => {
+    const decision = createAdaptiveRunDecisionV1({
+      contract: contract(),
+      reason: "active_compute_limit",
+      verifiedTrackCount: 73,
+      remainingStrategyCount: 2,
+      limitingClauseIds: ["prompt:era:1970s"],
+      reachedAt: new Date("2026-07-23T12:00:00.000Z"),
+    });
+    expect(publicAdaptiveRunDecisionV1({
+      ...decision,
+      verifiedTrackCount: 72,
+    })).toBeNull();
+    expect(publicAdaptiveRunDecisionV1({
+      ...decision,
+      contractRevisionId: `${decision.contractRevisionId}:tampered`,
+    })).toBeNull();
+    expect(publicAdaptiveRunDecisionV1({
+      ...decision,
+      actions: {
+        ...decision.actions,
+        anotherBoundedPass: false,
+      },
+    })).toBeNull();
+    expect(publicAdaptiveRunDecisionV1({
+      ...decision,
+      decisionHash: "0".repeat(64),
+    })).toBeNull();
+  });
+
   test("does not advertise a policy-invalid partial when playlist constraints fail", () => {
     const decision = createAdaptiveRunDecisionV1({
       contract: contract(),

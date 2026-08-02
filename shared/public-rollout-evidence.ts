@@ -31,6 +31,7 @@ export const PUBLIC_ROLLOUT_REQUIRED_PRODUCTION_GATES = [
 ] as const;
 
 export const PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS = Object.freeze({
+  editorial_influence: "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
   genre_scene: "PIPELINE_V3_GENRE_SCENE_PERCENT",
   mood_activity_theme: "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
   similarity: "PIPELINE_V3_SIMILARITY_PERCENT",
@@ -175,9 +176,9 @@ const RC_TAG = /^v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)-rc\.[1-9]\d*$/u
 const IMAGE_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const SAFE_RELEASE_LABEL = /^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,159}$/u;
 const ROLLOUT_STAGE =
-  /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u;
+  /^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u;
 const SAFE_OWNER_GROUPS =
-  /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive)(?:,(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive))*$/u;
+  /^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive)(?:,(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive))*$/u;
 const PERCENT_FLAGS = Object.values(PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS);
 export const PUBLIC_ROLLOUT_TARGET_CONFIGURATION_KEYS = [
   "PIPELINE_V2_OWNER_CANARY",
@@ -311,7 +312,6 @@ function targetConfiguration(value: unknown): PublicRolloutConfiguration {
     PIPELINE_V3_PROOF_ARCHITECTURE_MODE: "native",
     PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     GUIDANCE_CONTRACT_V3_ENABLED: "false",
-    GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
     GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "false",
   };
   for (const [name, expected] of Object.entries(exactLiterals)) {
@@ -323,6 +323,7 @@ function targetConfiguration(value: unknown): PublicRolloutConfiguration {
     "PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED",
     "PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED",
     "PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED",
+    "GUIDANCE_CONTRACT_V3_OWNER_CANARY",
   ] as const) {
     booleanLiteral(result[name], `public rollout targetConfiguration.${name}`);
   }
@@ -1026,10 +1027,13 @@ function payloadValidator(
     );
   }
   if (
-    targetPercentages.PIPELINE_V3_GENRE_SCENE_PERCENT !== "0"
+    (
+      targetPercentages.PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT !== "0"
+      || targetPercentages.PIPELINE_V3_GENRE_SCENE_PERCENT !== "0"
+    )
     && target.PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED !== "true"
   ) {
-    throw new Error("genre-scene rollout requires signed genre-scene evidence approval");
+    throw new Error("editorial-influence or genre-scene rollout requires signed genre-scene evidence approval");
   }
   if (
     (
@@ -1833,9 +1837,10 @@ export function verifyPreviousPublicRolloutLineage(
  * Finalization consumes the last fully rolled-out intent as proof that every
  * governed backend cohort reached 100% while Sites still exposed the exact
  * pre-candidate identity. This verifier intentionally accepts no caller-owned
- * scope relaxation: the transition must be an advance to 100%, every target
- * percentage must be 100%, and the evidence must be fresh and chained to the
- * exact promotion artifact and runtime.
+ * scope relaxation: v2.5.4 finalization is authorized only by the signed
+ * editorial-influence transition to 100%. Every unrelated intent must remain
+ * exactly at its signed pre-transition baseline, and the evidence must be
+ * fresh and chained to the exact promotion artifact and runtime.
  */
 export function verifyPublicRolloutFinalizationLineage(
   value: unknown,
@@ -1893,18 +1898,32 @@ export function verifyPublicRolloutFinalizationLineage(
       "public rollout finalization lineage does not bind the exact pre-Sites promotion",
     );
   }
-  if (result.operation !== "advance" || result.toPercent !== "100") {
-    throw new Error(
-      "finalization requires a completed signed backend cohort rollout to 100%",
-    );
-  }
   if (
-    Object.values(publicRolloutPercentages(result.targetConfiguration))
-      .some((percentage) => percentage !== "100")
+    result.operation !== "advance"
+    || result.intentGroup !== "editorial_influence"
+    || result.toPercent !== "100"
   ) {
     throw new Error(
-      "finalization requires every governed intent cohort at 100%",
+      "finalization requires the completed signed editorial-influence rollout to 100%",
     );
+  }
+  const targetPercentages = publicRolloutPercentages(
+    result.targetConfiguration,
+  );
+  const changedFlag =
+    PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS.editorial_influence;
+  if (targetPercentages[changedFlag] !== "100") {
+    throw new Error(
+      "finalization requires editorial influence at 100%",
+    );
+  }
+  for (const flag of Object.values(PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS)) {
+    if (flag === changedFlag) continue;
+    if (targetPercentages[flag] !== result.currentPercentages[flag]) {
+      throw new Error(
+        "finalization may not change unrelated governed intent cohorts",
+      );
+    }
   }
   const minimumSoakStartedAt = isoTimestamp(
     options.minimumSoakStartedAt,

@@ -7,7 +7,7 @@ const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u;
 
 describe("application release metadata", () => {
   test("uses one current semantic version throughout the application", () => {
-    expect(releaseManifest.schemaVersion).toBe(1);
+    expect(releaseManifest.schemaVersion).toBe(2);
     expect(currentRelease).toBe(releaseHistory[0]);
     expect(currentRelease.version).toBe(packageMetadata.version);
     expect(currentRelease.version).toMatch(semver);
@@ -20,14 +20,22 @@ describe("application release metadata", () => {
       expect(release.version).toMatch(semver);
       expect(versions.has(release.version)).toBe(false);
       versions.add(release.version);
-      expect(release.releasedAt).toMatch(/^\d{4}-\d{2}-\d{2}$/u);
-      expect(Number.isNaN(Date.parse(`${release.releasedAt}T00:00:00.000Z`))).toBe(false);
-      expect(dates.has(`${release.version}:${release.releasedAt}`)).toBe(false);
-      dates.add(`${release.version}:${release.releasedAt}`);
+      if (release.status === "candidate") {
+        expect(index).toBe(0);
+        expect(release.releasedAt).toBeNull();
+      } else {
+        expect(release.releasedAt).toMatch(/^\d{4}-\d{2}-\d{2}$/u);
+        expect(Number.isNaN(Date.parse(`${release.releasedAt}T00:00:00.000Z`))).toBe(false);
+        expect(dates.has(`${release.version}:${release.releasedAt}`)).toBe(false);
+        dates.add(`${release.version}:${release.releasedAt}`);
+      }
       expect(release.title.trim().length).toBeGreaterThanOrEqual(3);
       expect(release.notes.length).toBeGreaterThan(0);
       for (const note of release.notes) expect(note.trim().length).toBeGreaterThanOrEqual(8);
-      if (index > 0) expect(release.releasedAt <= releaseHistory[index - 1]!.releasedAt).toBe(true);
+      if (index > 1) {
+        expect(release.releasedAt! <= releaseHistory[index - 1]!.releasedAt!)
+          .toBe(true);
+      }
     }
   });
 

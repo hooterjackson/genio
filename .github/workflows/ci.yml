@@ -182,6 +182,64 @@ jobs:
             test-results/
           if-no-files-found: ignore
 
+  stitched-system:
+    needs: [static]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+        env:
+          POSTGRES_DB: needle
+          POSTGRES_USER: needle
+          POSTGRES_PASSWORD: needle
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U needle -d needle"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle
+      APP_ORIGIN: http://localhost:3000
+      RAILWAY_API_BASE: http://127.0.0.1:8788
+      GATEWAY_KEY_ID: ci-system-v1
+      GATEWAY_HMAC_SECRET: 0123456789abcdef0123456789abcdef
+      IP_HASH_SECRET: abcdef0123456789abcdef0123456789
+      CAPABILITY_PEPPER: fedcba9876543210fedcba9876543210
+      CAPABILITY_PEPPER_VERSION: ci-system-capability-v1
+      SESSION_SECRET: 00112233445566778899aabbccddeeff
+      OWNER_EMAIL: owner@example.com
+      OWNER_ALLOWLIST_VERSION: ci-system-owner-allowlist-v1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test:database:preflight
+      - run: pnpm db:migrate
+      - name: Install headless Chromium
+        run: pnpm exec playwright install --with-deps chromium-headless-shell
+      - name: Run mandatory stitched API-worker-database-browser suite
+        run: pnpm test:e2e:system
+      - name: Upload stitched-system failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: stitched-system
+          path: |
+            playwright-report/
+            test-results/
+          if-no-files-found: ignore
+
   aggregate-exact-sha:
     name: aggregate exact-SHA gate
     if: always()
@@ -191,6 +249,7 @@ jobs:
       - unit-and-database
       - production-database-compatibility
       - browser
+      - stitched-system
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

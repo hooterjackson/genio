@@ -170,6 +170,8 @@ test("Sites gateway uses an explicit route matrix and rejects cross-site mutatio
     "/api/v1/runs/run-id/manifest-canary-evidence",
   )).toMatchObject({ method: "GET" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/research/continue")).toMatchObject({ method: "POST" });
+  expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/dependency/resume")).toMatchObject({ method: "POST" });
+  expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/replay-after-repair")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/partial/confirm")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/cancel")).toMatchObject({ method: "POST" });
   expect(matchGatewayRoute("POST", "/api/v1/runs/run-id/explore")).toMatchObject({ method: "POST" });

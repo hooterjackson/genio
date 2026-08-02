@@ -8,11 +8,16 @@ import type {
   PartialPublicationActionView,
   PlaylistBrief,
   ResearchRunView,
+  RunDecisionActionView,
   RunResolutionView,
 } from "../shared/types.ts";
+import {
+  ADAPTIVE_RUN_DECISION_SCHEMA_V1,
+} from "../server/adaptive-run-decision-v1.ts";
 import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 import { predicateYieldRescueGuidanceDecisionV3 } from "../server/adaptive-guidance-v3.ts";
 import { publicGuidanceQuestionV3 } from "../server/adaptive-guidance-contract-bridge.ts";
+import { sha256Hex, stableStringify } from "../server/security.ts";
 
 const brief: PlaylistBrief = {
   title: "French jazz",
@@ -59,6 +64,51 @@ describe("public API projections", () => {
     contractHash: "c".repeat(64),
     blocker: null,
   });
+  const hashedAdaptiveDecision = (
+    body: Omit<RunDecisionActionView, "kind" | "decisionHash">,
+  ): RunDecisionActionView => ({
+    kind: "research_boundary",
+    decisionHash: sha256Hex(stableStringify({
+      schemaVersion: ADAPTIVE_RUN_DECISION_SCHEMA_V1,
+      ...body,
+    })),
+    ...body,
+  });
+  const adaptiveDecision = (
+    action: "review_contract" | "resume_research",
+  ): RunDecisionActionView => hashedAdaptiveDecision({
+    contractRevisionId: "pcr1:public-projection",
+    contractSemanticHash: "c".repeat(64),
+    reason: action === "resume_research"
+      ? "dependency_retry_window_expired" as const
+      : "runtime_feasibility_unknown" as const,
+    targetTrackCount: 50,
+    verifiedTrackCount: 0,
+    remainingStrategyCount: 0,
+    consumedActiveComputeMs: 0,
+    activeComputeLimitMs: 900_000,
+    activeComputeExtensionsUsed: 0,
+    namedPredicates: action === "review_contract"
+      ? [{ clauseId: "membership:irish", label: "Irish music" }]
+      : [],
+    interpretationSummary: {
+      mustHave: ["Irish music"],
+      prefer: [],
+      avoid: [],
+      flow: [],
+      count: 50,
+    },
+    actions: {
+      anotherBoundedPass: false,
+      reviseNamedPredicate: action === "review_contract",
+      reduceCount: false,
+      publishVerifiedPartial: false,
+      pause: true,
+      resumeLater: action === "resume_research",
+      cancel: true,
+    },
+    reachedAt: "2026-08-02T00:00:00.000Z",
+  });
 
   test("preserves the V4 interpretation checkpoint without leaking unrelated brief internals", () => {
     const view = publicBriefStatusView({
@@ -91,13 +141,39 @@ describe("public API projections", () => {
     expect(view).not.toHaveProperty("privateCompilerTrace");
   });
 
+  test("projects only the hash-bound execution-decision action", () => {
+    const executionAction = {
+      decisionHash: "a".repeat(64),
+      optionId: "review_interpretation",
+      kind: "review_interpretation" as const,
+      startsResearch: false,
+      actionHash: "b".repeat(64),
+    };
+    const view = publicBriefStatusView({
+      requestId: "brief-review",
+      prompt: "Kind of Blue in order",
+      requestedTrackCount: 25,
+      status: "review_required",
+      briefContractVersion: 3,
+      executionAction,
+      questions: [],
+      internalIdempotencyKey: "must-not-leak",
+    });
+    expect(view).toMatchObject({
+      status: "review_required",
+      executionAction,
+      questions: [],
+    });
+    expect(view).not.toHaveProperty("internalIdempotencyKey");
+  });
+
   test("narrows owner-only and unimplemented run actions to visitor-supported paths", () => {
     expect(publicRunResolutionView(
       resolution("answer_rescue_guidance", "needs_input"),
       null,
     )).toMatchObject({
-      state: "needs_decision",
-      nextAction: "review_contract",
+      state: "quarantined",
+      nextAction: "contact_support",
     });
     expect(publicRunResolutionView(
       resolution("authorize_apple", "blocked_dependency"),
@@ -110,8 +186,8 @@ describe("public API projections", () => {
       resolution("resume_research", "blocked_dependency"),
       null,
     )).toMatchObject({
-      state: "needs_decision",
-      nextAction: "review_contract",
+      state: "quarantined",
+      nextAction: "contact_support",
     });
   });
 
@@ -278,6 +354,7 @@ describe("public API projections", () => {
   test("preserves an actionable canonical capability decision without exposing blocker internals", () => {
     expect(publicRunResolutionView({
       ...resolution("review_contract"),
+      contractSemanticRevisionId: "pcr1:public-projection",
       blocker: {
         kind: "scope_decision",
         nextRetryAt: null,
@@ -285,11 +362,12 @@ describe("public API projections", () => {
         retryCount: 0,
         versionHash: null,
       },
-    }, null)).toEqual({
+    }, null, null, adaptiveDecision("review_contract"))).toEqual({
       state: "needs_decision",
       nextAction: "review_contract",
       terminal: false,
       contractRevisionId: "contract-id",
+      contractSemanticRevisionId: "pcr1:public-projection",
       contractRevision: 3,
       contractHash: "c".repeat(64),
       blocker: {
@@ -300,12 +378,69 @@ describe("public API projections", () => {
         versionHash: null,
       },
     });
+    expect(publicRunResolutionView({
+      ...resolution("review_contract"),
+      contractSemanticRevisionId: "pcr1:other",
+    }, null, null, adaptiveDecision("review_contract"))).toMatchObject({
+      state: "quarantined",
+      nextAction: "contact_support",
+      contractRevisionId: "contract-id",
+      contractSemanticRevisionId: "pcr1:other",
+    });
+    expect(publicRunResolutionView(
+      resolution("review_contract"),
+      null,
+      null,
+      adaptiveDecision("review_contract"),
+    )).toMatchObject({
+      state: "quarantined",
+      nextAction: "contact_support",
+      contractRevisionId: "contract-id",
+    });
+  });
+
+  test("fails closed for paused or stalled work and preserves truthful motion", () => {
+    expect(publicRunResolutionView({
+      ...resolution("none", "publishing"),
+      workMotion: "paused",
+      selectedTrackCount: 25,
+      manifestedTrackCount: 25,
+      appendedTrackCount: 0,
+      reconciledPublishedTrackCount: null,
+    }, null)).toMatchObject({
+      state: "quarantined",
+      nextAction: "contact_support",
+      workMotion: "paused",
+      selectedTrackCount: 25,
+      manifestedTrackCount: 25,
+      appendedTrackCount: 0,
+      reconciledPublishedTrackCount: null,
+    });
+    expect(publicRunResolutionView({
+      ...resolution("none", "executing"),
+      workMotion: "stalled",
+    }, null)).toMatchObject({
+      state: "quarantined",
+      nextAction: "contact_support",
+      workMotion: "stalled",
+    });
+    expect(publicRunResolutionView({
+      ...resolution("none", "executing"),
+      workMotion: "running",
+      activeComputeMs: 15_000,
+    }, null)).toMatchObject({
+      state: "executing",
+      nextAction: "none",
+      workMotion: "running",
+      activeComputeMs: 15_000,
+    });
   });
 
   test("preserves only a hash-bound retained provider resume action", () => {
     const versionHash = "9".repeat(64);
     expect(publicRunResolutionView({
       ...resolution("resume_research"),
+      contractSemanticRevisionId: "pcr1:public-projection",
       blocker: {
         kind: "provider",
         nextRetryAt: null,
@@ -313,7 +448,7 @@ describe("public API projections", () => {
         retryCount: 8,
         versionHash,
       },
-    }, null)).toMatchObject({
+    }, null, null, adaptiveDecision("resume_research"))).toMatchObject({
       state: "needs_decision",
       nextAction: "resume_research",
       blocker: {
@@ -323,6 +458,7 @@ describe("public API projections", () => {
     });
     expect(publicRunResolutionView({
       ...resolution("resume_research"),
+      contractSemanticRevisionId: "pcr1:public-projection",
       blocker: {
         kind: "provider",
         nextRetryAt: null,
@@ -330,9 +466,9 @@ describe("public API projections", () => {
         retryCount: 8,
         versionHash: null,
       },
-    }, null)).toMatchObject({
-      state: "needs_decision",
-      nextAction: "review_contract",
+    }, null, null, adaptiveDecision("resume_research"))).toMatchObject({
+      state: "quarantined",
+      nextAction: "contact_support",
     });
   });
 
@@ -385,8 +521,8 @@ describe("public API projections", () => {
       resolution("decide_verified_partial"),
       null,
     )).toMatchObject({
-      state: "needs_decision",
-      nextAction: "review_contract",
+      state: "quarantined",
+      nextAction: "contact_support",
     });
   });
 
@@ -526,6 +662,35 @@ describe("public API projections", () => {
   });
 
   test("partial-publication and Explore actions expose only capability-safe fields", () => {
+    const decision = hashedAdaptiveDecision({
+      contractRevisionId: "pcr1:revision",
+      contractSemanticHash: "d".repeat(64),
+      reason: "active_compute_limit",
+      targetTrackCount: 50,
+      verifiedTrackCount: 43,
+      remainingStrategyCount: 1,
+      consumedActiveComputeMs: 900_000,
+      activeComputeLimitMs: 900_000,
+      activeComputeExtensionsUsed: 0,
+      namedPredicates: [{ clauseId: "prompt:era", label: "1970s only" }],
+      interpretationSummary: {
+        mustHave: ["Brazilian disco"],
+        prefer: [],
+        avoid: [],
+        flow: ["Smooth"],
+        count: 50,
+      },
+      actions: {
+        anotherBoundedPass: true,
+        reviseNamedPredicate: true,
+        reduceCount: true,
+        publishVerifiedPartial: true,
+        pause: true,
+        resumeLater: false,
+        cancel: true,
+      },
+      reachedAt: "2026-07-23T12:00:00.000Z",
+    });
     const internal = {
       id: "canonical-run-id",
       prompt: "Brazilian disco",
@@ -554,37 +719,16 @@ describe("public API projections", () => {
         costUsd: 0.75,
       },
       decisionAction: {
-        schemaVersion: "genio-run-decision/v1",
-        decisionHash: "c".repeat(64),
-        contractRevisionId: "pcr1:revision",
-        contractSemanticHash: "d".repeat(64),
-        reason: "active_compute_limit",
-        targetTrackCount: 50,
-        verifiedTrackCount: 43,
-        remainingStrategyCount: 1,
-        consumedActiveComputeMs: 900_000,
-        activeComputeLimitMs: 900_000,
-        activeComputeExtensionsUsed: 0,
+        ...decision,
         namedPredicates: [{ clauseId: "prompt:era", label: "1970s only", privateEvidence: "secret" }],
         interpretationSummary: {
-          mustHave: ["Brazilian disco"],
-          prefer: [],
-          avoid: [],
-          flow: ["Smooth"],
-          count: 50,
+          ...decision.interpretationSummary,
           rawPrompt: "private prompt",
         },
         actions: {
-          anotherBoundedPass: true,
-          reviseNamedPredicate: true,
-          reduceCount: true,
-          publishVerifiedPartial: true,
-          pause: true,
-          resumeLater: false,
-          cancel: true,
+          ...decision.actions,
           internalOverride: true,
         },
-        reachedAt: "2026-07-23T12:00:00.000Z",
         privateProviderState: "secret",
       },
       explore: {
@@ -622,7 +766,7 @@ describe("public API projections", () => {
     });
     expect(view.decisionAction).toMatchObject({
       kind: "research_boundary",
-      decisionHash: "c".repeat(64),
+      decisionHash: decision.decisionHash,
       reason: "active_compute_limit",
       verifiedTrackCount: 43,
       namedPredicates: [{ clauseId: "prompt:era", label: "1970s only" }],
@@ -685,5 +829,333 @@ describe("public API projections", () => {
     const view = publicResearchRunView(internal, { id: "public-access-id" });
     expect(view.partialAction).toBeNull();
     expect(view.explore).toBeNull();
+  });
+
+  test("projects a repair replay and execution truth without private authority material", () => {
+    const internal = {
+      id: "canonical-run-id",
+      prompt: "Private prompt",
+      brief,
+      status: "failed_integrity",
+      phase: "canonical_integrity_quarantine",
+      error: null,
+      candidateCount: 55,
+      sourceCount: 4,
+      unresolvedCount: 0,
+      frontier: [],
+      resolution: {
+        generation: 7,
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: "contract-row-id",
+        contractRevision: 2,
+        contractHash: "a".repeat(64),
+        blocker: { kind: "integrity", nextRetryAt: null,
+          automaticRetryUntil: null, retryCount: 0, versionHash: null },
+      },
+      repairReplayAction: {
+        kind: "repair_replay",
+        expectedGeneration: 7,
+        incidentReference: "incident:qualification-binding",
+        contractRevisionId: "contract-row-id",
+        contractSemanticHash: "a".repeat(64),
+        available: true,
+        availabilityReason: "ready",
+        resultReuse: false,
+        autoPublication: false,
+        privateRepairKey: "never public",
+      },
+      executionRouteReceipt: {
+        version: "execution_route_receipt_v1",
+        trafficClass: "public",
+        contractVersion: 3,
+        guidanceVersion: "adaptive_guidance_v5",
+        executionRoute: "corpus_first_v3",
+        queryPlanSchema: 6,
+        queryPlanHash: "d".repeat(64),
+        capabilitySnapshotHash: "e".repeat(64),
+        releaseRevision: "b".repeat(40),
+        executorConfigurationHash: "f".repeat(64),
+        assignmentKind: "signed_public_rollout",
+        intentGroup: "genre_scene",
+        receiptHash: "c".repeat(64),
+        assignmentReceiptHash: "private-authority-hash",
+      },
+      evidenceCoverage: {
+        observationCount: 80,
+        qualificationObservationCount: 77,
+        legacyUnboundQualificationCount: 5,
+        uniqueLeadCount: 80,
+        candidates: 55,
+        materializedCandidateCount: 55,
+        identityBound: 55,
+        appleResolvedCount: 51,
+        versionCompatible: 52,
+        storefrontPlayable: 50,
+        obligationCounts: {
+          "verification:historical_influence": {
+            pass: 0,
+            fail: 0,
+            unknown: 77,
+          },
+        },
+        evidencePassed: 48,
+        evidenceUnknown: 5,
+        evidenceFailed: 2,
+        selected: 0,
+        manifested: 0,
+        appendedCount: 0,
+        reconciledPublished: null,
+        rawEvidence: "private evidence",
+      },
+    } as unknown as ResearchRunView & Record<string, unknown>;
+
+    const view = publicResearchRunView(internal, {
+      id: "public-access-id",
+      prompt: "Public prompt",
+    });
+    expect(view.resolution?.nextAction).toBe("replay_after_repair");
+    expect(view.repairReplayAction).toEqual({
+      kind: "repair_replay",
+      expectedGeneration: 7,
+      incidentReference: "incident:qualification-binding",
+      contractRevisionId: "contract-row-id",
+      contractSemanticHash: "a".repeat(64),
+      available: true,
+      availabilityReason: "ready",
+      resultReuse: false,
+      autoPublication: false,
+    });
+    expect(view.executionRouteReceipt).toEqual({
+      version: "execution_route_receipt_v1",
+      trafficClass: "public",
+      contractVersion: 3,
+      guidanceVersion: "adaptive_guidance_v5",
+      executionRoute: "corpus_first_v3",
+      queryPlanSchema: 6,
+      queryPlanHash: "d".repeat(64),
+      capabilitySnapshotHash: "e".repeat(64),
+      releaseRevision: "b".repeat(40),
+      executorConfigurationHash: "f".repeat(64),
+      assignmentKind: "signed_public_rollout",
+      intentGroup: "genre_scene",
+      receiptHash: "c".repeat(64),
+    });
+    expect(view.evidenceCoverage).toEqual({
+      observationCount: 80,
+      qualificationObservationCount: 77,
+      legacyUnboundQualificationCount: 5,
+      uniqueLeadCount: 80,
+      candidates: 55,
+      materializedCandidateCount: 55,
+      identityBound: 55,
+      appleResolvedCount: 51,
+      versionCompatible: 52,
+      storefrontPlayable: 50,
+      obligationCounts: {
+        "verification:historical_influence": {
+          pass: 0,
+          fail: 0,
+          unknown: 77,
+        },
+      },
+      evidencePassed: 48,
+      evidenceUnknown: 5,
+      evidenceFailed: 2,
+      selected: 0,
+      manifested: 0,
+      appendedCount: 0,
+      reconciledPublished: null,
+    });
+    const keys = serializedKeys(view);
+    expect(keys).not.toContain("privateRepairKey");
+    expect(keys).not.toContain("assignmentReceiptHash");
+    expect(keys).not.toContain("rawEvidence");
+  });
+
+  test("binds a compatibility-shadow resolution to the authenticated repair generation", () => {
+    const internal = {
+      id: "canonical-run-id",
+      prompt: "Request",
+      brief,
+      status: "failed_integrity",
+      phase: "canonical_integrity_quarantine",
+      error: null,
+      candidateCount: 0,
+      sourceCount: 0,
+      unresolvedCount: 0,
+      frontier: [],
+      resolution: {
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: "contract-row-id",
+        contractRevision: 1,
+        contractHash: "a".repeat(64),
+        blocker: null,
+      },
+      repairReplayAction: {
+        kind: "repair_replay",
+        expectedGeneration: 5,
+        incidentReference: "incident:compatibility-shadow",
+        contractRevisionId: "contract-row-id",
+        contractSemanticHash: "a".repeat(64),
+        available: true,
+        availabilityReason: "ready",
+        resultReuse: false,
+        autoPublication: false,
+      },
+    } as unknown as ResearchRunView & Record<string, unknown>;
+
+    const view = publicResearchRunView(internal);
+    expect(view.resolution).toMatchObject({
+      generation: 5,
+      state: "quarantined",
+      nextAction: "replay_after_repair",
+      contractRevisionId: "contract-row-id",
+      contractHash: "a".repeat(64),
+    });
+
+    const mismatched = publicResearchRunView({
+      ...internal,
+      resolution: {
+        ...internal.resolution,
+        contractHash: "b".repeat(64),
+      },
+    } as unknown as ResearchRunView & Record<string, unknown>);
+    expect(mismatched.resolution).toMatchObject({
+      nextAction: "contact_support",
+      contractHash: "b".repeat(64),
+    });
+    expect(mismatched.resolution?.generation).toBeUndefined();
+  });
+
+  test("does not advertise replay when the repair fence is malformed", () => {
+    const internal = {
+      id: "canonical-run-id",
+      prompt: "Request",
+      brief,
+      status: "failed_integrity",
+      phase: "canonical_integrity_quarantine",
+      error: null,
+      candidateCount: 0,
+      sourceCount: 0,
+      unresolvedCount: 0,
+      frontier: [],
+      resolution: {
+        generation: 1,
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: "contract-row-id",
+        contractRevision: 1,
+        contractHash: "a".repeat(64),
+        blocker: null,
+      },
+      repairReplayAction: {
+        kind: "repair_replay",
+        expectedGeneration: 1,
+        incidentReference: "incident",
+        contractRevisionId: "contract-row-id",
+        contractSemanticHash: "not-a-hash",
+        available: true,
+        availabilityReason: "ready",
+        resultReuse: false,
+        autoPublication: false,
+      },
+    } as unknown as ResearchRunView & Record<string, unknown>;
+    const view = publicResearchRunView(internal);
+    expect(view.repairReplayAction).toBeNull();
+    expect(view.resolution?.nextAction).toBe("contact_support");
+  });
+
+  test("retains the authoritative quarantine action while repair is pending", () => {
+    const internal = {
+      id: "canonical-run-id",
+      prompt: "Request",
+      brief,
+      status: "failed_integrity",
+      phase: "evidence_verification_unknown",
+      error: null,
+      candidateCount: 73,
+      sourceCount: 80,
+      unresolvedCount: 0,
+      frontier: [],
+      resolution: {
+        generation: 3,
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: "contract-row-id",
+        contractRevision: 1,
+        contractHash: "a".repeat(64),
+        blocker: null,
+      },
+      repairReplayAction: {
+        kind: "repair_replay",
+        expectedGeneration: 3,
+        incidentReference: "incident:evidence-binding",
+        contractRevisionId: "contract-row-id",
+        contractSemanticHash: "a".repeat(64),
+        available: false,
+        availabilityReason: "repair_pending",
+        resultReuse: false,
+        autoPublication: false,
+      },
+    } as unknown as ResearchRunView & Record<string, unknown>;
+    const view = publicResearchRunView(internal);
+    expect(view.resolution?.nextAction).toBe("contact_support");
+    expect(view.repairReplayAction).toMatchObject({
+      available: false,
+      availabilityReason: "repair_pending",
+      incidentReference: "incident:evidence-binding",
+    });
+  });
+
+  test("projects the already-created repair successor as the current action", () => {
+    const successorBriefRequestId =
+      "99999999-9999-4999-8999-999999999999";
+    const internal = {
+      id: "canonical-run-id",
+      prompt: "Request",
+      brief,
+      status: "failed_integrity",
+      phase: "evidence_verification_unknown",
+      error: null,
+      candidateCount: 73,
+      sourceCount: 80,
+      unresolvedCount: 0,
+      frontier: [],
+      resolution: {
+        generation: 3,
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+        contractRevisionId: "contract-row-id",
+        contractRevision: 1,
+        contractHash: "a".repeat(64),
+        blocker: null,
+      },
+      repairReplayAction: {
+        kind: "repair_replay",
+        expectedGeneration: 3,
+        incidentReference: "incident:evidence-binding",
+        contractRevisionId: "contract-row-id",
+        contractSemanticHash: "a".repeat(64),
+        available: false,
+        availabilityReason: "already_started",
+        successorBriefRequestId,
+        resultReuse: false,
+        autoPublication: false,
+      },
+    } as unknown as ResearchRunView & Record<string, unknown>;
+    const view = publicResearchRunView(internal);
+    expect(view.resolution?.nextAction).toBe("replay_after_repair");
+    expect(view.repairReplayAction).toMatchObject({
+      available: false,
+      availabilityReason: "already_started",
+      successorBriefRequestId,
+    });
   });
 });

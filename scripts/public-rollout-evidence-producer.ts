@@ -85,6 +85,17 @@ export interface PublicRolloutEvidenceProducerArgs {
   producerKeyId: string;
 }
 
+interface StandardPublicRolloutPromotionContext {
+  payloadHash: string;
+  configurationHash: string;
+  runtimeHash: string;
+  semanticBehaviorHash: string;
+  productionCanaryEvidenceHash: string;
+  latestProductionCanaryCompletedAt: string;
+  sitesVersion: string;
+  sitesRevision: string;
+}
+
 function optionCount(argv: readonly string[], name: string): number {
   return argv.filter((value) => value === name).length;
 }
@@ -166,6 +177,13 @@ export function parsePublicRolloutEvidenceProducerArgs(
   if (optionCount(argv, "--previous-rollout-evidence") > 1) {
     throw new Error("--previous-rollout-evidence may be provided only once");
   }
+  if (optionCount(argv, "--promotion-evidence") !== 1) {
+    throw new Error("standard public rollout requires exact promotion evidence");
+  }
+  const promotionEvidencePath = releaseProducerOption(
+    argv,
+    "--promotion-evidence",
+  );
   const rollbackWarrantPath = optionCount(argv, "--rollback-warrant") === 0
     ? null
     : releaseProducerOption(argv, "--rollback-warrant");
@@ -250,7 +268,7 @@ export function parsePublicRolloutEvidenceProducerArgs(
     samples: convergence.samples,
     intervalMs: convergence.intervalMs,
     runtimeSnapshotPath: releaseProducerOption(argv, "--runtime-snapshot"),
-    promotionEvidencePath: releaseProducerOption(argv, "--promotion-evidence"),
+    promotionEvidencePath,
     previousRolloutEvidencePath,
     intentCanaryPath: optionCount(argv, "--intent-canary") === 0
       ? null
@@ -537,8 +555,7 @@ export function summarizePublicRolloutObservation(
 
 export function buildPublicRolloutPayload(input: {
   args: PublicRolloutEvidenceProducerArgs;
-  promotionPayload: ReturnType<typeof verifyReleaseEvidence>;
-  promotionEvidenceHash: string;
+  promotion: StandardPublicRolloutPromotionContext;
   runtimeSnapshot: Awaited<ReturnType<typeof loadReleaseProducerRuntimeSnapshot>>;
   currentConfiguration: PublicRolloutConfiguration;
   previous: ReturnType<typeof verifyPreviousPublicRolloutLineage> | null;
@@ -602,22 +619,16 @@ export function buildPublicRolloutPayload(input: {
       version: input.args.candidate.version,
       sourceRevision: input.args.candidate.sourceRevision,
       imageDigest: input.args.candidate.imageDigest,
-      promotionEvidenceHash: input.promotionEvidenceHash,
+      promotionEvidenceHash: input.promotion.payloadHash,
     },
     promotion: {
-      configurationHash: releaseEvidenceConfigurationHash(
-        input.promotionPayload,
-      ),
-      runtimeHash: releaseEvidenceRuntimeHash(input.promotionPayload),
-      semanticBehaviorHash:
-        input.promotionPayload.semanticReview.semanticBehaviorHash,
+      configurationHash: input.promotion.configurationHash,
+      runtimeHash: input.promotion.runtimeHash,
+      semanticBehaviorHash: input.promotion.semanticBehaviorHash,
       productionCanaryEvidenceHash:
-        publicRolloutProductionCanaryEvidenceHash(input.promotionPayload.gates),
-      sitesVersion:
-        input.promotionPayload.environmentSnapshots.production!.sitesVersion,
-      sitesRevision:
-        input.promotionPayload.environmentSnapshots.production!
-          .sitesSourceRevision,
+        input.promotion.productionCanaryEvidenceHash,
+      sitesVersion: input.promotion.sitesVersion,
+      sitesRevision: input.promotion.sitesRevision,
       sitesCandidateMatched: false,
       databaseSchemaVersion: "20",
       databaseCapabilityVersion: "2",
@@ -672,14 +683,17 @@ async function main(): Promise<void> {
   const deadlineAt = Date.now() + DEADLINE_MS;
   const candidate = releaseProducerCandidate(args.candidate);
   const [
-    promotionEnvelope,
+    promotionAuthority,
     runtimeSnapshot,
     previousEnvelope,
     intentCanaryEnvelope,
     rollbackWarrantEnvelope,
   ] =
     await Promise.all([
-      jsonFile(args.promotionEvidencePath, "--promotion-evidence"),
+      jsonFile(
+        args.promotionEvidencePath,
+        "--promotion-evidence",
+      ),
       loadReleaseProducerRuntimeSnapshot({
         path: args.runtimeSnapshotPath,
         environment: "production",
@@ -700,35 +714,55 @@ async function main(): Promise<void> {
         ? jsonFile(args.rollbackWarrantPath, "--rollback-warrant")
         : null,
     ]);
-  const historicalPromotionVerificationTime =
-    historicalPromotionVerificationTimeForRollback(
-      promotionEnvelope,
-      args.toPercent,
-    );
-  const promotionPayload = verifyReleaseEvidence(
-    promotionEnvelope,
-    verificationKey,
-    {
-      expectedKind: "promotion",
-      expectedTag: args.candidate.tag,
-      expectedRevision: args.candidate.sourceRevision,
-      expectedImageDigest: args.candidate.imageDigest,
-      expectedRuntimeHash: runtimeSnapshot.runtimeHash,
-      ...(args.toPercent === "0"
-        ? {}
-        : { expectedConfigurationHash: runtimeSnapshot.configurationHash }),
-      ...(historicalPromotionVerificationTime
-        ? {
-          now: historicalPromotionVerificationTime,
+  const promotion = (() => {
+        const historicalPromotionVerificationTime =
+          historicalPromotionVerificationTimeForRollback(
+            promotionAuthority,
+            args.toPercent,
+          );
+        const payload = verifyReleaseEvidence(
+          promotionAuthority,
+          verificationKey,
+          {
+            expectedKind: "promotion",
+            expectedTag: args.candidate.tag,
+            expectedRevision: args.candidate.sourceRevision,
+            expectedImageDigest: args.candidate.imageDigest,
+            expectedRuntimeHash: runtimeSnapshot.runtimeHash,
+            ...(args.toPercent === "0"
+              ? {}
+              : {
+                expectedConfigurationHash:
+                  runtimeSnapshot.configurationHash,
+              }),
+            ...(historicalPromotionVerificationTime
+              ? { now: historicalPromotionVerificationTime }
+              : {}),
+          },
+        );
+        if (payload.candidate.version !== args.candidate.version) {
+          throw new Error(
+            "promotion evidence version does not match the rollout target",
+          );
         }
-        : {}),
-    },
-  );
-  if (promotionPayload.candidate.version !== args.candidate.version) {
-    throw new Error("promotion evidence version does not match the rollout target");
-  }
-  const promotionRecord = promotionEnvelope as JsonRecord;
-  const promotionEvidenceHash = String(promotionRecord.payloadHash ?? "");
+        return {
+          payloadHash: String(
+            (promotionAuthority as JsonRecord).payloadHash ?? "",
+          ),
+          configurationHash: releaseEvidenceConfigurationHash(payload),
+          runtimeHash: releaseEvidenceRuntimeHash(payload),
+          semanticBehaviorHash: payload.semanticReview.semanticBehaviorHash,
+          productionCanaryEvidenceHash:
+            publicRolloutProductionCanaryEvidenceHash(payload.gates),
+          latestProductionCanaryCompletedAt:
+            publicRolloutLatestProductionCanaryCompletedAt(payload.gates),
+          sitesVersion:
+            payload.environmentSnapshots.production!.sitesVersion,
+          sitesRevision:
+            payload.environmentSnapshots.production!.sitesSourceRevision,
+        };
+      })();
+  const promotionEvidenceHash = promotion.payloadHash;
   const currentConfiguration = configurationFromEnvironment(process.env);
   const previous = previousEnvelope
     ? verifyPreviousPublicRolloutLineage(
@@ -746,13 +780,14 @@ async function main(): Promise<void> {
         },
       )
     : null;
-  const promotionConfigurationHash =
-    releaseEvidenceConfigurationHash(promotionPayload);
-  const promotionRuntimeHash = releaseEvidenceRuntimeHash(promotionPayload);
+  const promotionConfigurationHash = promotion.configurationHash;
+  const promotionRuntimeHash = promotion.runtimeHash;
   const promotionCanaryEvidenceHash =
-    publicRolloutProductionCanaryEvidenceHash(promotionPayload.gates);
-  const priorSites =
-    promotionPayload.environmentSnapshots.production!;
+    promotion.productionCanaryEvidenceHash;
+  const priorSites = {
+    sitesVersion: promotion.sitesVersion,
+    sitesSourceRevision: promotion.sitesRevision,
+  };
   const rollbackWarrant = rollbackWarrantEnvelope
     ? verifyPublicRolloutRollbackWarrant(
         rollbackWarrantEnvelope,
@@ -857,8 +892,7 @@ async function main(): Promise<void> {
   }, deadlineAt);
   const payload = buildPublicRolloutPayload({
     args,
-    promotionPayload,
-    promotionEvidenceHash,
+    promotion,
     runtimeSnapshot,
     currentConfiguration,
     previous,
@@ -874,9 +908,7 @@ async function main(): Promise<void> {
     signingKey,
     keyId: args.producerKeyId,
   });
-  const latestCanary = publicRolloutLatestProductionCanaryCompletedAt(
-    promotionPayload.gates,
-  );
+  const latestCanary = promotion.latestProductionCanaryCompletedAt;
   const verified = verifyPublicRolloutEvidence(
     envelope,
     createPublicKey(signingKey),

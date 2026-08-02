@@ -6,6 +6,8 @@ import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import * as databaseSchema from "../db/schema.ts";
 import { Repository } from "../server/repository.ts";
 import type {
+  DiscoveryRequestV3,
+  QualificationRequestV3,
   QualifiedTrackV3,
   RetrievalOutcomeStatusV3,
   RetrievalResultV3,
@@ -36,6 +38,7 @@ import {
   queryPlanV3Hash,
 } from "../server/query-plan-v3.ts";
 import { canonicalContractExecutionPolicyV1 } from "../server/canonical-contract-runtime-v1.ts";
+import { verificationLeavesV1 } from "../server/verification-expression-v1.ts";
 import { compilePlaylistContractRevisionV1 } from "../server/playlist-contract-v1.ts";
 import { sha256Hex, stableStringify } from "../server/security.ts";
 import {
@@ -46,9 +49,11 @@ import {
 } from "../server/selection-plan-v3.ts";
 import {
   buildSemanticEquivalentRecoveryPlanV3,
+  candidateLeadKeyV3,
   type SemanticPlanRevisionArtifactV3,
 } from "../server/pipeline-v3-semantic-recovery.ts";
 import { assessPlaylistRuntimeFeasibilityV1 } from "../server/playlist-feasibility-v1.ts";
+import { semanticCollapseTelemetryDivergenceV2 } from "../server/semantic-collapse-coverage-v2.ts";
 import { PLAYLIST_CONTRACT_ONTOLOGY_VERSION } from "../server/music-concept-registry-v1.ts";
 import type { PlaylistBrief, QueryPlanV3 } from "../shared/types.ts";
 
@@ -378,9 +383,19 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
 
   beforeAll(async () => {
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY_GROUPS", "genre_scene");
-    vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "300");
+    // These persistence fixtures exercise ordinary admitted V3 work, not
+    // owner-canary authorization. Route them through an explicit 100% public
+    // rollout so forceFreshResearch remains only a cache/reuse control.
+    vi.stubEnv("PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED", "true");
+    vi.stubEnv("PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_GENRE_SCENE_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_MOOD_ACTIVITY_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_SIMILARITY_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_ARTIST_CATALOGUE_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_FIXED_CONTAINER_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_FACTUAL_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_EXHAUSTIVE_PERCENT", "100");
+    vi.stubEnv("PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED", "true");
     vi.stubEnv("PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED", "true");
     vi.stubEnv("PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED", "true");
     vi.stubEnv("APPLE_STOREFRONT", "us");
@@ -437,6 +452,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       | "or_membership"
       | "catalog_membership_with_evidence_meta"
       | "not_exclusion" = false,
+    canonicalQueryPlanSchemaVersion: 5 | 6 = 5,
   ): Promise<{
     runId: string;
     accessId: string;
@@ -869,7 +885,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
           canonicalSelectionPlan,
           active.graph_snapshot_id,
           {
-            schemaVersion: 5,
+            schemaVersion: canonicalQueryPlanSchemaVersion,
             briefContractVersion: 3,
             playlistContractRevisionId: contract.revisionId,
             playlistContractSemanticHash: contract.semanticHash,
@@ -1086,9 +1102,1267 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     );
     await expect(repository.getRun(context.runId)).resolves.toMatchObject({
       resolution: {
+        state: "quarantined",
+        nextAction: "contact_support",
         workMotion: "stalled",
       },
     });
+  }, 120_000);
+
+  test("keeps the fresh lease-to-attempt handoff accepted without claiming LIVE", async () => {
+    const context = await createLeasedRun(
+      3,
+      "lease-attempt-handoff",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    expect(context.fence.contractAttemptId).toBeTruthy();
+    await pool.query(
+      "DELETE FROM playlist_execution_attempts WHERE id=$1",
+      [context.fence.contractAttemptId],
+    );
+    await pool.query(
+      `UPDATE job_queue
+       SET updated_at=now(),lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1`,
+      [context.fence.jobId],
+    );
+
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      status: "queued",
+      resolution: {
+        state: "accepted",
+        nextAction: "none",
+        workMotion: "none",
+      },
+    });
+
+    await pool.query(
+      `UPDATE job_queue
+       SET updated_at=now()-interval '3 minutes',
+           lease_expires_at=now()+interval '5 minutes'
+       WHERE id=$1`,
+      [context.fence.jobId],
+    );
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      resolution: {
+        state: "quarantined",
+        nextAction: "contact_support",
+        workMotion: "stalled",
+      },
+    });
+  }, 120_000);
+
+  test("execution truth and collapse facts exclude a superseded contract revision", async () => {
+    const context = await createLeasedRun(
+      1,
+      "active-authority-count-scope",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    const strategy = retrievalStrategiesForEnginesV3(
+      context.queryPlan.engines,
+    ).find(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds.includes("hosted_web")
+    ))!;
+    const candidate = {
+      id: "active-authority-candidate",
+      artist: "Active Authority Artist",
+      title: "Active Authority Track",
+      album: "Active Authority Album",
+      sourceObservationIds: ["active-authority-source"],
+    };
+    const request = {
+      runId: context.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: context.selectionPlan,
+      engine: strategy.engine,
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request,
+      batch: {
+        candidates: [candidate],
+        nextCursor: null,
+        exhausted: true,
+      },
+      fence: context.fence,
+    });
+    await repository.persistPipelineV3QualificationBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: {
+        runId: context.runId,
+        executionMode: "active",
+        appleWriteAccess: "forbidden",
+        plan: context.selectionPlan,
+        engine: strategy.engine,
+        strategy,
+        candidates: [candidate],
+      },
+      qualifications: [{
+        candidateId: candidate.id,
+        scope: {
+          passed: true,
+          failedMembershipPredicateIds: [],
+          fit: 0.5,
+        },
+        hardConstraints: {
+          passed: true,
+          failedConstraintIds: [],
+        },
+        evidence: {
+          passed: false,
+          bindingIds: [],
+          bindings: [],
+          strength: 0,
+          independentProvenanceRoots: 0,
+        },
+        version: { compatible: true, confidence: 0.95 },
+        catalog: {
+          lookupAttempted: true,
+          storefrontPlayable: true,
+          appleSongId: "apple-active-authority",
+          recordingFamilyKey: "family-active-authority",
+          confidence: 0.98,
+        },
+        canonicalClauseAssessments: {
+          "genre:reggaeton": { status: "unknown" },
+          "genre:dembow": { status: "unknown" },
+        },
+        rankingSignals: {},
+        sourceRank: 1,
+      }],
+      fence: context.fence,
+    });
+
+    const supersededContractId = randomUUID();
+    const supersededAttemptId = randomUUID();
+    const supersededLeadId = randomUUID();
+    const supersededCandidateId = randomUUID();
+    await pool.query(
+      `WITH inserted_contract AS (
+       INSERT INTO playlist_contract_revisions(
+         id,run_id,revision,parent_revision_id,status,contract_hash,
+         contract_json,compiler_version,ontology_version,
+         evidence_policy_version,question_template_version,
+         catalog_policy_version,locale,storefront,answer_lineage_hash)
+       SELECT $2,contract.run_id,contract.revision+1,contract.id,'superseded',
+              $3,contract.contract_json,contract.compiler_version,
+              contract.ontology_version,contract.evidence_policy_version,
+              contract.question_template_version,
+              contract.catalog_policy_version,contract.locale,
+              contract.storefront,$4
+       FROM playlist_contract_revisions contract
+       WHERE contract.id=$5
+       RETURNING id
+       ), inserted_attempt AS (
+       INSERT INTO playlist_execution_attempts(
+         id,run_id,contract_revision_id,query_plan_revision_id,stage,
+         attempt_number,lease_generation,executor_revision,
+         executor_identity_hash,configuration_hash,idempotency_key,status,
+         started_at,last_active_at,completed_at)
+       VALUES($6,$1,$2,$7,'superseded_count_scope',99,0,'test-superseded',
+              $8,$9,$10,'complete',now(),now(),now())
+       RETURNING id
+       ), inserted_lead AS (
+       INSERT INTO playlist_discovery_leads(
+         id,run_id,contract_revision_id,execution_attempt_id,provider,
+         dependency_key,strategy_id,identity_hint_hash,lead_json,status,
+         evidence_eligible)
+       VALUES($11,$1,$2,$6,'hosted_web','hosted_web','superseded',
+              $12,$13::jsonb,'rejected',false)
+       RETURNING id
+       ), inserted_candidate AS (
+       INSERT INTO track_candidates(
+         id,run_id,canonical_key,artist,title,album,outcome,candidate_stage,
+         pipeline_version,policy_version)
+       VALUES($14,$1,'superseded-authority-candidate',
+              'Superseded Artist','Superseded Track','Superseded Album',
+              'review','discovered','corpus_first_v3',
+              'corpus_first_v3_policy_v1')
+       RETURNING id
+       )
+       INSERT INTO playlist_qualification_records(
+         id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
+         stable_identity_hash,storefront,predicate_results_json,
+         evidence_record_ids_json,quality_result_json,catalog_result_json,
+         decision,qualification_hash)
+       VALUES($15,$1,$2,$11,$14,$16,'us',$17::jsonb,'[]'::jsonb,
+              '{}'::jsonb,$18::jsonb,'unknown',$19)`,
+      [
+        context.runId,
+        supersededContractId,
+        "f".repeat(64),
+        "e".repeat(64),
+        context.fence.contractRevisionDatabaseId,
+        supersededAttemptId,
+        context.fence.queryPlanRevisionId,
+        "1".repeat(64),
+        "2".repeat(64),
+        `superseded-count-scope:${context.runId}`,
+        supersededLeadId,
+        "3".repeat(64),
+        JSON.stringify({
+          queryPlanHash: queryPlanV3Hash(context.queryPlan),
+          observationReceiptHashes: [
+            "4".repeat(64),
+            "5".repeat(64),
+          ],
+        }),
+        supersededCandidateId,
+        randomUUID(),
+        "6".repeat(64),
+        JSON.stringify({
+          canonicalContract: {
+            assessments: {
+              "genre:reggaeton": { status: "unknown" },
+              "genre:dembow": { status: "unknown" },
+            },
+          },
+        }),
+        JSON.stringify({
+          version: { compatible: true },
+          catalog: {
+            storefrontPlayable: true,
+            appleSongId: "apple-superseded-authority",
+          },
+        }),
+        "7".repeat(64),
+      ],
+    );
+
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      evidenceCoverage: {
+        observationCount: 1,
+        qualificationObservationCount: 1,
+        legacyUnboundQualificationCount: 0,
+        uniqueLeadCount: 1,
+        materializedCandidateCount: 1,
+        storefrontPlayable: 1,
+        evidenceUnknown: 1,
+      },
+    });
+    // Immutable evidence repair appends a successor observation for the same
+    // candidate. Observation telemetry remains cumulative, while public
+    // disposition and per-obligation truth must reflect only the newest
+    // active observation for that candidate.
+    await pool.query(
+      `INSERT INTO playlist_qualification_records(
+         id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
+         stable_identity_hash,storefront,predicate_results_json,
+         evidence_record_ids_json,quality_result_json,catalog_result_json,
+         decision,qualification_hash,qualified_at)
+       SELECT $2,qualification.run_id,qualification.contract_revision_id,
+              qualification.discovery_lead_id,qualification.candidate_id,
+              qualification.stable_identity_hash,qualification.storefront,
+              $3::jsonb,qualification.evidence_record_ids_json,
+              qualification.quality_result_json,
+              qualification.catalog_result_json,'qualified',$4,
+              qualification.qualified_at+interval '1 second'
+       FROM playlist_qualification_records qualification
+       WHERE qualification.run_id=$1
+         AND qualification.contract_revision_id=$5
+         AND qualification.candidate_id IS NOT NULL
+       ORDER BY qualification.qualified_at DESC,qualification.id DESC
+       LIMIT 1`,
+      [
+        context.runId,
+        randomUUID(),
+        JSON.stringify({
+          canonicalContract: {
+            evaluation: { status: "pass", eligible: true },
+            assessments: {
+              "genre:reggaeton": { status: "pass" },
+              "genre:dembow": { status: "pass" },
+            },
+          },
+        }),
+        "8".repeat(64),
+        context.fence.contractRevisionDatabaseId,
+      ],
+    );
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      evidenceCoverage: {
+        observationCount: 1,
+        qualificationObservationCount: 2,
+        materializedCandidateCount: 1,
+        appleResolvedCount: 1,
+        storefrontPlayable: 1,
+        obligationCounts: {
+          "genre:reggaeton": { pass: 1, fail: 0, unknown: 0 },
+          "genre:dembow": { pass: 1, fail: 0, unknown: 0 },
+        },
+        evidencePassed: 1,
+        evidenceUnknown: 0,
+        evidenceFailed: 0,
+      },
+    });
+    const crashBoundaryCandidateId = randomUUID();
+    await pool.query(
+      `INSERT INTO track_candidates(
+         id,run_id,canonical_key,artist,title,outcome,candidate_stage,
+         pipeline_version,policy_version)
+       VALUES($1,$2,$3,'Crash Boundary Artist','Crash Boundary Track',
+         'pending','discovered','corpus_first_v3',
+         'corpus_first_v3_policy_v1')`,
+      [
+        crashBoundaryCandidateId,
+        context.runId,
+        `crash-boundary:${crashBoundaryCandidateId}`,
+      ],
+    );
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      evidenceCoverage: {
+        observationCount: 1,
+        qualificationObservationCount: 2,
+        materializedCandidateCount: 2,
+      },
+    });
+    const facts = await repository.readPipelineV3SemanticCollapseDatabaseFacts({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      queryPlanHash: queryPlanV3Hash(context.queryPlan),
+      result: {
+        stages: {
+          discovered: 1,
+          validCandidates: 1,
+          evidenceEligible: 0,
+          storefrontPlayable: 1,
+        },
+      } as RetrievalResultV3,
+      capturedAt: new Date().toISOString(),
+      fence: context.fence,
+    });
+    expect(facts).toMatchObject({
+      observationCount: 1,
+      uniqueLeadCount: 1,
+      materializedCandidateCount: 1,
+      storefrontPlayableCount: 1,
+      evidenceQualifiedCount: 1,
+      canonicalClauseDispositionCounts: {
+        "genre:reggaeton": { pass: 1, fail: 0, unknown: 0 },
+        "genre:dembow": { pass: 1, fail: 0, unknown: 0 },
+      },
+    });
+  }, 120_000);
+
+  test("continuation collapse facts include only the authenticated source and active successor attempts", async () => {
+    const context = await createLeasedRun(
+      3,
+      "continuation-collapse-count-scope",
+      undefined,
+      undefined,
+      "or_membership",
+    );
+    const sourceStrategy = retrievalStrategiesForEnginesV3(
+      context.queryPlan.engines,
+    ).find(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds.includes("hosted_web")
+    ))!;
+    expect(sourceStrategy).toBeTruthy();
+
+    const persistUnknownCandidate = async (input: {
+      queryPlan: QueryPlanV3;
+      fence: PipelineV3WriteFence;
+      strategy: typeof sourceStrategy;
+      id: string;
+      appleSongId: string;
+      recordingFamilyKey: string;
+      strategyRound: number;
+    }): Promise<void> => {
+      const candidate = {
+        id: input.id,
+        artist: `${input.id} Artist`,
+        title: `${input.id} Track`,
+        album: `${input.id} Album`,
+        sourceObservationIds: [`${input.id}:source`],
+      };
+      const request = {
+        runId: context.runId,
+        executionMode: "active" as const,
+        appleWriteAccess: "forbidden" as const,
+        plan: selectionPlanFromQueryPlanV3(input.queryPlan, {
+          prompt: "Opaque continuation count-scope fixture.",
+        }),
+        engine: input.strategy.engine,
+        strategy: input.strategy,
+        strategyRound: input.strategyRound,
+        cursor: null,
+        requestedRawCandidateCount: 1,
+        alreadyDiscoveredCandidateIds: [],
+        alreadyDiscoveredTracks: [],
+        qualifiedRecordingFamilyKeys: [],
+        qualifiedTrackSeeds: [],
+      };
+      await repository.persistPipelineV3DiscoveryBatch({
+        runId: context.runId,
+        queryPlan: input.queryPlan,
+        request,
+        batch: {
+          candidates: [candidate],
+          nextCursor: null,
+          exhausted: true,
+        },
+        fence: input.fence,
+      });
+      await repository.persistPipelineV3QualificationBatch({
+        runId: context.runId,
+        queryPlan: input.queryPlan,
+        request: {
+          runId: context.runId,
+          executionMode: "active",
+          appleWriteAccess: "forbidden",
+          plan: request.plan,
+          engine: input.strategy.engine,
+          strategy: input.strategy,
+          candidates: [candidate],
+        },
+        qualifications: [{
+          candidateId: candidate.id,
+          scope: {
+            passed: true,
+            failedMembershipPredicateIds: [],
+            fit: 0.5,
+          },
+          hardConstraints: {
+            passed: true,
+            failedConstraintIds: [],
+          },
+          evidence: {
+            passed: false,
+            bindingIds: [],
+            bindings: [],
+            strength: 0,
+            independentProvenanceRoots: 0,
+          },
+          version: { compatible: true, confidence: 0.95 },
+          catalog: {
+            lookupAttempted: true,
+            storefrontPlayable: true,
+            appleSongId: input.appleSongId,
+            recordingFamilyKey: input.recordingFamilyKey,
+            confidence: 0.98,
+          },
+          canonicalClauseAssessments: {
+            "genre:reggaeton": { status: "unknown" },
+            "genre:dembow": { status: "unknown" },
+          },
+          rankingSignals: {},
+          sourceRank: input.strategyRound,
+        }],
+        fence: input.fence,
+      });
+    };
+
+    await persistUnknownCandidate({
+      queryPlan: context.queryPlan,
+      fence: context.fence,
+      strategy: sourceStrategy,
+      id: "continuation-source-candidate",
+      appleSongId: "apple-continuation-source",
+      recordingFamilyKey: "family-continuation-source",
+      strategyRound: 1,
+    });
+
+    await pool.query(
+      `UPDATE playlist_execution_attempts
+       SET status='complete',completed_at=now(),last_active_at=now()
+       WHERE id=$1`,
+      [context.fence.contractAttemptId],
+    );
+    await pool.query(
+      `UPDATE job_queue
+       SET status='complete',completed_at=now(),updated_at=now()
+       WHERE id=$1`,
+      [context.fence.jobId],
+    );
+    const sourceQueryPlanHash = queryPlanV3Hash(context.queryPlan);
+    const sourceStageKey =
+      `v3-retrieval:active:${sourceQueryPlanHash.slice(0, 48)}`;
+    const outcomeHash = sha256Hex(`continuation:${context.runId}`);
+    await repository.saveResearchCheckpoint(
+      context.runId,
+      "partial_ready",
+      {
+        outcomeHash,
+        outcomeVersion: 1,
+        targetTrackCount: 3,
+        verifiedTrackCount: 1,
+        shortfall: 2,
+        remainingStrategyCount: 1,
+        continueAvailable: true,
+        continuationStrategyIds: [sourceStrategy.id],
+        queryPlanRevisionId: context.fence.queryPlanRevisionId,
+        queryPlanHash: sourceQueryPlanHash,
+        stageKey: sourceStageKey,
+        preparedAt: new Date().toISOString(),
+      },
+    );
+    await repository.updateRun(context.runId, {
+      status: "partial_ready",
+      phase: "partial_confirmation_required",
+      error: null,
+    });
+    await expect(repository.continuePartialResearch({
+      runId: context.runId,
+      outcomeVersion: 1,
+      idempotencyKey: randomUUID(),
+    })).resolves.toEqual({ queued: true });
+
+    const successor = (await pool.query<{
+      query_plan_id: string;
+      query_plan: QueryPlanV3;
+      query_plan_hash: string;
+      job_id: string;
+      stage_key: string;
+      required_executor_capability_hash: string;
+      required_executor_capability_vector: Record<string, unknown>;
+      required_executor_revision: string;
+      required_executor_semantic_configuration_hash: string;
+    }>(
+      `SELECT query.id query_plan_id,query.plan_json query_plan,
+              query.plan_hash query_plan_hash,job.id job_id,
+              job.stage_key,job.required_executor_capability_hash,
+              job.required_executor_capability_vector,
+              job.required_executor_revision,
+              job.required_executor_semantic_configuration_hash
+       FROM run_active_query_plans active
+       JOIN query_plan_revisions query
+         ON query.id=active.query_plan_revision_id
+       JOIN job_queue job
+         ON job.run_id=active.run_id
+        AND job.query_plan_revision_id=query.id
+        AND job.kind='research'
+       WHERE active.run_id=$1
+       ORDER BY job.created_at DESC LIMIT 1`,
+      [context.runId],
+    )).rows[0]!;
+    expect(successor.query_plan.continuation).toMatchObject({
+      sourceQueryPlanRevisionId: context.fence.queryPlanRevisionId,
+      sourceQueryPlanHash,
+      sourceOutcomeHash: outcomeHash,
+    });
+
+    const successorWorkerId =
+      `continuation-count-worker-${randomUUID()}`;
+    await repository.updateWorkerHeartbeat(successorWorkerId, {
+      version: successor.required_executor_revision,
+      semanticExecutionConfigurationHash:
+        successor.required_executor_semantic_configuration_hash,
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
+    await pool.query(
+      `UPDATE job_queue
+       SET status='leased',lease_owner=$2,
+           lease_expires_at=now()+interval '5 minutes',updated_at=now()
+       WHERE id=$1`,
+      [successor.job_id, successorWorkerId],
+    );
+    const successorLeaseEpoch = Number((await pool.query<{
+      lease_epoch: string;
+    }>(
+      "SELECT lease_epoch::text FROM job_queue WHERE id=$1",
+      [successor.job_id],
+    )).rows[0]!.lease_epoch);
+    const activeContract =
+      await repository.getActivePlaylistContractRevision({
+        runId: context.runId,
+      });
+    expect(activeContract).toBeTruthy();
+    const immutableContract = activeContract!.contract as {
+      revisionId: string;
+      semanticHash: string;
+    };
+    const successorAttempt =
+      await repository.beginPlaylistExecutionAttempt({
+        runId: context.runId,
+        contractRevisionId: activeContract!.id,
+        jobId: successor.job_id,
+        workerId: successorWorkerId,
+        queryPlanRevisionId: successor.query_plan_id,
+        stage: successor.stage_key,
+        dependencyKey: "research",
+        attemptNumber: 2,
+        leaseGeneration: successorLeaseEpoch,
+        executorRevision: successor.required_executor_revision,
+        executorIdentityHash: "8".repeat(64),
+        executorCapabilityHash:
+          successor.required_executor_capability_hash,
+        executorCapabilityVector:
+          successor.required_executor_capability_vector,
+        configurationHash: "9".repeat(64),
+        semanticExecutionConfigurationHash:
+          successor.required_executor_semantic_configuration_hash,
+        idempotencyKey:
+          `${successor.job_id}:${successorLeaseEpoch}:${activeContract!.id}`,
+      });
+    const successorFence: PipelineV3WriteFence = {
+      jobId: successor.job_id,
+      workerId: successorWorkerId,
+      leaseEpoch: successorLeaseEpoch,
+      queryPlanRevisionId: successor.query_plan_id,
+      stageKey: successor.stage_key,
+      contractAttemptId: successorAttempt.id,
+      contractRevisionDatabaseId: activeContract!.id,
+      contractRevisionId: immutableContract.revisionId,
+      contractSemanticHash: immutableContract.semanticHash,
+    };
+    const successorStrategy = retrievalStrategiesForEnginesV3(
+      successor.query_plan.engines,
+    ).find(({ id }) => id === sourceStrategy.id)!;
+    expect(successorStrategy).toBeTruthy();
+    const repeatedSourceCandidate = {
+      id: "continuation-source-candidate",
+      artist: "continuation-source-candidate Artist",
+      title: "continuation-source-candidate Track",
+      album: "continuation-source-candidate Album",
+      sourceObservationIds: ["continuation-source-candidate:source"],
+    };
+    await pool.query(
+      `UPDATE playlist_discovery_leads
+       SET status='rejected'
+       WHERE run_id=$1 AND identity_hint_hash=$2`,
+      [
+        context.runId,
+        candidateLeadKeyV3(repeatedSourceCandidate),
+      ],
+    );
+    const successorSelectionPlan = selectionPlanFromQueryPlanV3(
+      successor.query_plan,
+      { prompt: "Opaque continuation count-scope fixture." },
+    );
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: successor.query_plan,
+      request: {
+        runId: context.runId,
+        executionMode: "active",
+        appleWriteAccess: "forbidden",
+        plan: successorSelectionPlan,
+        engine: successorStrategy.engine,
+        strategy: successorStrategy,
+        strategyRound: 2,
+        cursor: null,
+        requestedRawCandidateCount: 1,
+        alreadyDiscoveredCandidateIds: [],
+        alreadyDiscoveredTracks: [],
+        qualifiedRecordingFamilyKeys: [],
+        qualifiedTrackSeeds: [],
+      },
+      batch: {
+        candidates: [repeatedSourceCandidate],
+        nextCursor: null,
+        exhausted: true,
+      },
+      fence: successorFence,
+    });
+    const preservedSourceLead = (await pool.query<{
+      execution_attempt_id: string;
+      status: string;
+      lead_json: {
+        observationReceiptHashes?: string[];
+        observationProvenance?: Array<{
+          executionAttemptId?: string;
+          queryPlanHash?: string;
+        }>;
+      };
+    }>(
+      `SELECT execution_attempt_id,status,lead_json
+       FROM playlist_discovery_leads
+       WHERE run_id=$1 AND identity_hint_hash=$2`,
+      [
+        context.runId,
+        candidateLeadKeyV3(repeatedSourceCandidate),
+      ],
+    )).rows[0]!;
+    expect(preservedSourceLead).toMatchObject({
+      execution_attempt_id: context.fence.contractAttemptId,
+      status: "rejected",
+    });
+    expect(preservedSourceLead.lead_json.observationReceiptHashes)
+      .toHaveLength(2);
+    expect(preservedSourceLead.lead_json.observationProvenance)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          executionAttemptId: context.fence.contractAttemptId,
+          queryPlanHash: sourceQueryPlanHash,
+        }),
+        expect.objectContaining({
+          executionAttemptId: successorAttempt.id,
+          queryPlanHash: successor.query_plan_hash,
+        }),
+      ]));
+    await persistUnknownCandidate({
+      queryPlan: successor.query_plan,
+      fence: successorFence,
+      strategy: successorStrategy,
+      id: "continuation-successor-candidate",
+      appleSongId: "apple-continuation-successor",
+      recordingFamilyKey: "family-continuation-successor",
+      strategyRound: 2,
+    });
+
+    const unrelatedPlanId = randomUUID();
+    const unrelatedAttemptId = randomUUID();
+    const unrelatedLeadId = randomUUID();
+    const unrelatedFamilyId = randomUUID();
+    const unrelatedCandidateId = randomUUID();
+    const unrelatedQualificationId = randomUUID();
+    const unrelatedPlan: QueryPlanV3 = {
+      ...context.queryPlan,
+      conceptDiscoveryHints: [{
+        clauseId: "unrelated:test-axis",
+        axis: "genre",
+        originalText: "unrelated test axis",
+        normalizedText: "unrelated test axis",
+        status: "unresolved",
+        ontologyVersion: PLAYLIST_CONTRACT_ONTOLOGY_VERSION,
+        unresolvedTermId:
+          `unresolved:${sha256Hex("unrelated test axis").slice(0, 16)}`,
+        provenance: "immutable_playlist_contract_concept_v1",
+        untrusted: true,
+        usage: "discovery_lead_only_not_membership_evidence_or_ranking",
+      }],
+    };
+    expect(isQueryPlanV3(unrelatedPlan)).toBe(true);
+    const unrelatedPlanHash = queryPlanV3Hash(unrelatedPlan);
+    await pool.query(
+      `WITH inserted_plan AS (
+         INSERT INTO query_plan_revisions(
+           id,run_id,selection_plan_id,revision,parent_revision_id,
+           graph_snapshot_id,engine,status,plan_hash,plan_json,
+           pipeline_version,policy_version,activated_at)
+         SELECT $2,$1,query.selection_plan_id,
+                (SELECT max(revision)+1 FROM query_plan_revisions
+                 WHERE run_id=$1),
+                $3,query.graph_snapshot_id,query.engine,'superseded',
+                $4,$5::jsonb,'corpus_first_v3',
+                'corpus_first_v3_policy_v1',now()
+         FROM query_plan_revisions query WHERE query.id=$3
+         RETURNING id
+       ), inserted_attempt AS (
+         INSERT INTO playlist_execution_attempts(
+           id,run_id,contract_revision_id,query_plan_revision_id,stage,
+           attempt_number,lease_generation,executor_revision,
+           executor_identity_hash,configuration_hash,idempotency_key,status,
+           started_at,last_active_at,completed_at)
+         VALUES($6,$1,$7,$2,'unrelated_count_scope',99,0,
+                'test-unrelated','a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0',
+                'b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0',
+                $8,'complete',now(),now(),now())
+         RETURNING id
+       ), inserted_lead AS (
+         INSERT INTO playlist_discovery_leads(
+           id,run_id,contract_revision_id,execution_attempt_id,provider,
+           dependency_key,strategy_id,identity_hint_hash,lead_json,status,
+           evidence_eligible)
+         VALUES($9,$1,$7,$6,'hosted_web','hosted_web',
+                'unrelated-count-scope',$10,$11::jsonb,'qualifying',false)
+         RETURNING id
+       ), inserted_family AS (
+         INSERT INTO recording_families(
+           id,run_id,family_key,canonical_artist,canonical_title,
+           version_class,metadata_json,pipeline_version,policy_version)
+         VALUES($12,$1,'family-unrelated-count-scope',
+                'Unrelated Artist','Unrelated Track','canonical','{}'::jsonb,
+                'corpus_first_v3','corpus_first_v3_policy_v1')
+         RETURNING id
+       ), inserted_candidate AS (
+         INSERT INTO track_candidates(
+           id,run_id,canonical_key,artist,title,album,outcome,
+           recording_family_id,candidate_stage,pipeline_version,
+           policy_version)
+         VALUES($13,$1,'unrelated-count-scope-candidate',
+                'Unrelated Artist','Unrelated Track','Unrelated Album',
+                'review',$12,'discovered','corpus_first_v3',
+                'corpus_first_v3_policy_v1')
+         RETURNING id
+       )
+       INSERT INTO playlist_qualification_records(
+         id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
+         stable_identity_hash,storefront,predicate_results_json,
+         evidence_record_ids_json,quality_result_json,catalog_result_json,
+         decision,qualification_hash)
+       VALUES($14,$1,$7,$9,$13,$15,'us',$16::jsonb,'[]'::jsonb,
+              '{}'::jsonb,$17::jsonb,'unknown',$18)`,
+      [
+        context.runId,
+        unrelatedPlanId,
+        context.fence.queryPlanRevisionId,
+        unrelatedPlanHash,
+        JSON.stringify(unrelatedPlan),
+        unrelatedAttemptId,
+        activeContract!.id,
+        `unrelated-count-scope:${context.runId}`,
+        unrelatedLeadId,
+        "c".repeat(64),
+        JSON.stringify({
+          queryPlanHash: unrelatedPlanHash,
+          observationReceiptHashes: [
+            "d".repeat(64),
+            "e".repeat(64),
+            "f".repeat(64),
+          ],
+        }),
+        unrelatedFamilyId,
+        unrelatedCandidateId,
+        unrelatedQualificationId,
+        "1".repeat(64),
+        JSON.stringify({
+          canonicalContract: {
+            assessments: {
+              "genre:reggaeton": { status: "unknown" },
+              "genre:dembow": { status: "unknown" },
+            },
+          },
+        }),
+        JSON.stringify({
+          version: { compatible: true },
+          catalog: {
+            storefrontPlayable: true,
+            appleSongId: "apple-unrelated-count-scope",
+          },
+        }),
+        "2".repeat(64),
+      ],
+    );
+
+    const facts = await repository.readPipelineV3SemanticCollapseDatabaseFacts({
+      runId: context.runId,
+      queryPlan: successor.query_plan,
+      queryPlanHash: successor.query_plan_hash,
+      result: {
+        stages: {
+          discovered: 3,
+          validCandidates: 2,
+          evidenceEligible: 0,
+          storefrontPlayable: 2,
+        },
+      } as RetrievalResultV3,
+      capturedAt: new Date().toISOString(),
+      fence: successorFence,
+    });
+    expect(facts).toMatchObject({
+      observationCount: 3,
+      uniqueLeadCount: 2,
+      materializedCandidateCount: 2,
+      uniqueRecordingFamilyCount: 2,
+      storefrontPlayableCount: 2,
+      evidenceQualifiedCount: 0,
+      nullCandidateQualificationCount: 0,
+      canonicalClauseDispositionCounts: {
+        "genre:reggaeton": { pass: 0, fail: 0, unknown: 2 },
+        "genre:dembow": { pass: 0, fail: 0, unknown: 2 },
+      },
+    });
+    const publicRun = await repository.getRun(context.runId);
+    expect(publicRun.evidenceCoverage).toMatchObject({
+      observationCount: 3,
+      qualificationObservationCount: 2,
+      uniqueLeadCount: 2,
+      candidates: 2,
+      materializedCandidateCount: 2,
+      identityBound: 2,
+      appleResolvedCount: 2,
+      versionCompatible: 2,
+      storefrontPlayable: 2,
+      evidencePassed: 0,
+      evidenceUnknown: 2,
+      evidenceFailed: 0,
+      obligationCounts: {
+        "genre:reggaeton": { pass: 0, fail: 0, unknown: 2 },
+        "genre:dembow": { pass: 0, fail: 0, unknown: 2 },
+      },
+    });
+
+    const replaceStoredSuccessorPlan = async (
+      queryPlan: QueryPlanV3,
+      queryPlanHash: string,
+    ): Promise<void> => {
+      await pool.query("ALTER TABLE query_plan_revisions DISABLE TRIGGER USER");
+      try {
+        await pool.query(
+          `UPDATE query_plan_revisions
+           SET plan_json=$2::jsonb,plan_hash=$3
+           WHERE id=$1`,
+          [
+            successor.query_plan_id,
+            JSON.stringify(queryPlan),
+            queryPlanHash,
+          ],
+        );
+      } finally {
+        await pool.query(
+          "ALTER TABLE query_plan_revisions ENABLE TRIGGER USER",
+        );
+      }
+    };
+    const forgedSiblingSourcePlan: QueryPlanV3 = {
+      ...successor.query_plan,
+      continuation: {
+        ...successor.query_plan.continuation!,
+        sourceQueryPlanRevisionId: unrelatedPlanId,
+        sourceQueryPlanHash: unrelatedPlanHash,
+        sourceStageKey:
+          `v3-retrieval:active:${unrelatedPlanHash.slice(0, 48)}`,
+      },
+    };
+    const forgedSiblingSourceHash =
+      queryPlanV3Hash(forgedSiblingSourcePlan);
+    await replaceStoredSuccessorPlan(
+      forgedSiblingSourcePlan,
+      forgedSiblingSourceHash,
+    );
+    await expect(
+      repository.readPipelineV3SemanticCollapseDatabaseFacts({
+        runId: context.runId,
+        queryPlan: forgedSiblingSourcePlan,
+        queryPlanHash: forgedSiblingSourceHash,
+        result: {
+          stages: {
+            discovered: 2,
+            validCandidates: 2,
+            evidenceEligible: 0,
+            storefrontPlayable: 2,
+          },
+        } as RetrievalResultV3,
+        capturedAt: new Date().toISOString(),
+        fence: successorFence,
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      code: "pipeline_v3_semantic_collapse_snapshot_invalid",
+    });
+    await replaceStoredSuccessorPlan(
+      successor.query_plan,
+      successor.query_plan_hash,
+    );
+
+    await pool.query(
+      "UPDATE query_plan_revisions SET status='active' WHERE id=$1",
+      [context.fence.queryPlanRevisionId],
+    );
+    try {
+      await expect(
+        repository.readPipelineV3SemanticCollapseDatabaseFacts({
+          runId: context.runId,
+          queryPlan: successor.query_plan,
+          queryPlanHash: successor.query_plan_hash,
+          result: {
+            stages: {
+              discovered: 2,
+              validCandidates: 2,
+              evidenceEligible: 0,
+              storefrontPlayable: 2,
+            },
+          } as RetrievalResultV3,
+          capturedAt: new Date().toISOString(),
+          fence: successorFence,
+        }),
+      ).rejects.toMatchObject({
+        statusCode: 409,
+        code: "pipeline_v3_semantic_collapse_snapshot_invalid",
+      });
+    } finally {
+      await pool.query(
+        "UPDATE query_plan_revisions SET status='superseded' WHERE id=$1",
+        [context.fence.queryPlanRevisionId],
+      );
+    }
+  }, 120_000);
+
+  test("collapse truth keeps 80 leads separate from 77 qualifications after one evidence repair", async () => {
+    const context = await createLeasedRun(
+      25,
+      "production-shaped-evidence-repair-counts",
+      undefined,
+      "Create 25 influential Irish recordings",
+      "or_membership",
+      6,
+    );
+    const strategy = retrievalStrategiesForEnginesV3(
+      context.queryPlan.engines,
+    ).find(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds.includes("hosted_web")
+    ))!;
+    const leaves = verificationLeavesV1(
+      context.queryPlan.verificationExpression!,
+    );
+    expect(strategy).toBeTruthy();
+    expect(leaves).toHaveLength(2);
+    const candidates = Array.from({ length: 80 }, (_, index) => ({
+      id: `irish-repair-${index}`,
+      artist: `Irish Repair Artist ${index}`,
+      title: `Irish Repair Track ${index}`,
+      album: `Irish Repair Album ${Math.floor(index / 10)}`,
+      sourceObservationIds: [`irish-repair-source-${index}`],
+    }));
+    const request: DiscoveryRequestV3 = {
+      runId: context.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: context.selectionPlan,
+      engine: strategy.engine,
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 80,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request,
+      batch: {
+        candidates,
+        nextCursor: null,
+        exhausted: true,
+      },
+      fence: context.fence,
+    });
+    const evaluated = candidates.slice(0, 77);
+    await repository.persistPipelineV3QualificationBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: {
+        runId: context.runId,
+        executionMode: "active",
+        appleWriteAccess: "forbidden",
+        plan: context.selectionPlan,
+        engine: strategy.engine,
+        strategy,
+        strategyRound: 1,
+        candidates: evaluated,
+      },
+      qualifications: evaluated.map((candidate, index) => ({
+        candidateId: candidate.id,
+        scope: {
+          passed: true,
+          failedMembershipPredicateIds: [],
+          fit: 0.5,
+        },
+        hardConstraints: {
+          passed: true,
+          failedConstraintIds: [],
+        },
+        evidence: {
+          passed: false,
+          bindingIds: [],
+          bindings: [],
+          strength: 0,
+          independentProvenanceRoots: 0,
+        },
+        version: {
+          compatible: index < 73,
+          confidence: index < 73 ? 0.95 : 0,
+        },
+        catalog: {
+          lookupAttempted: true,
+          storefrontPlayable: index < 73,
+          appleSongId: index < 73 ? `apple-irish-repair-${index}` : null,
+          recordingFamilyKey:
+            index < 73 ? `family-irish-repair-${index}` : null,
+          confidence: index < 73 ? 0.98 : 0,
+        },
+        canonicalClauseAssessments: Object.fromEntries(
+          leaves.map(({ clauseId }) => [clauseId, { status: "unknown" }]),
+        ),
+        rankingSignals: {},
+        sourceRank: index + 1,
+      })),
+      fence: context.fence,
+    });
+
+    await pool.query(
+      `INSERT INTO playlist_qualification_records(
+         id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
+         stable_identity_hash,storefront,predicate_results_json,
+         evidence_record_ids_json,quality_result_json,catalog_result_json,
+         decision,qualification_hash,qualified_at)
+       SELECT $2,qualification.run_id,qualification.contract_revision_id,
+              qualification.discovery_lead_id,qualification.candidate_id,
+              qualification.stable_identity_hash,qualification.storefront,
+              $3::jsonb,qualification.evidence_record_ids_json,
+              qualification.quality_result_json,
+              qualification.catalog_result_json,'qualified',$4,
+              qualification.qualified_at+interval '1 second'
+       FROM playlist_qualification_records qualification
+       WHERE qualification.run_id=$1
+         AND qualification.contract_revision_id=$5
+         AND qualification.candidate_id IS NOT NULL
+       ORDER BY qualification.qualified_at ASC,qualification.id ASC
+       LIMIT 1`,
+      [
+        context.runId,
+        randomUUID(),
+        JSON.stringify({
+          canonicalContract: {
+            evaluation: { status: "pass", eligible: true },
+            assessments: Object.fromEntries(
+              leaves.map(({ clauseId }) => [clauseId, { status: "pass" }]),
+            ),
+          },
+        }),
+        sha256Hex(`irish-repair-pass:${context.runId}`),
+        context.fence.contractRevisionDatabaseId,
+      ],
+    );
+
+    const proofHash = sha256Hex(`irish-repair-proof:${context.runId}`);
+    const attemptedAt = new Date().toISOString();
+    const evidenceRequest: DiscoveryRequestV3 = {
+      ...request,
+      evidenceAcquisitionAttemptedAt: attemptedAt,
+      evidenceEnrichment: {
+        producerFamily: "structured_music_metadata",
+        dependencyRootId: "hosted_web",
+        deficitObligationIds: leaves.map(({ obligationId }) => obligationId),
+        strategyDeltaProofHash: proofHash,
+        automaticRescueOrdinal: 1,
+      },
+    };
+    await repository.persistPipelineV3EvidenceAcquisitionAttempt({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: evidenceRequest,
+      observation: {
+        operation: "qualify",
+        attemptedAt,
+        outcome: "success",
+        failureClass: null,
+        retryAfterUntil: null,
+      },
+      fence: context.fence,
+    });
+
+    const capturedAt = new Date().toISOString();
+    const passLocalResult = {
+      schemaVersion: "genio-pipeline-v3-retrieval/v1",
+      runId: context.runId,
+      executionMode: "active",
+      continuationTelemetryScope: "pass_local_qualification_projection",
+      outcome: {
+        status: "partial_ready",
+        stopReason: "frontier_exhausted",
+        requestedTrackCount: 25,
+        qualifiedTrackCount: 1,
+        selectedTrackCount: 1,
+        reserveTrackCount: 0,
+        shortfall: 24,
+        requiresPartialPublicationDecision: true,
+      },
+      stages: {
+        discovered: 80,
+        validCandidates: 77,
+        scopeEligible: 1,
+        hardConstraintEligible: 1,
+        evidenceEligible: 1,
+        versionCompatible: 1,
+        storefrontPlayable: 1,
+        canonicalUnique: 1,
+        selected: 1,
+        reserve: 0,
+      },
+      predicateDiagnostics: {
+        qualificationsObserved: 1,
+        uniqueQualificationsObserved: 1,
+        scopeFailures: 0,
+        failedMembershipPredicateIds: {},
+        canonicalClauseDispositionCounts: Object.fromEntries(
+          leaves.map(({ clauseId }) => [
+            clauseId,
+            { pass: 1, fail: 0, unknown: 0 },
+          ]),
+        ),
+        attemptedCanonicalClauseIds:
+          leaves.map(({ clauseId }) => clauseId),
+        evidenceAcquisitionAttempts: leaves.map(({ obligationId }) => ({
+          obligationId,
+          producerFamily: "structured_music_metadata",
+          dependencyRootId: "hosted_web",
+          operation: "qualify",
+          attemptedAt,
+          outcome: "success",
+          strategyDeltaProofHash: proofHash,
+          automaticRescueOrdinal: 1,
+          attemptCount: 1,
+        })),
+        appleLookupCount: 1,
+        appleProviderRequestCount: 1,
+        rootCause: "semantic_contract",
+        recoveryAttemptCount: 1,
+      },
+      candidateLeads: candidates.map((candidate) => ({
+        strategyId: strategy.id,
+        candidateKey: candidateLeadKeyV3(candidate),
+        artist: candidate.artist,
+        title: candidate.title,
+        album: candidate.album,
+        sourceRecordIds: [...candidate.sourceObservationIds],
+        citationHashes: [],
+        predicateCoverage: [],
+        rejectionCode: "canonical_contract_unknown",
+      })),
+    } as unknown as RetrievalResultV3;
+    const facts =
+      await repository.readPipelineV3SemanticCollapseDatabaseFacts({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        queryPlanHash: queryPlanV3Hash(context.queryPlan),
+        result: passLocalResult,
+        capturedAt,
+        fence: context.fence,
+      });
+    expect(facts).toMatchObject({
+      observationCount: 80,
+      uniqueLeadCount: 80,
+      materializedCandidateCount: 77,
+      storefrontPlayableCount: 73,
+      evidenceQualifiedCount: 1,
+      nullCandidateQualificationCount: 0,
+      canonicalClauseDispositionCounts: Object.fromEntries(
+        leaves.map(({ clauseId }) => [
+          clauseId,
+          { pass: 1, fail: 0, unknown: 76 },
+        ]),
+      ),
+    });
+    expect(semanticCollapseTelemetryDivergenceV2({
+      result: passLocalResult,
+      databaseFacts: facts,
+      queryPlan: context.queryPlan,
+      authenticatedEvidenceRepairContinuation: {
+        strategyDeltaProofHash: proofHash,
+        automaticRescueOrdinal: 1,
+      },
+    })).toEqual([]);
+    expect(semanticCollapseTelemetryDivergenceV2({
+      result: passLocalResult,
+      databaseFacts: facts,
+      queryPlan: context.queryPlan,
+    })).toEqual(expect.arrayContaining([
+      "materialized_candidate_count_mismatch",
+      "storefront_playable_count_mismatch",
+      "clause_disposition_mismatch",
+    ]));
   }, 120_000);
 
   test("a paused or delayed publication never inherits LIVE from its research lease", async () => {
@@ -1141,8 +2415,9 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
 
       await expect(repository.getRun(context.runId)).resolves.toMatchObject({
         resolution: {
-          state: "publishing",
-          workMotion: "paused",
+          state: "quarantined",
+          nextAction: "contact_support",
+          workMotion: "none",
         },
       });
       await expect(pool.query<{
@@ -1154,8 +2429,8 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         [context.runId],
       )).resolves.toMatchObject({
         rows: [{
-          state: "publishing",
-          work_motion: "paused",
+          state: "quarantined",
+          work_motion: "none",
         }],
       });
 
@@ -1173,9 +2448,9 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       });
       await expect(repository.getRun(context.runId)).resolves.toMatchObject({
         resolution: {
-          state: "publishing",
-          workMotion: "retry_scheduled",
-          nextRetryAt: expect.any(String),
+          state: "quarantined",
+          nextAction: "contact_support",
+          workMotion: "none",
         },
       });
 
@@ -1504,7 +2779,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       strategy,
       strategyRound: 1,
       cursor: null,
-      requestedRawCandidateCount: 1,
+      requestedRawCandidateCount: 2,
       alreadyDiscoveredCandidateIds: [],
       alreadyDiscoveredTracks: [],
       qualifiedRecordingFamilyKeys: [],
@@ -1514,6 +2789,45 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       runId: context.runId,
       queryPlan: context.queryPlan,
       request: discoveryRequest,
+      batch: {
+        candidates: [candidate, candidate],
+        nextCursor: null,
+        exhausted: true,
+        costUnits: 1,
+        provenance: {
+          cacheOrigin: "fresh_cache",
+          sourceFreshUntil: "2099-01-01T00:00:00.000Z",
+        },
+      },
+      fence: context.fence,
+    });
+    // A transaction replay of the exact same provider batch is idempotent.
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: discoveryRequest,
+      batch: {
+        candidates: [candidate, candidate],
+        nextCursor: null,
+        exhausted: true,
+        costUnits: 1,
+        provenance: {
+          cacheOrigin: "fresh_cache",
+          sourceFreshUntil: "2099-01-01T00:00:00.000Z",
+        },
+      },
+      fence: context.fence,
+    });
+    // A later provider retry is a third cumulative observation of the same
+    // unique/materialized candidate.
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: {
+        ...discoveryRequest,
+        strategyRound: 2,
+        requestedRawCandidateCount: 1,
+      },
       batch: {
         candidates: [candidate],
         nextCursor: null,
@@ -1556,6 +2870,12 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       lead_json: {
         schemaVersion: "genio-playlist-discovery-lead/v1",
         untrusted: true,
+        queryPlanHash: queryPlanV3Hash(context.queryPlan),
+        observationReceiptHashes: [
+          expect.stringMatching(/^[a-f0-9]{64}$/u),
+          expect.stringMatching(/^[a-f0-9]{64}$/u),
+          expect.stringMatching(/^[a-f0-9]{64}$/u),
+        ],
       },
     });
     expect(discovered.source_fresh_until?.toISOString())
@@ -1625,6 +2945,10 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
 
     const qualification = (await pool.query<{
       decision: string;
+      candidate_id: string;
+      candidate_outcome: string;
+      recording_family_id: string;
+      catalog_identity_count: number;
       predicate_results_json: Record<string, unknown>;
       evidence_record_ids_json: string[];
       quality_result_json: Record<string, unknown>;
@@ -1636,15 +2960,31 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
               qualification.evidence_record_ids_json,
               qualification.quality_result_json,
               qualification.catalog_result_json,
+              qualification.candidate_id,candidate.outcome candidate_outcome,
+              candidate.recording_family_id,
+              (SELECT count(*)::int
+               FROM recording_catalog_identities identity
+               WHERE identity.recording_family_id=
+                 candidate.recording_family_id) catalog_identity_count,
               lead.status lead_status,lead.evidence_eligible
        FROM playlist_qualification_records qualification
        JOIN playlist_discovery_leads lead
          ON lead.id=qualification.discovery_lead_id
+       JOIN track_candidates candidate
+         ON candidate.id=qualification.candidate_id
        WHERE qualification.run_id=$1`,
       [context.runId],
     )).rows[0]!;
     expect(qualification).toMatchObject({
       decision: "qualified",
+      candidate_id: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+      ),
+      candidate_outcome: "accepted",
+      recording_family_id: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+      ),
+      catalog_identity_count: 1,
       lead_status: "qualified",
       evidence_eligible: false,
       predicate_results_json: {
@@ -1681,6 +3021,145 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     });
     expect(qualification.evidence_record_ids_json)
       .toEqual(source.evidenceBindingIds);
+    await expect(repository.getRun(context.runId)).resolves.toMatchObject({
+      evidenceCoverage: {
+        qualificationObservationCount: 1,
+        legacyUnboundQualificationCount: 0,
+        materializedCandidateCount: 1,
+        appleResolvedCount: 1,
+        storefrontPlayable: 1,
+        appendedCount: 0,
+      },
+    });
+
+    const unresolvedCandidates = [
+      {
+        id: "schema-18-separated-unknown",
+        artist: "Unknown Evidence Artist",
+        title: "Unknown Evidence Track",
+        album: "Unknown Evidence Album",
+        sourceObservationIds: ["unknown-evidence-source"],
+      },
+      {
+        id: "schema-18-separated-failed",
+        artist: "Failed Predicate Artist",
+        title: "Failed Predicate Track",
+        album: "Failed Predicate Album",
+        sourceObservationIds: ["failed-predicate-source"],
+      },
+    ];
+    const unresolvedDiscoveryRequest = {
+      ...discoveryRequest,
+      requestedRawCandidateCount: unresolvedCandidates.length,
+    };
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: unresolvedDiscoveryRequest,
+      batch: {
+        candidates: unresolvedCandidates,
+        nextCursor: null,
+        exhausted: true,
+        costUnits: 1,
+        provenance: {
+          cacheOrigin: "fresh_cache",
+          sourceFreshUntil: "2099-01-01T00:00:00.000Z",
+        },
+      },
+      fence: context.fence,
+    });
+    await repository.persistPipelineV3QualificationBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: {
+        runId: context.runId,
+        executionMode: "active",
+        appleWriteAccess: "forbidden",
+        plan: context.selectionPlan,
+        engine: strategy.engine,
+        strategy,
+        candidates: unresolvedCandidates,
+      },
+      qualifications: unresolvedCandidates.map((value, index) => ({
+        candidateId: value.id,
+        scope: {
+          passed: true,
+          failedMembershipPredicateIds: [],
+          fit: 0.5,
+        },
+        hardConstraints: {
+          passed: true,
+          failedConstraintIds: [],
+        },
+        evidence: {
+          passed: false,
+          bindingIds: [],
+          bindings: [],
+          strength: 0,
+          independentProvenanceRoots: 0,
+        },
+        version: {
+          compatible: true,
+          confidence: 0.95,
+        },
+        catalog: {
+          lookupAttempted: true,
+          storefrontPlayable: true,
+          appleSongId: `apple-${value.id}`,
+          recordingFamilyKey: `family-${value.id}`,
+          confidence: 0.98,
+        },
+        canonicalClauseAssessments: {
+          "genre:reggaeton": {
+            status: index === 0 ? "unknown" as const : "fail" as const,
+            ...(index === 0 ? {} : {
+              evidenceGrade:
+                "track_specific_editorial_assertion" as const,
+            }),
+          },
+          "genre:dembow": {
+            status: index === 0 ? "unknown" as const : "fail" as const,
+            ...(index === 0 ? {} : {
+              evidenceGrade:
+                "track_specific_editorial_assertion" as const,
+            }),
+          },
+        },
+        rankingSignals: {},
+        sourceRank: 10 + index,
+      })),
+      fence: context.fence,
+    });
+    expect((await pool.query<{
+      decision: string;
+      outcome: string;
+      candidate_id: string | null;
+    }>(
+      `SELECT qualification.decision,candidate.outcome,
+              qualification.candidate_id
+       FROM playlist_qualification_records qualification
+       JOIN track_candidates candidate
+         ON candidate.id=qualification.candidate_id
+       WHERE qualification.run_id=$1
+         AND qualification.decision IN ('unknown','failed')
+       ORDER BY qualification.decision`,
+      [context.runId],
+    )).rows).toEqual([
+      {
+        decision: "failed",
+        outcome: "unsupported",
+        candidate_id: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+        ),
+      },
+      {
+        decision: "unknown",
+        outcome: "review",
+        candidate_id: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u,
+        ),
+      },
+    ]);
 
     const finalBase = retrievalResult({
       runId: context.runId,
@@ -1715,6 +3194,7 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     expect((await pool.query<{
       active: number;
       revoked: number;
+      candidates: number;
     }>(
       `SELECT
          count(*) FILTER (
@@ -1722,13 +3202,16 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
          )::int active,
          count(*) FILTER (
            WHERE decision='qualified' AND revoked_at IS NOT NULL
-         )::int revoked
+         )::int revoked,
+         (SELECT count(*)::int FROM track_candidates
+          WHERE run_id=$1) candidates
        FROM playlist_qualification_records
        WHERE run_id=$1`,
       [context.runId],
     )).rows[0]).toEqual({
       active: 1,
       revoked: 1,
+      candidates: 3,
     });
     const durableBinding = (await pool.query<{
       provenance_path_json: Array<Record<string, unknown>>;
@@ -1876,6 +3359,43 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
         disabled: false,
       }],
     });
+
+    // Lease-time fallback classification must protect an influence plan with
+    // the narrower editorial switch even when no persisted brief assignment
+    // is available. The ordinary genre switch remains independent.
+    const editorialContext = await createLeasedRun(
+      1,
+      "irish-influence",
+      undefined,
+      "Create 1 influential Irish music track",
+    );
+    await repository.setPipelineCohortKillSwitch({
+      cohortKey: `test:editorial:${editorialContext.runId}`,
+      route: "corpus_first_v3",
+      intentGroup: "editorial_influence",
+      disabled: true,
+      reasonCode: "integration_test",
+      changedBy: "integration",
+    });
+    await expect(repository.renewJobLease(
+      editorialContext.fence.jobId,
+      editorialContext.fence.workerId,
+      60_000,
+      editorialContext.fence.leaseEpoch,
+    )).resolves.toBe(false);
+    await repository.setPipelineCohortKillSwitch({
+      cohortKey: `test:editorial-reenable:${editorialContext.runId}`,
+      route: "corpus_first_v3",
+      intentGroup: "editorial_influence",
+      disabled: false,
+      changedBy: "integration",
+    });
+    await expect(repository.renewJobLease(
+      editorialContext.fence.jobId,
+      editorialContext.fence.workerId,
+      60_000,
+      editorialContext.fence.leaseEpoch,
+    )).resolves.toBe(true);
   }, 120_000);
 
   test("persists the contract-bound publication reconciliation lifecycle", async () => {
@@ -2614,6 +4134,21 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       selected,
       reserve,
       qualifiedPool: [...selected, ...reserve],
+      candidateLeads: [{
+        strategyId: "curated_genre_scene:trusted_scoped_containers",
+        candidateKey: sha256Hex("echo-park-scheduler-rejection"),
+        artist: "Rejected Candidate Artist",
+        title: "Rejected Candidate Track",
+        album: null,
+        sourceRecordIds: [],
+        citationHashes: [],
+        predicateCoverage: ["bridge:membership:hip-hop-or-grime"],
+        rejectionCode: "scheduler_scope_rejection",
+        discoveryDependencyIds: ["apple_catalog"],
+        provenanceRoots: ["echo-park-scheduler-rejection"],
+        cacheOrigin: "live",
+        sourceFreshUntil: null,
+      }],
     };
 
     const first = await repository.persistPipelineV3RetrievalResult({
@@ -2637,6 +4172,8 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       reserve_count: number;
       qualification_count: number;
       null_candidate_count: number;
+      rejected_qualification_count: number;
+      rejected_null_candidate_count: number;
       manifest_revision_count: number;
       publication_job_count: number;
     }>(
@@ -2650,6 +4187,12 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
          (SELECT count(*)::int FROM playlist_qualification_records
           WHERE run_id=$1 AND decision='qualified' AND revoked_at IS NULL
             AND candidate_id IS NULL) null_candidate_count,
+         (SELECT count(*)::int FROM playlist_qualification_records
+          WHERE run_id=$1 AND decision='failed' AND revoked_at IS NULL)
+            rejected_qualification_count,
+         (SELECT count(*)::int FROM playlist_qualification_records
+          WHERE run_id=$1 AND decision='failed' AND revoked_at IS NULL
+            AND candidate_id IS NULL) rejected_null_candidate_count,
          (SELECT count(*)::int FROM manifest_revisions revision
           JOIN manifests manifest ON manifest.id=revision.manifest_id
           WHERE manifest.run_id=$1) manifest_revision_count,
@@ -2662,6 +4205,8 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       reserve_count: 5,
       qualification_count: 55,
       null_candidate_count: 0,
+      rejected_qualification_count: 1,
+      rejected_null_candidate_count: 0,
       manifest_revision_count: 1,
       publication_job_count: 1,
     });
@@ -2692,6 +4237,80 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
     expect(provenance).toHaveLength(55);
     expect(sourceObservationIds).toHaveLength(56);
     expect(new Set(sourceObservationIds).size).toBe(56);
+  }, 120_000);
+
+  test("rejects a scheduler candidate-key conflict without rewriting the existing identity tuple", async () => {
+    const context = await createLeasedRun(
+      1,
+      "scheduler-rejection-identity-conflict",
+      undefined,
+      "Create 1 qualifying track",
+      "or_membership",
+    );
+    const base = retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 0,
+      status: "no_compatible_tracks",
+      prefix: "scheduler-rejection-identity-conflict",
+    });
+    const candidateKey = sha256Hex(
+      "scheduler-rejection-identity-conflict-candidate",
+    );
+    await pool.query(
+      `INSERT INTO track_candidates(
+         id,run_id,canonical_key,artist,title,album,outcome,candidate_stage,
+         pipeline_version,policy_version)
+       VALUES($1,$2,$3,'Existing Artist','Existing Track',NULL,'review',
+         'discovered','corpus_first_v3','corpus_first_v3_policy_v1')`,
+      [randomUUID(), context.runId, candidateKey],
+    );
+    const result: RetrievalResultV3 = {
+      ...base,
+      candidateLeads: [{
+        strategyId: base.strategies[0]!.id,
+        candidateKey,
+        artist: "Conflicting Artist",
+        title: "Conflicting Track",
+        album: null,
+        sourceRecordIds: [],
+        citationHashes: [],
+        predicateCoverage: ["genre:example"],
+        rejectionCode: "scheduler_scope_rejection",
+        discoveryDependencyIds:
+          base.strategies[0]!.discoveryDependencyIds,
+        provenanceRoots: [],
+        cacheOrigin: "live",
+        sourceFreshUntil: null,
+      }],
+    };
+
+    await expect(repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    })).rejects.toThrow(
+      "pipeline_v3_scheduler_rejected_candidate_identity_conflict",
+    );
+    expect((await pool.query<{
+      artist: string;
+      title: string;
+      qualifications: number;
+    }>(
+      `SELECT candidate.artist,candidate.title,
+         (SELECT count(*)::int
+          FROM playlist_qualification_records qualification
+          WHERE qualification.run_id=candidate.run_id) qualifications
+       FROM track_candidates candidate
+       WHERE candidate.run_id=$1 AND candidate.canonical_key=$2`,
+      [context.runId, candidateKey],
+    )).rows[0]).toEqual({
+      artist: "Existing Artist",
+      title: "Existing Track",
+      qualifications: 0,
+    });
   }, 120_000);
 
   test("rejects an evidence-policy citation that has no factual predicate scope", async () => {
@@ -2858,6 +4477,63 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       manifest_candidate_id: existingCandidateId,
       qualification_candidate_id: existingCandidateId,
       family_id: existingFamilyId,
+    });
+  }, 30_000);
+
+  test("fails closed when a recording-family key resolves to a conflicting identity tuple", async () => {
+    const context = await createLeasedRun(
+      1,
+      "conflicting-recording-family-tuple",
+      undefined,
+      "Create 1 reggaeton track",
+      "or_membership",
+    );
+    const result = withCanonicalHostedProof(retrievalResult({
+      runId: context.runId,
+      target: 1,
+      selectedCount: 1,
+      status: "exact_ready",
+      prefix: "conflicting-recording-family-tuple",
+      predicateIds: ["genre:reggaeton"],
+    }), "genre:reggaeton");
+    const track = result.selected[0]!;
+    await pool.query(
+      `INSERT INTO recording_families(
+         id,run_id,family_key,canonical_artist,canonical_title,version_class,
+         metadata_json,pipeline_version,policy_version)
+       VALUES($1,$2,$3,$4,$5,'canonical',$6::jsonb,
+         'corpus_first_v3','corpus_first_v3_policy_v1')`,
+      [
+        randomUUID(),
+        context.runId,
+        track.recordingFamilyKey,
+        "Different Artist",
+        "Different Recording",
+        JSON.stringify({ album: track.album }),
+      ],
+    );
+
+    await expect(repository.persistPipelineV3RetrievalResult({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      plan: context.selectionPlan,
+      result,
+      fence: context.fence,
+    })).rejects.toThrow(
+      "pipeline_v3_recording_family_identity_conflict",
+    );
+    expect((await pool.query<{
+      manifests: number;
+      qualifications: number;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM manifests WHERE run_id=$1) manifests,
+         (SELECT count(*)::int FROM playlist_qualification_records
+          WHERE run_id=$1) qualifications`,
+      [context.runId],
+    )).rows[0]).toEqual({
+      manifests: 0,
+      qualifications: 0,
     });
   }, 30_000);
 
@@ -4952,6 +6628,713 @@ databaseDescribe("Pipeline V3 governed manifest persistence", () => {
       }
     }
   }, 60_000);
+
+  test("retains a terminal evidence-acquisition receipt across a crash and worker reclaim", async () => {
+    const context = await createLeasedRun(
+      1,
+      "durable-evidence-acquisition-reclaim",
+      undefined,
+      "Create 1 reggaeton or dembow track",
+      "or_membership",
+      6,
+    );
+    const strategy = retrievalStrategiesForEnginesV3(
+      context.queryPlan.engines,
+    ).find(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds.includes("hosted_web")
+    ))!;
+    const leaf = verificationLeavesV1(
+      context.queryPlan.verificationExpression!,
+    ).find(({ capableProducerFamilies }) => (
+      capableProducerFamilies.includes("structured_music_metadata")
+    ))!;
+    expect(strategy).toBeTruthy();
+    expect(leaf).toBeTruthy();
+    const attemptedAt = "2026-08-02T16:00:00.000Z";
+    const proofHash = sha256Hex(stableStringify({
+      kind: "test-evidence-acquisition",
+      obligationId: leaf.obligationId,
+    }));
+    const genericRequest: DiscoveryRequestV3 = {
+      runId: context.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: context.selectionPlan,
+      engine: strategy.engine,
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: genericRequest,
+      batch: {
+        candidates: [],
+        nextCursor: null,
+        exhausted: true,
+      },
+      fence: context.fence,
+    });
+    const emptyResult = {
+      stages: {
+        discovered: 0,
+        validCandidates: 0,
+        evidenceEligible: 0,
+        storefrontPlayable: 0,
+      },
+    } as RetrievalResultV3;
+    await expect(repository.readPipelineV3SemanticCollapseDatabaseFacts({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      queryPlanHash: queryPlanV3Hash(context.queryPlan),
+      result: emptyResult,
+      capturedAt: "2026-08-02T16:00:01.000Z",
+      fence: context.fence,
+    })).resolves.toMatchObject({
+      evidenceAcquisitionAttempts: [],
+    });
+
+    const request: DiscoveryRequestV3 = {
+      ...genericRequest,
+      evidenceAcquisitionAttemptedAt: attemptedAt,
+      evidenceEnrichment: {
+        producerFamily: "structured_music_metadata",
+        dependencyRootId: "hosted_web",
+        deficitObligationIds: [leaf.obligationId],
+        strategyDeltaProofHash: proofHash,
+        automaticRescueOrdinal: 1 as const,
+      },
+    };
+    await repository.persistPipelineV3EvidenceAcquisitionAttempt({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request,
+      observation: {
+        operation: "discover",
+        attemptedAt,
+        outcome: "in_flight",
+        failureClass: null,
+        retryAfterUntil: null,
+      },
+      fence: context.fence,
+    });
+    // This is the provider-success/crash boundary: the terminal receipt is
+    // committed before the provider batch is persisted. Deliberately do not
+    // call persistPipelineV3DiscoveryBatch for this explicit request.
+    await repository.persistPipelineV3EvidenceAcquisitionAttempt({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request,
+      observation: {
+        operation: "discover",
+        attemptedAt,
+        outcome: "success",
+        failureClass: null,
+        retryAfterUntil: null,
+      },
+      fence: context.fence,
+    });
+
+    const successorWorkerId = `evidence-reclaim-${randomUUID()}`;
+    await repository.updateWorkerHeartbeat(successorWorkerId, {
+      version: context.executorReleaseIdentity.executorRevision,
+      ...(context.executorReleaseIdentity
+          .semanticExecutionConfigurationHash ? {
+          semanticExecutionConfigurationHash:
+            context.executorReleaseIdentity
+              .semanticExecutionConfigurationHash,
+        } : {}),
+      protocolVersion: "playlist-pipeline-v10",
+      capacity: 1,
+      activeJobs: 0,
+    });
+    const successorLease = (await pool.query<{ lease_epoch: string }>(
+      `UPDATE job_queue
+       SET lease_owner=$2,lease_epoch=lease_epoch+1,
+           lease_expires_at=now()+interval '5 minutes',updated_at=now()
+       WHERE id=$1
+       RETURNING lease_epoch::text`,
+      [context.fence.jobId, successorWorkerId],
+    )).rows[0]!;
+    const successorAttempt = await repository.beginPlaylistExecutionAttempt({
+      runId: context.runId,
+      contractRevisionId: context.fence.contractRevisionDatabaseId!,
+      jobId: context.fence.jobId,
+      workerId: successorWorkerId,
+      queryPlanRevisionId: context.fence.queryPlanRevisionId,
+      stage: context.fence.stageKey,
+      dependencyKey: "research",
+      attemptNumber: 2,
+      leaseGeneration: Number(successorLease.lease_epoch),
+      executorRevision: context.executorReleaseIdentity.executorRevision,
+      executorIdentityHash: "f".repeat(64),
+      executorCapabilityHash: context.queryPlan.executorCapabilityHash!,
+      executorCapabilityVector: structuredClone(
+        context.queryPlan.executorCapabilityVector!,
+      ) as unknown as Record<string, unknown>,
+      configurationHash: "c".repeat(64),
+      semanticExecutionConfigurationHash:
+        context.executorReleaseIdentity.semanticExecutionConfigurationHash,
+      idempotencyKey:
+        `${context.fence.jobId}:${successorLease.lease_epoch}:reclaim`,
+    });
+    const successorFence: PipelineV3WriteFence = {
+      ...context.fence,
+      workerId: successorWorkerId,
+      leaseEpoch: Number(successorLease.lease_epoch),
+      contractAttemptId: successorAttempt.id,
+    };
+    const restartedRepository = new Repository({
+      pool,
+      db: drizzle(pool, { schema: databaseSchema }),
+    });
+    await expect(
+      restartedRepository.readPipelineV3SemanticCollapseDatabaseFacts({
+        runId: context.runId,
+        queryPlan: context.queryPlan,
+        queryPlanHash: queryPlanV3Hash(context.queryPlan),
+        result: emptyResult,
+        capturedAt: "2026-08-02T16:01:00.000Z",
+        fence: successorFence,
+      }),
+    ).resolves.toMatchObject({
+      evidenceAcquisitionAttempts: [{
+        obligationId: leaf.obligationId,
+        producerFamily: "structured_music_metadata",
+        dependencyRootId: "hosted_web",
+        operation: "discover",
+        attemptedAt,
+        outcome: "success",
+        strategyDeltaProofHash: proofHash,
+        automaticRescueOrdinal: 1,
+        attemptCount: 1,
+      }],
+    });
+  }, 120_000);
+
+  test("retains one provider-failure evidence attempt without converting generic discovery into acquisition", async () => {
+    const context = await createLeasedRun(
+      1,
+      "durable-evidence-provider-failure",
+      undefined,
+      "Create 1 reggaeton or dembow track",
+      "or_membership",
+      6,
+    );
+    const strategy = retrievalStrategiesForEnginesV3(
+      context.queryPlan.engines,
+    ).find(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds.includes("hosted_web")
+    ))!;
+    const leaf = verificationLeavesV1(
+      context.queryPlan.verificationExpression!,
+    ).find(({ capableProducerFamilies }) => (
+      capableProducerFamilies.includes("structured_music_metadata")
+    ))!;
+    const attemptedAt = "2026-08-02T16:10:00.000Z";
+    const retryAfterUntil = "2026-08-02T16:15:00.000Z";
+    const request: DiscoveryRequestV3 = {
+      runId: context.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: context.selectionPlan,
+      engine: strategy.engine,
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+      evidenceAcquisitionAttemptedAt: attemptedAt,
+      evidenceEnrichment: {
+        producerFamily: "structured_music_metadata",
+        dependencyRootId: "hosted_web",
+        deficitObligationIds: [leaf.obligationId],
+        strategyDeltaProofHash: "b".repeat(64),
+        automaticRescueOrdinal: 1 as const,
+      },
+    };
+    await repository.persistPipelineV3EvidenceAcquisitionAttempt({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request,
+      observation: {
+        operation: "discover",
+        attemptedAt,
+        outcome: "in_flight",
+        failureClass: null,
+        retryAfterUntil: null,
+      },
+      fence: context.fence,
+    });
+    await repository.persistPipelineV3EvidenceAcquisitionAttempt({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request,
+      observation: {
+        operation: "discover",
+        attemptedAt,
+        outcome: "provider_failure",
+        failureClass: "rate_limited",
+        retryAfterUntil,
+      },
+      fence: context.fence,
+    });
+    const facts = await repository.readPipelineV3SemanticCollapseDatabaseFacts({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      queryPlanHash: queryPlanV3Hash(context.queryPlan),
+      result: {
+        stages: {
+          discovered: 0,
+          validCandidates: 0,
+          evidenceEligible: 0,
+          storefrontPlayable: 0,
+        },
+      } as RetrievalResultV3,
+      capturedAt: "2026-08-02T16:10:01.000Z",
+      fence: context.fence,
+    });
+    expect(facts.evidenceAcquisitionAttempts).toEqual([{
+      obligationId: leaf.obligationId,
+      producerFamily: "structured_music_metadata",
+      dependencyRootId: "hosted_web",
+      operation: "discover",
+      attemptedAt,
+      outcome: "provider_failure",
+      failureClass: "rate_limited",
+      retryAfterUntil,
+      strategyDeltaProofHash: "b".repeat(64),
+      automaticRescueOrdinal: 1,
+      attemptCount: 1,
+    }]);
+  }, 120_000);
+
+  test("atomically persists candidate evidence and leaves no partial projection when binding fails", async () => {
+    const context = await createLeasedRun(
+      1,
+      "candidate-evidence-atomicity",
+      undefined,
+      "Create 1 reggaeton or dembow track",
+      "or_membership",
+      6,
+    );
+    const strategy = retrievalStrategiesForEnginesV3(
+      context.queryPlan.engines,
+    ).find(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds.includes("hosted_web")
+    ))!;
+    const source = qualifiedTrack(
+      "candidate-evidence-atomicity",
+      0,
+      ["genre:reggaeton"],
+    );
+    const candidate = {
+      id: source.candidateId,
+      artist: source.artist,
+      title: source.title,
+      album: source.album,
+      sourceObservationIds: [...source.sourceObservationIds],
+    };
+    const discoveryRequest = {
+      runId: context.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: context.selectionPlan,
+      engine: strategy.engine,
+      strategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: discoveryRequest,
+      batch: {
+        candidates: [candidate],
+        nextCursor: null,
+        exhausted: true,
+      },
+      fence: context.fence,
+    });
+    const leaf = verificationLeavesV1(
+      context.queryPlan.verificationExpression!,
+    ).find(({ clauseId, capableProducerFamilies }) => (
+      clauseId === "genre:reggaeton"
+      && capableProducerFamilies.includes("structured_music_metadata")
+    ))!;
+    const attemptedAt = "2026-08-02T16:20:00.000Z";
+    const qualificationRequest: QualificationRequestV3 = {
+      runId: context.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: context.selectionPlan,
+      engine: strategy.engine,
+      strategy,
+      strategyRound: 1,
+      candidates: [candidate],
+      evidenceAcquisitionAttemptedAt: attemptedAt,
+      evidenceEnrichment: {
+        producerFamily: "structured_music_metadata",
+        dependencyRootId: "hosted_web",
+        deficitObligationIds: [leaf.obligationId],
+        strategyDeltaProofHash: "c".repeat(64),
+        automaticRescueOrdinal: 1 as const,
+      },
+    };
+    const qualification = {
+      candidateId: candidate.id,
+      scope: {
+        passed: true,
+        failedMembershipPredicateIds: [],
+        fit: 0.95,
+      },
+      hardConstraints: {
+        passed: true,
+        failedConstraintIds: [],
+      },
+      evidence: {
+        passed: true,
+        bindingIds: source.evidenceBindingIds,
+        bindings: source.evidenceBindings,
+        strength: source.evidenceStrength,
+        independentProvenanceRoots: source.independentProvenanceRoots,
+      },
+      version: {
+        compatible: true,
+        confidence: source.versionConfidence,
+      },
+      catalog: {
+        lookupAttempted: true,
+        storefrontPlayable: true,
+        appleSongId: source.appleSongId,
+        recordingFamilyKey: source.recordingFamilyKey,
+        confidence: source.catalogConfidence,
+      },
+      canonicalClauseAssessments: {
+        "genre:reggaeton": {
+          status: "pass" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...source.evidenceBindingIds],
+        },
+        "genre:dembow": { status: "unknown" as const },
+      },
+      rankingSignals: source.rankingSignals,
+      sourceRank: source.sourceRank,
+    };
+    const sourceUrl = source.evidenceBindings![0]!.url!;
+    await pool.query(
+      `INSERT INTO source_records(
+         id,run_id,url,title,source_class,provenance_root,note)
+       VALUES($1,$2,$3,'conflicting source','web',
+         'conflicting-provenance','test conflict')`,
+      [randomUUID(), context.runId, sourceUrl],
+    );
+    await expect(repository.persistPipelineV3QualificationBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: qualificationRequest,
+      qualifications: [qualification],
+      fence: context.fence,
+    })).rejects.toThrow("pipeline_v3_evidence_source_identity_conflict");
+    expect((await pool.query<{
+      families: number;
+      candidates: number;
+      catalog_identities: number;
+      qualifications: number;
+      bindings: number;
+      acquisition_ledgers: number;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM recording_families
+          WHERE run_id=$1) families,
+         (SELECT count(*)::int FROM track_candidates
+          WHERE run_id=$1) candidates,
+         (SELECT count(*)::int FROM recording_catalog_identities identity
+          JOIN recording_families family
+            ON family.id=identity.recording_family_id
+          WHERE family.run_id=$1) catalog_identities,
+         (SELECT count(*)::int FROM playlist_qualification_records
+          WHERE run_id=$1) qualifications,
+         (SELECT count(*)::int FROM track_scope_bindings
+          WHERE run_id=$1) bindings,
+         (SELECT count(*)::int FROM research_checkpoints
+          WHERE run_id=$1
+            AND phase='v3:evidence-acquisition:v1') acquisition_ledgers`,
+      [context.runId],
+    )).rows[0]).toEqual({
+      families: 0,
+      candidates: 0,
+      catalog_identities: 0,
+      qualifications: 0,
+      bindings: 0,
+      acquisition_ledgers: 0,
+    });
+
+    await pool.query(
+      "DELETE FROM source_records WHERE run_id=$1 AND url=$2",
+      [context.runId, sourceUrl],
+    );
+    await repository.persistPipelineV3QualificationBatch({
+      runId: context.runId,
+      queryPlan: context.queryPlan,
+      request: qualificationRequest,
+      qualifications: [qualification],
+      fence: context.fence,
+    });
+    const persisted = (await pool.query<{
+      qualification_candidate_id: string;
+      binding_candidate_id: string;
+      family_id: string;
+      catalog_identity_count: number;
+      source_count: number;
+    }>(
+      `SELECT qualification.candidate_id qualification_candidate_id,
+              binding.candidate_id binding_candidate_id,
+              candidate.recording_family_id family_id,
+              (SELECT count(*)::int
+               FROM recording_catalog_identities identity
+               WHERE identity.recording_family_id=
+                 candidate.recording_family_id) catalog_identity_count,
+              (SELECT count(*)::int FROM source_records
+               WHERE run_id=$1) source_count
+       FROM playlist_qualification_records qualification
+       JOIN track_candidates candidate
+         ON candidate.id=qualification.candidate_id
+       JOIN track_scope_bindings binding
+         ON binding.candidate_id=candidate.id
+       WHERE qualification.run_id=$1`,
+      [context.runId],
+    )).rows[0]!;
+    expect(persisted).toMatchObject({
+      qualification_candidate_id: expect.stringMatching(
+        /^[0-9a-f-]{36}$/u,
+      ),
+      binding_candidate_id: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+      family_id: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+      catalog_identity_count: 1,
+      source_count: 1,
+    });
+    expect(persisted.binding_candidate_id)
+      .toBe(persisted.qualification_candidate_id);
+  }, 120_000);
+
+  test("never binds either legacy null qualification path in place", async () => {
+    const batchContext = await createLeasedRun(
+      1,
+      "legacy-null-qualification-batch",
+      undefined,
+      "Create 1 reggaeton or dembow track",
+      "or_membership",
+    );
+    const batchStrategy = retrievalStrategiesForEnginesV3(
+      batchContext.queryPlan.engines,
+    ).find(({ discoveryDependencyIds }) => (
+      discoveryDependencyIds.includes("hosted_web")
+    ))!;
+    const source = qualifiedTrack(
+      "legacy-null-qualification-batch",
+      0,
+      ["genre:reggaeton"],
+    );
+    const candidate = {
+      id: source.candidateId,
+      artist: source.artist,
+      title: source.title,
+      album: source.album,
+      sourceObservationIds: [...source.sourceObservationIds],
+    };
+    const discoveryRequest = {
+      runId: batchContext.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: batchContext.selectionPlan,
+      engine: batchStrategy.engine,
+      strategy: batchStrategy,
+      strategyRound: 1,
+      cursor: null,
+      requestedRawCandidateCount: 1,
+      alreadyDiscoveredCandidateIds: [],
+      alreadyDiscoveredTracks: [],
+      qualifiedRecordingFamilyKeys: [],
+      qualifiedTrackSeeds: [],
+    };
+    await repository.persistPipelineV3DiscoveryBatch({
+      runId: batchContext.runId,
+      queryPlan: batchContext.queryPlan,
+      request: discoveryRequest,
+      batch: {
+        candidates: [candidate],
+        nextCursor: null,
+        exhausted: true,
+      },
+      fence: batchContext.fence,
+    });
+    const batchQualification = {
+      candidateId: candidate.id,
+      scope: {
+        passed: true,
+        failedMembershipPredicateIds: [],
+        fit: 0.95,
+      },
+      hardConstraints: { passed: true, failedConstraintIds: [] },
+      evidence: {
+        passed: true,
+        bindingIds: source.evidenceBindingIds,
+        bindings: source.evidenceBindings,
+        strength: source.evidenceStrength,
+        independentProvenanceRoots: source.independentProvenanceRoots,
+      },
+      version: {
+        compatible: true,
+        confidence: source.versionConfidence,
+      },
+      catalog: {
+        lookupAttempted: true,
+        storefrontPlayable: true,
+        appleSongId: source.appleSongId,
+        recordingFamilyKey: source.recordingFamilyKey,
+        confidence: source.catalogConfidence,
+      },
+      canonicalClauseAssessments: {
+        "genre:reggaeton": {
+          status: "pass" as const,
+          evidenceGrade: "track_specific_editorial_assertion" as const,
+          evidenceIds: [...source.evidenceBindingIds],
+        },
+        "genre:dembow": { status: "unknown" as const },
+      },
+      rankingSignals: source.rankingSignals,
+      sourceRank: source.sourceRank,
+    };
+    const batchRequest = {
+      runId: batchContext.runId,
+      executionMode: "active" as const,
+      appleWriteAccess: "forbidden" as const,
+      plan: batchContext.selectionPlan,
+      engine: batchStrategy.engine,
+      strategy: batchStrategy,
+      candidates: [candidate],
+    };
+    await repository.persistPipelineV3QualificationBatch({
+      runId: batchContext.runId,
+      queryPlan: batchContext.queryPlan,
+      request: batchRequest,
+      qualifications: [batchQualification],
+      fence: batchContext.fence,
+    });
+    await pool.query(
+      `UPDATE playlist_qualification_records
+       SET candidate_id=NULL
+       WHERE run_id=$1`,
+      [batchContext.runId],
+    );
+    const batchLegacyBefore = (await pool.query<{ row: unknown }>(
+      `SELECT to_jsonb(qualification) row
+       FROM playlist_qualification_records qualification
+       WHERE run_id=$1`,
+      [batchContext.runId],
+    )).rows[0]!.row;
+    await expect(repository.persistPipelineV3QualificationBatch({
+      runId: batchContext.runId,
+      queryPlan: batchContext.queryPlan,
+      request: batchRequest,
+      qualifications: [batchQualification],
+      fence: batchContext.fence,
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_legacy_unbound_qualification_requires_successor",
+    });
+    expect((await pool.query<{ row: unknown }>(
+      `SELECT to_jsonb(qualification) row
+       FROM playlist_qualification_records qualification
+       WHERE run_id=$1`,
+      [batchContext.runId],
+    )).rows[0]!.row).toEqual(batchLegacyBefore);
+
+    const finalContext = await createLeasedRun(
+      1,
+      "legacy-null-scheduler-rejection",
+      undefined,
+      "Create 1 reggaeton or dembow track",
+      "or_membership",
+    );
+    const base = retrievalResult({
+      runId: finalContext.runId,
+      target: 1,
+      selectedCount: 0,
+      status: "no_compatible_tracks",
+      prefix: "legacy-null-scheduler-rejection",
+    });
+    const candidateKey = sha256Hex(
+      "legacy-null-scheduler-rejection-candidate",
+    );
+    const result: RetrievalResultV3 = {
+      ...base,
+      candidateLeads: [{
+        strategyId: base.strategies[0]!.id,
+        candidateKey,
+        artist: "Legacy Scheduler Artist",
+        title: "Legacy Scheduler Track",
+        album: null,
+        sourceRecordIds: [],
+        citationHashes: [],
+        predicateCoverage: ["genre:reggaeton"],
+        rejectionCode: "scheduler_scope_rejection",
+        discoveryDependencyIds:
+          base.strategies[0]!.discoveryDependencyIds,
+        provenanceRoots: [],
+        cacheOrigin: "live",
+        sourceFreshUntil: null,
+      }],
+    };
+    await repository.persistPipelineV3RetrievalResult({
+      runId: finalContext.runId,
+      queryPlan: finalContext.queryPlan,
+      plan: finalContext.selectionPlan,
+      result,
+      fence: finalContext.fence,
+    });
+    await pool.query(
+      `UPDATE playlist_qualification_records
+       SET candidate_id=NULL
+       WHERE run_id=$1 AND decision='failed'`,
+      [finalContext.runId],
+    );
+    const finalLegacyBefore = (await pool.query<{ row: unknown }>(
+      `SELECT to_jsonb(qualification) row
+       FROM playlist_qualification_records qualification
+       WHERE run_id=$1 AND decision='failed'`,
+      [finalContext.runId],
+    )).rows[0]!.row;
+    await expect(repository.persistPipelineV3RetrievalResult({
+      runId: finalContext.runId,
+      queryPlan: finalContext.queryPlan,
+      plan: finalContext.selectionPlan,
+      result,
+      fence: finalContext.fence,
+    })).rejects.toMatchObject({
+      code: "pipeline_v3_legacy_unbound_qualification_requires_successor",
+    });
+    expect((await pool.query<{ row: unknown }>(
+      `SELECT to_jsonb(qualification) row
+       FROM playlist_qualification_records qualification
+       WHERE run_id=$1 AND decision='failed'`,
+      [finalContext.runId],
+    )).rows[0]!.row).toEqual(finalLegacyBefore);
+  }, 120_000);
 
   test("rejects a stale lease before it can persist candidates, manifests, or Apple work", async () => {
     const context = await createLeasedRun(25, "stale-lease");

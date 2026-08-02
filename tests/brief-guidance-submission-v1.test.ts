@@ -20,6 +20,81 @@ const readyPreflight: BriefAnswersPreflightV1 = {
 };
 
 describe("initial brief guidance submission service", () => {
+  test("persists review without consulting new-work gates or providers", async () => {
+    const executionAction = {
+      decisionHash: "1".repeat(64),
+      optionId: "review_interpretation",
+      kind: "review_interpretation" as const,
+      startsResearch: false,
+      actionHash: "2".repeat(64),
+    };
+    const preflight = vi.fn(async () => ({
+      ...readyPreflight,
+      executionAction,
+    }));
+    const authorizeNewWork = vi.fn();
+    const resolveCustomArtistIdentities = vi.fn();
+    const submit = vi.fn(async ({ authority }) => {
+      expect(authority).toBeUndefined();
+      return {
+        status: "review_required" as const,
+        created: true,
+        executionAction,
+      };
+    });
+
+    await expect(submitBriefGuidanceAnswersV1({
+      customTexts: [],
+      preflight,
+      authorizeNewWork,
+      resolveCustomArtistIdentities,
+      submit,
+    })).resolves.toEqual({
+      status: "submitted",
+      submission: {
+        status: "review_required",
+        created: true,
+        executionAction,
+      },
+    });
+    expect(preflight).toHaveBeenCalledTimes(2);
+    expect(authorizeNewWork).not.toHaveBeenCalled();
+    expect(resolveCustomArtistIdentities).not.toHaveBeenCalled();
+  });
+
+  test("replays a durable cancellation before new-work gates", async () => {
+    const executionAction = {
+      decisionHash: "3".repeat(64),
+      optionId: "cancel_request",
+      kind: "cancel_request" as const,
+      startsResearch: false,
+      actionHash: "4".repeat(64),
+    };
+    const authorizeNewWork = vi.fn();
+    const submit = vi.fn();
+
+    await expect(submitBriefGuidanceAnswersV1({
+      customTexts: [],
+      preflight: vi.fn(async () => ({
+        status: "prior" as const,
+        resultStatus: "cancelled" as const,
+        executionAction,
+      })),
+      authorizeNewWork,
+      resolveCustomArtistIdentities: vi.fn(),
+      submit,
+    })).resolves.toEqual({
+      status: "submitted",
+      submission: {
+        status: "cancelled",
+        created: false,
+        executionAction,
+      },
+    });
+    expect(authorizeNewWork).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+  });
+
   test("returns a durable prior before new-work gates or providers", async () => {
     const preflight = vi.fn(async () => ({
       status: "prior" as const,

@@ -106,7 +106,6 @@ import {
   parseSourcePolicyApprovalV3,
 } from "./evidence-graph-owner-api-v3.ts";
 import { persistedWorkerPipeline } from "./pipeline-worker-routing.ts";
-import { isSmoothReggaetonHeatRequestV3 } from "./adaptive-guidance-v3.ts";
 import { readReleaseCanaryInventory } from "./release-canary-inventory.ts";
 import {
   authenticateReleaseCanary,
@@ -132,11 +131,18 @@ import {
 } from "./release-manifest-canary.ts";
 import {
   createPublicRolloutAssignmentV1,
+  createV254DirectExposureAssignmentV1,
+  publicRolloutDatabaseAuthorityActiveV1,
   publicRolloutAssignmentStickyKeyV1,
-  publicRolloutAssignmentPausedV1,
+  publicRolloutAdmissionDispositionV1,
   publicRolloutCanonicalContractRequestedV1,
+  publicRolloutIntentGroupForPromptV1,
   publicRolloutRuntimeDatabaseAuthorityV1,
+  v254DirectExposureRuntimeDatabaseAuthorityV1,
 } from "./public-rollout-assignment.ts";
+import {
+  canonicalContractFallbackRequestedV1,
+} from "./canonical-contract-route-authority-v1.ts";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const BULK_SELECTION_BODY_BYTES = 1024 * 1024;
@@ -415,7 +421,10 @@ async function assertNotPaused(kind: "research" | "publishing" | "feedback"): Pr
   }
 }
 
-async function enqueueResearchResume(runId: string): Promise<void> {
+async function enqueueResearchResume(
+  runId: string,
+  options: { requireExecutionRouteReceipt?: boolean } = {},
+): Promise<void> {
   const [run, saved, manifestCanaryMarker] = await Promise.all([
     repository.getRun(runId),
     repository.getResearchCheckpoint(runId, "resume") as Promise<ResearchResumeCheckpoint | null>,
@@ -433,11 +442,15 @@ async function enqueueResearchResume(runId: string): Promise<void> {
         "release_manifest_canary_integrity",
       );
     }
-    await repository.enqueueJob(pipelineV3ResearchJob(
-      runId,
-      pipeline.queryPlan!,
-      marker ? "shadow" : "active",
-    ));
+    await repository.enqueueJob({
+      ...pipelineV3ResearchJob(
+        runId,
+        pipeline.queryPlan!,
+        marker ? "shadow" : "active",
+      ),
+      requireExecutionRouteReceipt:
+        options.requireExecutionRouteReceipt === true,
+    });
     return;
   }
   if (manifestCanaryMarker !== null) {
@@ -458,7 +471,11 @@ async function enqueueResearchResume(runId: string): Promise<void> {
     fast = Boolean(route || started);
     fastRoute = parseFastRouteCheckpoint(route, policy.version);
   }
-  await repository.enqueueJob(researchResumeJob(runId, saved, { fast, fastRoute }));
+  await repository.enqueueJob({
+    ...researchResumeJob(runId, saved, { fast, fastRoute }),
+    requireExecutionRouteReceipt:
+      options.requireExecutionRouteReceipt === true,
+  });
 }
 
 app.get("/health/live", async () => {
@@ -584,13 +601,21 @@ app.get("/health/system", async (_request, reply) => {
   try {
     const api = apiRuntimeIdentityV1();
     const capabilityPepper = capabilityPepperRotationStatus();
-    const [health, publicRolloutDatabaseAuthority] = await Promise.all([
+    const [health, publicRolloutDatabaseAuthority,
+      directExposureDatabaseAuthority] = await Promise.all([
       repository.getSystemHealth(),
       repository.getPublicRolloutDatabaseAuthority(),
+      repository.getV254DirectExposureDatabaseAuthority(),
     ]);
     const publicRollout = publicRolloutRuntimeDatabaseAuthorityV1({
       databaseAuthority: publicRolloutDatabaseAuthority,
     });
+    const directExposure = v254DirectExposureRuntimeDatabaseAuthorityV1({
+      databaseAuthority: directExposureDatabaseAuthority,
+    });
+    if (directExposure && publicRollout) {
+      throw new Error("standard and direct rollout authorities are mutually exclusive");
+    }
     const schemaVersion = health.database.schemaVersion;
     const releaseManifestCanaryGuardsVersion =
       health.database.releaseManifestCanaryGuardsVersion ?? null;
@@ -667,6 +692,31 @@ app.get("/health/system", async (_request, reply) => {
             stage: null,
             targetConfigurationHash: null,
           },
+      directExposure: directExposure
+        ? {
+            active: directExposure.active,
+            state: directExposure.state,
+            databaseAuthorized: true,
+            authorityPayloadHash: directExposure.authorityPayloadHash,
+            rollbackWarrantPayloadHash:
+              directExposure.rollbackWarrantPayloadHash,
+            stage: directExposure.stage,
+            targetConfigurationHash:
+              directExposure.targetConfigurationHash,
+            exposureClass: directExposure.exposureClass,
+            organicReliabilityProven: false,
+          }
+        : {
+            active: false,
+            state: null,
+            databaseAuthorized: true,
+            authorityPayloadHash: null,
+            rollbackWarrantPayloadHash: null,
+            stage: null,
+            targetConfigurationHash: null,
+            exposureClass: null,
+            organicReliabilityProven: false,
+          },
       capabilityPepper,
       worker: health.worker.worker_id
         ? health.worker.stale
@@ -734,13 +784,21 @@ app.get("/api/health", async () => ({ ok: await repository.ping(), service: "nee
 
 app.get("/api/v1/system/health", async () => {
   const capabilityPepper = capabilityPepperRotationStatus();
-  const [health, publicRolloutDatabaseAuthority] = await Promise.all([
+  const [health, publicRolloutDatabaseAuthority,
+    directExposureDatabaseAuthority] = await Promise.all([
     repository.getSystemHealth(),
     repository.getPublicRolloutDatabaseAuthority(),
+    repository.getV254DirectExposureDatabaseAuthority(),
   ]);
   const publicRollout = publicRolloutRuntimeDatabaseAuthorityV1({
     databaseAuthority: publicRolloutDatabaseAuthority,
   });
+  const directExposure = v254DirectExposureRuntimeDatabaseAuthorityV1({
+    databaseAuthority: directExposureDatabaseAuthority,
+  });
+  if (directExposure && publicRollout) {
+    throw new Error("standard and direct rollout authorities are mutually exclusive");
+  }
   const deploymentDatabaseReady = releaseDatabaseReadinessReady({
     environment: process.env,
     observedDatabaseSchemaVersion: health.database.schemaVersion,
@@ -794,6 +852,30 @@ app.get("/api/v1/system/health", async () => {
           evidenceHash: null,
           stage: null,
           targetConfigurationHash: null,
+        },
+    directExposure: directExposure
+      ? {
+          active: directExposure.active,
+          state: directExposure.state,
+          databaseAuthorized: true,
+          authorityPayloadHash: directExposure.authorityPayloadHash,
+          rollbackWarrantPayloadHash:
+            directExposure.rollbackWarrantPayloadHash,
+          stage: directExposure.stage,
+          targetConfigurationHash: directExposure.targetConfigurationHash,
+          exposureClass: directExposure.exposureClass,
+          organicReliabilityProven: false,
+        }
+      : {
+          active: false,
+          state: null,
+          databaseAuthorized: true,
+          authorityPayloadHash: null,
+          rollbackWarrantPayloadHash: null,
+          stage: null,
+          targetConfigurationHash: null,
+          exposureClass: null,
+          organicReliabilityProven: false,
         },
     capabilityPepper,
     worker: {
@@ -901,30 +983,92 @@ app.post<{
     );
   }
   const expandedTrackCountRequested = preliminaryTrackCountAdmission.expanded;
+  const signedOwnerCanaryAuthority =
+    isOwner(caller) && releaseCanary !== null;
+  const signedReleaseCanaryAuthority = releaseCanary !== null;
+  if (expandedTrackCountRequested && !signedOwnerCanaryAuthority) {
+    throw new HttpError(
+      403,
+      "Playlist sizes above 300 require a signed owner-canary route authority",
+      "expanded_track_count_route_authority_required",
+    );
+  }
   const key = request.body?.idempotencyKey ? idempotencyKey(request, request.body.idempotencyKey) : undefined;
   const publicRolloutStickyKey = publicRolloutAssignmentStickyKeyV1({
     owner: isOwner(caller),
     clientBucket: caller.clientBucket,
     releaseCanary,
   });
-  const publicRolloutDatabaseAuthority = publicRolloutStickyKey !== null
+  const [publicRolloutDatabaseAuthority, directExposureDatabaseAuthority] =
+    Number.isSafeInteger(targetTrackCount)
+      ? await Promise.all([
+          repository.getPublicRolloutDatabaseAuthority(),
+          repository.getV254DirectExposureDatabaseAuthority(),
+        ])
+      : [null, null];
+  const directExposureAssignment = publicRolloutStickyKey !== null
     && Number.isSafeInteger(targetTrackCount)
-    ? await repository.getPublicRolloutDatabaseAuthority()
-    : null;
-  const publicRolloutAssignment = publicRolloutStickyKey !== null
-    && Number.isSafeInteger(targetTrackCount)
-    ? createPublicRolloutAssignmentV1({
+    ? createV254DirectExposureAssignmentV1({
         prompt,
         requestedTrackCount: Number(targetTrackCount),
         stickyKey: publicRolloutStickyKey,
-        databaseAuthority: publicRolloutDatabaseAuthority,
+        databaseAuthority: directExposureDatabaseAuthority,
       })
     : null;
-  if (publicRolloutAssignment?.assigned === true
-    && await repository.isPipelineCohortDisabled({
-      route: "corpus_first_v3",
-      intentGroup: publicRolloutAssignment.intentGroup,
-    })) {
+  if (
+    directExposureAssignment
+    && publicRolloutDatabaseAuthorityActiveV1(publicRolloutDatabaseAuthority)
+  ) {
+    throw new HttpError(
+      503,
+      "Standard and direct rollout authorities are both active",
+      "rollout_authority_conflict",
+    );
+  }
+  const publicRolloutAssignment = directExposureAssignment
+    ?? (publicRolloutStickyKey !== null && Number.isSafeInteger(targetTrackCount)
+      ? createPublicRolloutAssignmentV1({
+          prompt,
+          requestedTrackCount: Number(targetTrackCount),
+          stickyKey: publicRolloutStickyKey,
+          databaseAuthority: publicRolloutDatabaseAuthority,
+        })
+      : null);
+  // Assignment remains signed-authority-only, while admission classification
+  // is deterministic and authority-independent. A missing/0% rollout must
+  // never disable containment or make an affected request fall back to V2.
+  const publicRolloutAdmissionIntent = Number.isSafeInteger(targetTrackCount)
+    ? publicRolloutIntentGroupForPromptV1({
+        prompt,
+        requestedTrackCount: Number(targetTrackCount),
+      })
+    : null;
+  const [publicRolloutHardSwitchDisabled, publicRolloutGlobalPause,
+    publicRolloutIntentPause] = await Promise.all([
+    publicRolloutAdmissionIntent === null
+      ? false
+      : repository.isPipelineCohortDisabled({
+          route: "corpus_first_v3",
+          intentGroup: publicRolloutAdmissionIntent,
+        }),
+    repository.getSetting("pipeline_v3_public_assignment_paused")
+      .then((value) => value === "true"),
+    publicRolloutAdmissionIntent === null
+      ? false
+      : repository.getSetting(
+          `pipeline_v3_public_assignment_paused:${publicRolloutAdmissionIntent}`,
+        ).then((value) => value === "true"),
+  ]);
+  const publicRolloutAdmissionDisposition =
+    publicRolloutAdmissionDispositionV1({
+      assignment: publicRolloutAssignment,
+      classifiedIntentGroup: publicRolloutAdmissionIntent,
+      signedCanary: releaseCanary !== null,
+      hardSwitchDisabled: publicRolloutHardSwitchDisabled,
+      publicAssignmentPaused: publicRolloutGlobalPause,
+      intentPublicAssignmentPaused: publicRolloutIntentPause,
+    });
+  if (publicRolloutAdmissionDisposition === "hard_disabled") {
     reply.header("Retry-After", "300");
     throw new HttpError(
       503,
@@ -932,14 +1076,7 @@ app.post<{
       "pipeline_route_hard_disabled",
     );
   }
-  if (publicRolloutAssignmentPausedV1({
-    assignment: publicRolloutAssignment,
-    owner: isOwner(caller),
-    signedCanary: releaseCanary !== null,
-    publicAssignmentPaused:
-      await repository.getSetting("pipeline_v3_public_assignment_paused")
-        === "true",
-  })) {
+  if (publicRolloutAdmissionDisposition === "public_paused") {
     reply.header("Retry-After", "300");
     throw new HttpError(
       503,
@@ -950,12 +1087,11 @@ app.post<{
   const canonicalContractCohortRequested = expandedTrackCountRequested
     || publicRolloutCanonicalContractRequestedV1({
       assignment: publicRolloutAssignment,
-      fallbackRequested:
-        process.env.GUIDANCE_CONTRACT_V3_ENABLED === "true"
-        || (process.env.GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED === "true"
-          && isSmoothReggaetonHeatRequestV3(prompt))
-        || (process.env.GUIDANCE_CONTRACT_V3_OWNER_CANARY === "true"
-          && isOwner(caller)),
+      fallbackRequested: canonicalContractFallbackRequestedV1({
+        owner: isOwner(caller),
+        signedOwnerCanary: signedOwnerCanaryAuthority,
+        signedReleaseCanary: signedReleaseCanaryAuthority,
+      }),
     });
   const canonicalActivationConfigured = canonicalContractActivationConfigured(process.env);
   const [
@@ -1032,6 +1168,11 @@ app.post<{
     briefContractVersion,
     publicRolloutAssignment,
     releaseCanary,
+    contract3RouteAuthority: signedOwnerCanaryAuthority
+      ? "signed_owner_canary"
+      : signedReleaseCanaryAuthority
+        ? "signed_release_canary"
+        : null,
     allowExecutableTrackCount: expandedTrackCountRequested,
   });
   await capabilities.authorizeBrief(request, reply, created.id);
@@ -1045,7 +1186,21 @@ app.post<{
     });
   }
   if (publicRolloutAssignment?.assigned === true) {
-    reply
+    if (publicRolloutAssignment.version === "signed_public_direct_exposure_v1") {
+      reply
+        .header(
+          "x-genio-direct-exposure-authority-hash",
+          publicRolloutAssignment.rolloutEvidenceHash,
+        )
+        .header(
+          "x-genio-direct-exposure-stage",
+          "editorial_influence:0->100:fully_exposed_unproven",
+        )
+        .header(
+          "x-genio-direct-exposure-assignment-hash",
+          publicRolloutAssignment.assignmentHash,
+        );
+    } else reply
       .header(
         "x-genio-public-rollout-evidence-hash",
         publicRolloutAssignment.rolloutEvidenceHash,
@@ -1075,7 +1230,12 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
   };
   const canonicalBrief = brief.status === "complete" && isPlaylistBrief(brief.brief)
     ? canonicalBriefForRequest(executionContext, brief.brief)
-    : ["awaiting_answers", "finalizing"].includes(brief.status) && isPlaylistBrief(brief.brief)
+    : [
+        "awaiting_answers",
+        "finalizing",
+        "review_required",
+        "cancelled",
+      ].includes(brief.status) && isPlaylistBrief(brief.brief)
       ? canonicalBriefForRequest(executionContext, brief.brief)
     : undefined;
   return publicBriefStatusView({
@@ -1089,6 +1249,7 @@ app.get<{ Params: { id: string } }>("/api/v1/brief/:id", async (request, reply) 
     checkpointMode: brief.checkpointMode,
     confirmationKind: brief.confirmationKind,
     interpretationSummary: brief.interpretationSummary,
+    executionAction: brief.executionAction,
     brief: canonicalBrief,
     questions: Array.isArray(brief.questions) ? brief.questions : [],
     answers: Array.isArray(brief.answers) && brief.answers.length > 0 ? brief.answers : undefined,
@@ -1258,6 +1419,9 @@ app.post<{
           questions: submitted.questions,
         }
       : {}),
+    ...("executionAction" in submitted && submitted.executionAction
+      ? { executionAction: submitted.executionAction }
+      : {}),
     pollAfterMs: submitted.status === "finalizing" ? 1_500 : undefined,
   });
 });
@@ -1304,24 +1468,6 @@ app.post<{
       "invalid_manifest_canary_mode",
     );
   }
-  const manifestCanaryAllowed = !manifestOnly
-    || manifestOnlyReleaseCanaryAllowed({
-      releaseEnvironment: releaseCanary?.environment ?? null,
-      owner: isOwner(caller),
-      publicAssignmentPaused:
-        await repository.getSetting("pipeline_v3_public_assignment_paused")
-          === "true",
-    });
-  if (
-    manifestOnly
-    && !manifestCanaryAllowed
-  ) {
-    throw new HttpError(
-      403,
-      "Production manifest-only canaries require a signed owner request while public assignment is paused",
-      "release_manifest_canary_owner_gate_required",
-    );
-  }
   await assertNotPaused("research");
   await requireWorkerForNewWork();
   const briefRequestId = uuid(request.body?.briefRequestId, "Brief request ID");
@@ -1349,6 +1495,44 @@ app.post<{
   const requestedTrackCount = submittedTrackCount
     ?? executionRequestedTrackCount
     ?? canonicalExactTrackCount;
+  const manifestCanaryIntent = manifestOnly
+    && Number.isSafeInteger(requestedTrackCount)
+    ? publicRolloutIntentGroupForPromptV1({
+        prompt: interpreted.prompt,
+        requestedTrackCount: Number(requestedTrackCount),
+      })
+    : null;
+  const [manifestGlobalPause, manifestIntentPause] = manifestOnly
+    ? await Promise.all([
+        repository.getSetting("pipeline_v3_public_assignment_paused")
+          .then((value) => value === "true"),
+        manifestCanaryIntent === null
+          ? false
+          : repository.getSetting(
+              `pipeline_v3_public_assignment_paused:${manifestCanaryIntent}`,
+            ).then((value) => value === "true"),
+      ])
+    : [false, false];
+  const manifestDirectExposure = manifestOnly && releaseCanary !== null
+    ? v254DirectExposureRuntimeDatabaseAuthorityV1({
+        databaseAuthority:
+          await repository.getV254DirectExposureDatabaseAuthority(),
+      })
+    : null;
+  const manifestCanaryAllowed = !manifestOnly
+    || manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: releaseCanary?.environment ?? null,
+      signedCanary: releaseCanary !== null,
+      publicAssignmentPaused: manifestGlobalPause || manifestIntentPause,
+      signedDirectExposureActive: manifestDirectExposure?.active === true,
+    });
+  if (!manifestCanaryAllowed) {
+    throw new HttpError(
+      403,
+      "Production manifest-only canaries require a signed request while the exact public route remains paused",
+      "release_manifest_canary_owner_gate_required",
+    );
+  }
   if (manifestOnly && (
     !Number.isSafeInteger(requestedTrackCount)
     || Number(requestedTrackCount) < 1
@@ -1465,6 +1649,13 @@ app.post<{
     );
   }
   const runBudgetUsd = isOwner(caller) ? confirmedEstimateUsd : publicRunBudget;
+  // Owner identity may disable result reuse, but it is not execution-route
+  // authority. Only the separately authenticated run-scoped canary below may
+  // enter an owner canary cohort inside createRunIdempotent.
+  const forceFreshResearch =
+    isOwner(caller) || releaseCanary !== null;
+  const signedOwnerCanaryRunAuthority =
+    isOwner(caller) && releaseCanary !== null;
   const created = await repository.createRunIdempotent({
     prompt: interpreted.prompt,
     briefRequestId,
@@ -1478,15 +1669,20 @@ app.post<{
     idempotencyKey: key,
     autoPublish: !manifestOnly && executionRequestedTrackCount !== null,
     capabilitySessionId: briefSession.id,
-    forceFreshResearch: isOwner(caller) || releaseCanary !== null,
+    forceFreshResearch,
     releaseCanary,
+    releaseCanaryOwnerAuthorized: signedOwnerCanaryRunAuthority,
     releaseManifestCanary: manifestOnly,
     releaseManifestCanaryOwnerAuthorized: manifestOnly && isOwner(caller),
+    releaseManifestCanarySignedAuthorized:
+      manifestOnly && releaseCanary !== null,
   });
   // A repeated idempotent request repairs a crash between the committed run
   // transaction and the queue insert. Cached completed runs need no handoff.
   if (!created.reused && created.status === "queued") {
-    await enqueueResearchResume(created.runId);
+    await enqueueResearchResume(created.runId, {
+      requireExecutionRouteReceipt: created.created,
+    });
   }
   const capability = await capabilities.issue(created.runId, created.accessId);
   const run = await repository.getRunByAccess(created.accessId);
@@ -1606,6 +1802,75 @@ app.get<{
   return repository.getPlaylistGuidanceHistory({
     runId: session.runId,
     sourceAccessId: accessId,
+  });
+});
+
+app.post<{
+  Params: { id: string };
+  Body: {
+    expectedGeneration?: unknown;
+    incidentReference?: unknown;
+    expectedContractRevisionId?: unknown;
+    expectedContractSemanticHash?: unknown;
+    idempotencyKey?: unknown;
+  };
+}>("/api/v1/runs/:id/replay-after-repair", async (request, reply) => {
+  await assertNotPaused("research");
+  await requireWorkerForNewWork();
+  const accessId = uuid(request.params.id, "Run ID");
+  const session = await sessionForAccess(request, accessId);
+  const key = idempotencyKey(request, request.body?.idempotencyKey);
+  await repository.consumeRateLimit(
+    identity(request).clientBucketAliases,
+    "mutation",
+    120,
+    1,
+  );
+  const expectedGeneration = Number(request.body?.expectedGeneration);
+  const incidentReference = typeof request.body?.incidentReference === "string"
+    ? request.body.incidentReference.normalize("NFKC").trim()
+    : "";
+  const expectedContractRevisionId = uuid(
+    request.body?.expectedContractRevisionId,
+    "Contract revision ID",
+  );
+  const expectedContractSemanticHash = typeof request.body
+    ?.expectedContractSemanticHash === "string"
+    ? request.body.expectedContractSemanticHash.trim().toLowerCase()
+    : "";
+  if (!Number.isSafeInteger(expectedGeneration)
+    || expectedGeneration < 1
+    || !incidentReference
+    || incidentReference.length > 160
+    || !/^[a-f0-9]{64}$/u.test(expectedContractSemanticHash)) {
+    throw new HttpError(
+      400,
+      "Repair replay fence is invalid",
+      "invalid_repair_replay_fence",
+    );
+  }
+  const replay = await repository.replayCanonicalRunAfterRepair({
+    runId: session.runId,
+    sourceAccessId: accessId,
+    capabilitySessionId: session.id,
+    expectedGeneration,
+    expectedIncidentReference: incidentReference,
+    expectedContractRevisionId,
+    expectedContractSemanticHash,
+    idempotencyKey: key,
+  });
+  return reply.code(replay.created ? 202 : 200).send({
+    requestId: replay.briefRequestId,
+    status: replay.status,
+    pollAfterMs: 1_500,
+    replay: {
+      created: replay.created,
+      sourceAccessId: accessId,
+      successorKind: replay.successorKind,
+      resultReuse: replay.resultReuse,
+      autoPublication: replay.autoPublication,
+      next: "brief_guidance",
+    },
   });
 });
 

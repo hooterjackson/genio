@@ -640,6 +640,506 @@ test("Guidance V5 gives precise contract-3 requests a useful executable nuance q
   expect(saved).not.toHaveProperty("estimateUsd");
 });
 
+test("Contract-3 V5 scouts through the sanitized path and lets a validated nomination select a server axis", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-contract3-v5-scout");
+  vi.stubEnv("GUIDANCE_V5_ENABLED", "true");
+  const sourceUrl = "https://example.org/rainy-night-sequencing";
+  const responseBodies: Record<string, unknown>[] = [];
+  const scoutBrief: PlaylistBrief = {
+    ...draftBrief,
+    relationship: "expresses a rainy-night atmosphere",
+    orderingPolicy: "editorial flow",
+  };
+  const fetchMock = vi.fn(async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    responseBodies.push(body);
+    if (responseBodies.length === 1) {
+      return new Response(JSON.stringify({
+        id: "response-contract3-v5-brief",
+        model: "gpt-5.4-mini",
+        usage: { input_tokens: 180, output_tokens: 100 },
+        output_text: JSON.stringify(scoutBrief),
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const question = {
+      decisionKey: "rainy_night_close_call_priority",
+      header: "Rainy-night close calls",
+      question: "What should break close calls between rainy-night tracks?",
+      whyMaterial:
+        "The answer changes which recording wins when several candidates fit the confirmed scope equally well.",
+      groundingSummary:
+        "Close matches can be resolved by musical fit, whole-playlist cohesion, or discovery value.",
+      sourceUrls: [sourceUrl],
+      options: [
+        {
+          label: "Closest musical fit",
+          description: "Favor the recording with the closest overall musical fit.",
+          effect: {
+            kind: "research_preference",
+            value: "break rainy-night close calls by closest musical fit",
+            orderingBehavior: null,
+            geographyConstraint: null,
+          },
+        },
+        {
+          label: "Playlist cohesion",
+          description: "Favor the recording that makes the playlist most coherent.",
+          effect: {
+            kind: "research_preference",
+            value: "break rainy-night close calls by playlist cohesion",
+            orderingBehavior: null,
+            geographyConstraint: null,
+          },
+        },
+        {
+          label: "More discovery",
+          description: "Favor the less obvious qualifying recording.",
+          effect: {
+            kind: "research_preference",
+            value: "break rainy-night close calls toward discovery",
+            orderingBehavior: null,
+            geographyConstraint: null,
+          },
+        },
+      ],
+    };
+    const outputText = JSON.stringify({ questions: [question] });
+    return new Response(JSON.stringify({
+      id: "response-contract3-v5-scout",
+      model: "gpt-5.4-mini",
+      usage: { input_tokens: 220, output_tokens: 160 },
+      output_text: outputText,
+      output: [
+        {
+          type: "web_search_call",
+          id: "search-rainy-night-sequencing",
+          status: "completed",
+          action: {
+            type: "search",
+            query: "rainy night playlist editorial sequencing",
+            sources: [{
+              type: "url",
+              url: sourceUrl,
+              title: "Rainy-night sequencing",
+            }],
+          },
+        },
+        {
+          type: "message",
+          id: "message-contract3-v5-scout",
+          content: [{
+            type: "output_text",
+            text: outputText,
+            annotations: [],
+          }],
+        },
+      ],
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-contract3-v5-scout",
+      prompt: "Create a rainy-night playlist",
+      requestedTrackCount: 75,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+      briefContractVersion: 3 as const,
+    })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => ({
+      reservationId: `reservation-${operation}`,
+    })),
+    reconcileProviderCost: vi.fn(async () => undefined),
+    releaseProviderCost: vi.fn(async () => undefined),
+    getActivePlaylistContractRevision: vi.fn(async () => null),
+    savePlaylistContractRevision: vi.fn(async (input: {
+      contractHash: string;
+      contract: Record<string, unknown>;
+    }) => ({
+      id: "contract3-v5-scout-base",
+      contractHash: input.contractHash,
+      contract: input.contract,
+    })),
+    savePlaylistFeasibilitySnapshot: vi.fn(async () => ({
+      id: "feasibility-contract3-v5-scout",
+      created: true,
+    })),
+    saveBriefSelectionPlan: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-contract3-v5-scout",
+  });
+
+  expect(responseBodies).toHaveLength(2);
+  const scoutInput = JSON.parse(String(responseBodies[1]?.input));
+  expect(scoutInput).toHaveProperty("musicIntentEnvelope");
+  expect(scoutInput).not.toHaveProperty("request");
+  expect(scoutInput).not.toHaveProperty("confirmedBrief");
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-contract3-v5-scout",
+    expect.objectContaining({
+      status: "awaiting_answers",
+      questions: [expect.objectContaining({
+        schemaVersion: 5,
+        axis: "selection_tiebreak",
+        question: "When several tracks fit equally well, what should break the tie?",
+        options: expect.arrayContaining([
+          expect.objectContaining({
+            id: "closest_musical_fit",
+            executionEffect: expect.objectContaining({
+              field: "rankingObjectives",
+              consumerId:
+                "pipeline_v3_live_adapters:hostedDiscoveryRankingObjectivesV5",
+            }),
+          }),
+        ]),
+      })],
+      guidanceSourceHints: [
+        expect.objectContaining({ url: sourceUrl }),
+      ],
+      guidanceTelemetry: expect.objectContaining({
+        generationMode: "grounded_scout",
+        webSearchCalls: 1,
+        acceptedQuestionCount: 1,
+      }),
+      guidanceContract: expect.objectContaining({
+        axis: "selection_tiebreak",
+        generationMode: "grounded_scout",
+      }),
+    }),
+  );
+});
+
+test("Contract-3 V5 fails closed when billed scout usage cannot be reconciled", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-contract3-v5-accounting");
+  vi.stubEnv("GUIDANCE_V5_ENABLED", "true");
+  const providerResponses = [
+    {
+      id: "response-contract3-v5-accounting-brief",
+      model: "gpt-5.4-mini",
+      usage: { input_tokens: 180, output_tokens: 100 },
+      output_text: JSON.stringify(draftBrief),
+    },
+    {
+      id: "response-contract3-v5-accounting-scout",
+      model: "gpt-5.4-mini",
+      usage: { input_tokens: 220, output_tokens: 60 },
+      output_text: JSON.stringify({ questions: [] }),
+      output: [{
+        type: "web_search_call",
+        id: "search-contract3-v5-accounting",
+        status: "completed",
+        action: {
+          type: "search",
+          query: "rainy night playlist musical directions",
+          sources: [],
+        },
+      }],
+    },
+  ];
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(
+    JSON.stringify(providerResponses.shift()),
+    {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    },
+  )));
+
+  let reconciliationCall = 0;
+  const reconcileProviderCost = vi.fn(async () => {
+    reconciliationCall += 1;
+    if (reconciliationCall === 2) {
+      throw new Error("fixture cost-ledger write failed");
+    }
+  });
+  const releaseProviderCost = vi.fn(async () => undefined);
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-contract3-v5-accounting",
+      prompt: "Create a rainy-night playlist",
+      requestedTrackCount: 75,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+      briefContractVersion: 3 as const,
+    })),
+    reserveProviderCost: vi.fn(async (_subject, operation: string) => ({
+      reservationId: `reservation-${operation}`,
+    })),
+    reconcileProviderCost,
+    releaseProviderCost,
+    getActivePlaylistContractRevision: vi.fn(async () => null),
+    savePlaylistContractRevision: vi.fn(async (input: {
+      contractHash: string;
+      contract: Record<string, unknown>;
+    }) => ({
+      id: "contract3-v5-accounting-base",
+      contractHash: input.contractHash,
+      contract: input.contract,
+    })),
+    savePlaylistFeasibilitySnapshot: vi.fn(async () => ({
+      id: "feasibility-contract3-v5-accounting",
+      created: true,
+    })),
+    saveBriefSelectionPlan: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await expect(processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-contract3-v5-accounting",
+  })).rejects.toThrow("Provider cost reconciliation failed");
+
+  expect(reconcileProviderCost).toHaveBeenCalledTimes(2);
+  expect(releaseProviderCost).not.toHaveBeenCalledWith(
+    expect.stringContaining("brief.question_scout"),
+  );
+  expect(saveBriefResult).not.toHaveBeenCalled();
+});
+
+test("Guidance V5.1 gates a Contract-2 Irish-influence brief with a typed MCQ", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-contract2-irish-influence");
+  vi.stubEnv("GUIDANCE_V5_ENABLED", "true");
+  const irishBrief: PlaylistBrief = {
+    title: "Influential Irish Music",
+    description: "Influential recordings by Irish artists.",
+    mode: "curated",
+    subjectEntities: ["Irish music"],
+    relationship: "influential music by Irish artists",
+    include: ["Irish artists and recordings"],
+    exclude: [],
+    versionPolicy: "canonical recordings",
+    evidencePolicy: "documented Irish origin and influence",
+    orderingPolicy: "coherent listening arc",
+    targetSize: { min: 25, max: 25 },
+    ambiguities: ["whether influence means Irish cultural impact or global impact"],
+  };
+  vi.stubGlobal("fetch", vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      id: "response-contract2-irish-influence",
+      model: "gpt-5.4-mini",
+      usage: { input_tokens: 180, output_tokens: 100 },
+      output_text: JSON.stringify(irishBrief),
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }))
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      error: { message: "Question scout temporarily unavailable" },
+    }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    })));
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-contract2-irish-influence",
+      prompt: "Infuential irish music",
+      requestedTrackCount: 25,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+      briefContractVersion: 2 as const,
+    })),
+    reserveProviderCost: vi.fn(async () => ({
+      reservationId: "reservation-contract2-irish-influence",
+    })),
+    reconcileProviderCost: vi.fn(async () => undefined),
+    releaseProviderCost: vi.fn(async () => undefined),
+    getActivePlaylistContractRevision: vi.fn(async () => null),
+    savePlaylistContractRevision: vi.fn(async (input: {
+      contractHash: string;
+      contract: Record<string, unknown>;
+    }) => ({
+      id: "contract2-irish-influence-shadow",
+      contractHash: input.contractHash,
+      contract: input.contract,
+    })),
+    savePlaylistFeasibilitySnapshot: vi.fn(async () => ({
+      id: "feasibility-contract2-irish-influence",
+      created: true,
+    })),
+    saveBriefSelectionPlan: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-contract2-irish-influence",
+  });
+
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-contract2-irish-influence",
+    expect.objectContaining({
+      status: "awaiting_answers",
+      questions: [expect.objectContaining({
+        schemaVersion: 5,
+        axis: "influence_scope",
+        guidanceMode: "nuance_optional",
+        options: expect.arrayContaining([
+          expect.objectContaining({
+            id: "within_scope_cultural_impact",
+            label: "Irish cultural impact",
+          }),
+          expect.objectContaining({ id: "global_influence" }),
+          expect.objectContaining({
+            id: "balanced_influence",
+            recommended: true,
+            recommendationReason:
+              "The original wording leaves Irish cultural impact versus global influence open, so a balanced emphasis preserves both readings.",
+          }),
+        ]),
+      })],
+      guidanceContract: expect.objectContaining({
+        checkpointMode: "nuance_optional",
+        guidancePolicyVersion: "adaptive_guidance_v5",
+        axis: "influence_scope",
+      }),
+      guidanceTelemetry: expect.objectContaining({
+        generationMode: "generalized_axis_registry",
+        webSearchCalls: 0,
+        validationIssues: expect.arrayContaining([
+          "scout:provider_unavailable",
+          "v5-scout-failure:deterministic_server_axis_used",
+        ]),
+      }),
+    }),
+  );
+  expect(repository.savePlaylistContractRevision).toHaveBeenCalledTimes(1);
+  const saved = (saveBriefResult.mock.calls as unknown as Array<
+    [string, Record<string, unknown>]
+  >)[0]?.[1];
+  expect(saved).not.toHaveProperty("estimateUsd");
+});
+
+test("Guidance V5 persists one typed execution decision for a saturated exact-order list", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-contract3-execution-decision");
+  vi.stubEnv("GUIDANCE_V5_ENABLED", "true");
+  const exactBrief: PlaylistBrief = {
+    title: "Exact Radiohead sequence",
+    description: "Three exact Radiohead recordings in the supplied order.",
+    mode: "curated",
+    subjectEntities: ["Radiohead"],
+    relationship:
+      "Use only the three supplied artist/title pairs in the exact specified order.",
+    include: [
+      "Radiohead — Creep",
+      "Radiohead — Karma Police",
+      "Radiohead — No Surprises",
+    ],
+    exclude: [],
+    versionPolicy: "canonical studio recordings only",
+    evidencePolicy: "exact artist/title catalog identity",
+    orderingPolicy: "Preserve the exact specified order.",
+    targetSize: { min: 3, max: 3 },
+    ambiguities: [],
+  };
+  vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+    id: "response-contract3-execution-decision",
+    model: "gpt-5.4-mini",
+    usage: { input_tokens: 220, output_tokens: 120 },
+    output_text: JSON.stringify(exactBrief),
+  }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+  const saveBriefResult = vi.fn(async () => undefined);
+  const repository = {
+    getBriefRequest: vi.fn(async () => ({
+      id: "brief-contract3-execution-decision",
+      prompt:
+        "Use only Radiohead — Creep, Radiohead — Karma Police, and Radiohead — No Surprises in that exact specified order.",
+      requestedTrackCount: 3,
+      model: "gpt-5.4-mini",
+      status: "queued" as const,
+      briefContractVersion: 3 as const,
+    })),
+    reserveProviderCost: vi.fn(async () => ({
+      reservationId: "reservation-contract3-execution-decision",
+    })),
+    reconcileProviderCost: vi.fn(async () => undefined),
+    releaseProviderCost: vi.fn(async () => undefined),
+    getActivePlaylistContractRevision: vi.fn(async () => null),
+    savePlaylistContractRevision: vi.fn(async (input: {
+      contractHash: string;
+      contract: Record<string, unknown>;
+    }) => ({
+      id: "contract3-execution-decision-base",
+      contractHash: input.contractHash,
+      contract: input.contract,
+    })),
+    savePlaylistFeasibilitySnapshot: vi.fn(async () => ({
+      id: "feasibility-contract3-execution-decision",
+      created: true,
+    })),
+    saveBriefSelectionPlan: vi.fn(async () => undefined),
+    saveBriefResult,
+  } as unknown as ResearchRepository;
+
+  await processBriefInterpretationJob(repository, {
+    briefRequestId: "brief-contract3-execution-decision",
+  });
+
+  expect(saveBriefResult).toHaveBeenCalledWith(
+    "brief-contract3-execution-decision",
+    expect.objectContaining({
+      status: "awaiting_answers",
+      questions: [expect.objectContaining({
+        schemaVersion: 5,
+        guidanceMode: "execution_decision",
+        axis: "execution_readiness",
+        criticality: "required",
+        options: [
+          expect.objectContaining({
+            id: "execute_confirmed_contract",
+            executionAction: {
+              kind: "execute_confirmed_contract",
+              startsResearch: true,
+            },
+          }),
+          expect.objectContaining({
+            id: "review_interpretation",
+            executionAction: {
+              kind: "review_interpretation",
+              startsResearch: false,
+            },
+          }),
+          expect.objectContaining({
+            id: "cancel_request",
+            executionAction: {
+              kind: "cancel_request",
+              startsResearch: false,
+            },
+          }),
+        ],
+      })],
+      guidanceContract: expect.objectContaining({
+        checkpointMode: "execution_decision",
+        generationMode: "typed_execution_decision",
+        guidancePolicyVersion: "adaptive_guidance_v5",
+        trigger: "nuance",
+        axis: "execution_readiness",
+        interpretationSummary: expect.objectContaining({ count: 3 }),
+      }),
+      guidanceTelemetry: expect.objectContaining({
+        generationMode: "typed_execution_decision",
+        proposedQuestionCount: 1,
+        acceptedQuestionCount: 1,
+      }),
+    }),
+  );
+  const saved = (saveBriefResult.mock.calls as unknown as Array<
+    [string, Record<string, unknown>]
+  >)[0]?.[1];
+  expect(saved).not.toHaveProperty("estimateUsd");
+});
+
 test("the durable production brief boundary caps every grounded scout question at two attested sources", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-guided-v3-boundary");
   const sourceUrls = [

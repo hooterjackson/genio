@@ -65,6 +65,7 @@ function databaseTransition(
     env.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH as string,
 ) {
   const current = {
+    PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
     PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
     PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
     PIPELINE_V3_SIMILARITY_PERCENT: "0",
@@ -356,6 +357,11 @@ describe("atomic signed public rollout database transition", () => {
       advanceEvidenceHash: "a".repeat(64),
       rollbackToPercent: "0",
     });
+    expect(client.states.get("pipeline_v3_public_assignment_paused"))
+      .toBe(false);
+    expect(client.states.get(
+      "pipeline_v3_public_assignment_paused:genre_scene",
+    )).toBe(false);
   });
 
   test("requires the database state to match the immediately previous signed target", async () => {
@@ -432,6 +438,11 @@ describe("atomic signed public rollout database transition", () => {
       operation: "rollback_to_zero",
       toPercent: "0",
     });
+    expect(client.states.get("pipeline_v3_public_assignment_paused"))
+      .toBe(true);
+    expect(client.states.get(
+      "pipeline_v3_public_assignment_paused:genre_scene",
+    )).toBe(true);
   });
 
   test("rejects rollback when the active database warrant hash differs", async () => {

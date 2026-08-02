@@ -23,14 +23,21 @@ function releaseEnvironment(
 
 export function manifestOnlyReleaseCanaryAllowed(input: {
   releaseEnvironment: "staging" | "production" | null;
-  owner: boolean;
+  signedCanary: boolean;
   publicAssignmentPaused: boolean;
+  signedDirectExposureActive?: boolean;
 }): boolean {
-  return input.releaseEnvironment === "staging"
+  return (
+    input.releaseEnvironment === "staging"
+    && input.signedCanary
+  )
     || (
       input.releaseEnvironment === "production"
-      && input.owner
-      && input.publicAssignmentPaused
+      && input.signedCanary
+      && (
+        input.publicAssignmentPaused
+        || input.signedDirectExposureActive === true
+      )
     );
 }
 

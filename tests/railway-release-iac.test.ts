@@ -141,7 +141,7 @@ beforeAll(() => {
       escalation: "gpt-5.6-terra",
     },
     policyVersions: {
-      guidance: "adaptive_guidance_v4",
+      guidance: "adaptive_guidance_v5",
       evidence: "governed_evidence_v2",
       queryPlan: "query_plan_v3_4",
       selection: "selection_plan_v3",
@@ -372,6 +372,7 @@ beforeAll(() => {
           PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
           PIPELINE_V3_OWNER_CANARY: "true",
           PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+          PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
           PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
           PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
           PIPELINE_V3_SIMILARITY_PERCENT: "0",
@@ -400,6 +401,7 @@ beforeAll(() => {
           PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
           PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
           PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+          PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
           PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
           PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
           PIPELINE_V3_SIMILARITY_PERCENT: "0",
@@ -613,7 +615,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
     }))).toThrow(/GENIO_RELEASE_PHASE is required/u);
     expect(() => railwayReleasePhaseConfiguration(baseEnvironment({
       GENIO_RELEASE_PHASE: "migrate-and-hope",
-    }))).toThrow(/bridge, expand, activate, or rollout/u);
+    }))).toThrow(/bridge, expand, activate, redeploy_native, or rollout/u);
   });
 
   test("requires verified candidate evidence for production but not staging", () => {
@@ -676,6 +678,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
         SOURCE_COMMIT_SHA: { type: "literal", value: releaseRevision },
         RELEASE_ENVIRONMENT: { type: "literal", value: "production" },
         RELEASE_DEPLOYMENT_PHASE: { type: "literal", value: "bridge" },
+        GUIDANCE_V5_ENABLED: { type: "literal", value: "true" },
         RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: { type: "literal", value: "19" },
         RELEASE_SECRET_VERSIONS_HASH: {
           type: "literal",
@@ -791,6 +794,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
       },
       PIPELINE_V3_OWNER_CANARY_GROUPS: { type: "literal", value: "genre_scene" },
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: { type: "literal", value: "50" },
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: { type: "literal", value: "0" },
       PIPELINE_V3_GENRE_SCENE_PERCENT: { type: "literal", value: "0" },
       GUIDANCE_CONTRACT_V3_ENABLED: { type: "literal", value: "false" },
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: { type: "literal", value: "true" },
@@ -823,6 +827,7 @@ describe("Railway immutable bridge-expand-activate release", () => {
       },
       PIPELINE_V3_OWNER_CANARY_GROUPS: { type: "literal", value: "genre_scene" },
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: { type: "literal", value: "50" },
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: { type: "literal", value: "0" },
       PIPELINE_V3_GENRE_SCENE_PERCENT: { type: "literal", value: "0" },
       GUIDANCE_CONTRACT_V3_ENABLED: { type: "literal", value: "false" },
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: { type: "literal", value: "true" },
@@ -861,6 +866,58 @@ describe("Railway immutable bridge-expand-activate release", () => {
       GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
       GENIO_PRODUCTION_DATABASE_IDENTITY_HASH: hash("0"),
     }))).rejects.toThrow(/selected production database/u);
+  });
+
+  test("native schema-20 point release preserves activation without fabricated migration evidence", async () => {
+    const environment = baseEnvironment({
+      GENIO_RELEASE_PHASE: "redeploy_native",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
+      GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE: undefined,
+      GENIO_EXPAND_CONVERGENCE_EVIDENCE_FILE: undefined,
+      GENIO_BRIDGE_CONFIGURATION_HASH: undefined,
+      GENIO_EXPAND_CONFIGURATION_HASH: undefined,
+      GENIO_PRODUCTION_DATABASE_IDENTITY_HASH: undefined,
+    });
+    const integrated = railwayReleasePhaseConfiguration(environment);
+    expect(integrated).toMatchObject({
+      environment: "production",
+      phase: "redeploy_native",
+      expectedDatabaseSchemaVersion: "20",
+      verifiedCandidateEvidenceHash,
+      bridgeConvergenceEvidenceHash: null,
+      expandConvergenceEvidenceHash: null,
+      activationRollout: null,
+    });
+    const project = await railwayProject(environment);
+    for (const current of [
+      service(project, "needle-worker"),
+      service(project, "needle-deep-worker"),
+      service(project, "needle-api"),
+    ]) {
+      expect(current.source).toMatchObject({
+        image: releaseImage,
+        autoUpdates: { type: "disabled" },
+      });
+      expect(current.variables).toMatchObject({
+        RELEASE_DEPLOYMENT_PHASE: { type: "literal", value: "activate" },
+        RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: {
+          type: "literal",
+          value: "20",
+        },
+        RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION: { type: "preserve" },
+        RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION: { type: "preserve" },
+        RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION: {
+          type: "preserve",
+        },
+        RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION: { type: "preserve" },
+        PIPELINE_V3_PROOF_ARCHITECTURE_MODE: { type: "preserve" },
+      });
+    }
+    expect(service(project, "needle-api").deploy?.preDeployCommand).toBeUndefined();
+    expect(() => railwayReleasePhaseConfiguration(stagingEnvironment({
+      GENIO_RELEASE_PHASE: "redeploy_native",
+      GENIO_EXPECTED_DATABASE_SCHEMA_VERSION: "20",
+    }))).toThrow(/accepted only for production/u);
   });
 
   test("staging is capped and bound to separate provider, Apple, account, and MusicKit controls", async () => {

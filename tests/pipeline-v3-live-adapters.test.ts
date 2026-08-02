@@ -17,10 +17,18 @@ import {
   compilePlaylistContractShadowV1,
 } from "../server/playlist-contract-shadow-bridge-v1.ts";
 import {
+  applyPlaylistContractPatchV1,
   compilePlaylistContractRevisionV1,
   type PlaylistContractDraftV1,
   type PlaylistPredicateV1,
 } from "../server/playlist-contract-v1.ts";
+import {
+  guidanceCheckpointV5,
+} from "../server/adaptive-guidance-v5.ts";
+import {
+  compileGuidanceRoundPatchV3,
+  publicGuidanceQuestionV5,
+} from "../server/adaptive-guidance-contract-bridge.ts";
 import {
   createCentralQualityCriterionObservationV3,
   evidenceBindingIsAttestedForSelectionV3,
@@ -81,6 +89,90 @@ function canonicalScenario(
     contract: shadow.contract,
     basePlan,
   });
+}
+
+function guidedIrishInfluenceSelection(
+  optionId:
+    | "within_scope_cultural_impact"
+    | "global_influence"
+    | "balanced_influence",
+): SelectionPlanV3 {
+  const prompt = "Infuential irish music";
+  const brief: PlaylistBrief = {
+    title: "Influential Irish music",
+    description: prompt,
+    mode: "curated",
+    subjectEntities: ["Irish music"],
+    relationship: "music by Irish artists",
+    include: ["Irish music"],
+    exclude: [],
+    versionPolicy: "Prefer canonical studio recordings.",
+    evidencePolicy: "Use policy-valid evidence.",
+    orderingPolicy: "Use a coherent editorial flow.",
+    targetSize: { min: 2, max: 2 },
+    ambiguities: [],
+  };
+  const basePlan = createSelectionPlanV2({
+    prompt,
+    brief,
+    storefront: "us",
+  });
+  const shadow = compilePlaylistContractShadowV1({
+    contractId: `contract:live:irish-influence:${optionId}`,
+    prompt,
+    brief,
+    selectionPlan: basePlan,
+  });
+  const base = shadow.contract;
+  const checkpoint = guidanceCheckpointV5({
+    prompt,
+    baseContract: base,
+    preservedTrackPredicate: shadow.preservedTrackPredicate,
+    ambiguousScopeClauseIds: [],
+    criticalAmbiguities: [],
+    requestShape: "curated",
+    capabilitySnapshotHash: "a".repeat(64),
+    semanticConfigurationHash: "b".repeat(64),
+    expectedRolloutGroup: "editorial_influence",
+  });
+  const question = publicGuidanceQuestionV5(checkpoint.decisions[0]!);
+  const patch = compileGuidanceRoundPatchV3({
+    base,
+    questionSetHash: checkpoint.checkpointHash,
+    questions: [question],
+    answers: [{ questionId: question.id, optionId }],
+  });
+  const successor = applyPlaylistContractPatchV1(base, patch!);
+  return projectPlaylistContractExecutionV1({
+    contract: successor,
+    basePlan,
+  }).selectionPlanV3;
+}
+
+function hostedCitationMessage(
+  id: string,
+  sourceUrl: string,
+  text: string,
+) {
+  const marker = "[source]";
+  const markerStart = text.indexOf(marker);
+  if (markerStart < 0) {
+    throw new Error("Hosted citation fixture requires a [source] marker");
+  }
+  return {
+    id,
+    type: "message",
+    content: [{
+      type: "output_text",
+      text,
+      annotations: [{
+        type: "url_citation",
+        url: sourceUrl,
+        start_index: markerStart,
+        end_index: markerStart + marker.length,
+      }],
+    }],
+  };
 }
 
 function canonicalExactArtistExclusionSelection(): SelectionPlanV3 {
@@ -1507,9 +1599,124 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(batch.candidates).toHaveLength(1);
     expect(qualification).toMatchObject({
       scope: { passed: false, failedMembershipPredicateIds: [predicateId] },
-      evidence: { passed: false, bindingIds: [] },
+      evidence: {
+        passed: false,
+        bindingIds: [],
+        bindingDiagnostics: [],
+      },
       catalog: { storefrontPlayable: true, appleSongId: appleSong.id },
     });
+  });
+
+  test("reports a healthy hosted citation bound to the wrong track as wrong-axis evidence", async () => {
+    const selection = plan("25 disco songs", 25);
+    const predicateId = selection.membershipPredicates.find(
+      (value) => value.axis === "genre",
+    )!.id;
+    const sourceUrl = "https://example.com/disco-list";
+    const citationText =
+      "Sister Sledge — We Are Family is a disco recording. [source]";
+    const markerStart = citationText.indexOf("[source]");
+    const createResponse = vi.fn(async () => ({
+      id: "resp_wrong_track_binding",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: "Chic",
+          title: "Good Times",
+          album: null,
+          sources: [{ url: sourceUrl, predicateIds: [predicateId] }],
+        }],
+      }),
+      output: [{
+        id: "msg_wrong_track_binding",
+        type: "message",
+        content: [{
+          type: "output_text",
+          text: citationText,
+          annotations: [{
+            type: "url_citation",
+            url: sourceUrl,
+            start_index: markerStart,
+            end_index: markerStart + "[source]".length,
+          }],
+        }],
+      }],
+    }));
+    const appleSong = song(30, "Chic", "Good Times");
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = discoveryRequest(selection, "editorial_tracks");
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({
+      ...discovery,
+      candidates: batch.candidates,
+    });
+
+    expect(qualification?.evidence.bindingDiagnostics).toEqual([{
+      kind: "wrong_axis_evidence",
+      clauseIds: [predicateId],
+      producerFamily: "factual_source",
+      dependencyRootId: "hosted_web",
+    }]);
+    expect(qualification?.catalog).toMatchObject({
+      storefrontPlayable: true,
+      appleSongId: appleSong.id,
+    });
+  });
+
+  test("reports a provider citation with invalid span indices as malformed evidence", async () => {
+    const selection = plan("25 disco songs", 25);
+    const predicateId = selection.membershipPredicates.find(
+      (value) => value.axis === "genre",
+    )!.id;
+    const sourceUrl = "https://example.com/disco-list";
+    const citationText = "Chic — Good Times is a disco recording. [source]";
+    const createResponse = vi.fn(async () => ({
+      id: "resp_malformed_binding",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: "Chic",
+          title: "Good Times",
+          album: null,
+          sources: [{ url: sourceUrl, predicateIds: [predicateId] }],
+        }],
+      }),
+      output: [{
+        id: "msg_malformed_binding",
+        type: "message",
+        content: [{
+          type: "output_text",
+          text: citationText,
+          annotations: [{
+            type: "url_citation",
+            url: sourceUrl,
+            start_index: citationText.length + 10,
+            end_index: citationText.length + 20,
+          }],
+        }],
+      }],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [song(31, "Chic", "Good Times")]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = discoveryRequest(selection, "editorial_tracks");
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({
+      ...discovery,
+      candidates: batch.candidates,
+    });
+
+    expect(qualification?.evidence.bindingDiagnostics).toEqual([{
+      kind: "malformed_evidence",
+      clauseIds: [predicateId],
+      producerFamily: "factual_source",
+      dependencyRootId: "hosted_web",
+    }]);
   });
 
   test("derives hosted authority server-side and ignores a model claim that an unknown host is primary", async () => {
@@ -1669,6 +1876,945 @@ describe("Pipeline V3 live read-only adapters", () => {
         sourceSnapshotHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
       },
     });
+  });
+
+  test("binds exact artist-origin evidence to the resolved Apple artist without requiring every citation to name the track", async () => {
+    const selection = plan("Infuential irish music", 25);
+    const predicate = selection.membershipPredicates.find((value) => (
+      value.axis === "geography"
+      && value.values.includes("Ireland")
+    ));
+    expect(predicate).toMatchObject({
+      geographyRelationship: "unspecified",
+      operator: "require",
+    });
+    const sourceUrl = "https://www.loc.gov/item/irish-music-artists";
+    const citationText = "Fontaines D.C. is an Irish band formed in Dublin. [source]";
+    const markerStart = citationText.indexOf("[source]");
+    const createResponse = vi.fn(async () => ({
+      id: "resp_irish_artist_origin",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: "Fontaines D.C.",
+          title: "Boys in the Better Land",
+          album: null,
+          centralQualityScore: null,
+          centralQualityCriteria: [],
+          sources: [{
+            url: sourceUrl,
+            predicateIds: [predicate!.id],
+          }],
+        }],
+      }),
+      output: [
+        { type: "web_search_call", action: { sources: [{ url: sourceUrl }] } },
+        {
+          id: "msg_irish_artist_origin",
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: citationText,
+            annotations: [{
+              type: "url_citation",
+              url: sourceUrl,
+              start_index: markerStart,
+              end_index: markerStart + "[source]".length,
+            }],
+          }],
+        },
+      ],
+    }));
+    const appleSong = song(
+      505,
+      "Fontaines D.C.",
+      "Boys in the Better Land",
+    );
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = discoveryRequest(selection, "editorial_tracks");
+    const batch = await adapters.discover(discovery);
+    const binding = (batch.candidates[0] as any)?.metadata?.bindings?.[0];
+    expect(binding).toMatchObject({
+      predicateIds: [predicate!.id],
+      eligibilityAttestation: {
+        kind: "approved_exact_artist_scope_source",
+        exactArtistScope: true,
+        subjectArtistHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      },
+      hostedEvidenceSnapshot: {
+        sourceUrl,
+        predicateIds: [predicate!.id],
+      },
+    });
+    expect(evidenceBindingIsAttestedForSelectionV3(binding, {
+      requireHostedEvidenceSnapshot: true,
+      storefront: selection.storefront,
+      requiredArtistName: "Fontaines D.C.",
+    })).toBe(true);
+    expect(evidenceBindingIsAttestedForSelectionV3(binding, {
+      requireHostedEvidenceSnapshot: true,
+      storefront: selection.storefront,
+      requiredArtistName: "The Cranberries",
+    })).toBe(false);
+
+    const [qualification] = await adapters.qualify({
+      runId: discovery.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: discovery.engine,
+      strategy: discovery.strategy,
+      candidates: batch.candidates,
+    });
+    expect(qualification).toMatchObject({
+      scope: { passed: true, failedMembershipPredicateIds: [] },
+      evidence: { passed: true, bindingIds: [binding.id] },
+      catalog: {
+        storefrontPlayable: true,
+        appleSongId: appleSong.id,
+        artistName: "Fontaines D.C.",
+      },
+    });
+  });
+
+  test("keeps unspanned artist-origin URLs as leads and never mints selection evidence", async () => {
+    const selection = plan("Infuential irish music", 25);
+    const predicate = selection.membershipPredicates.find((value) => (
+      value.axis === "geography"
+      && value.values.includes("Ireland")
+    ))!;
+    const sourceUrl = "https://www.loc.gov/item/irish-music-artists";
+    const createResponse = vi.fn(async () => ({
+      id: "resp_irish_missing_span",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: "Fontaines D.C.",
+          title: "Boys in the Better Land",
+          album: null,
+          centralQualityScore: null,
+          centralQualityCriteria: [],
+          sources: [{ url: sourceUrl, predicateIds: [predicate.id] }],
+        }],
+      }),
+      output: [{
+        type: "web_search_call",
+        action: { sources: [{ url: sourceUrl }] },
+      }],
+    }));
+    const appleSong = song(
+      506,
+      "Fontaines D.C.",
+      "Boys in the Better Land",
+    );
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = discoveryRequest(selection, "editorial_tracks");
+    const batch = await adapters.discover(discovery);
+    const binding = (batch.candidates[0] as any)?.metadata?.bindings?.[0];
+    expect(binding).toMatchObject({
+      hostedEvidenceSnapshot: undefined,
+      eligibilityAttestation: undefined,
+    });
+    const [qualification] = await adapters.qualify({
+      runId: discovery.runId,
+      executionMode: "active",
+      appleWriteAccess: "forbidden",
+      plan: selection,
+      engine: discovery.engine,
+      strategy: discovery.strategy,
+      candidates: batch.candidates,
+    });
+    expect(qualification).toMatchObject({
+      scope: {
+        passed: false,
+        failedMembershipPredicateIds: [predicate.id],
+      },
+      evidence: { passed: false, bindingIds: [] },
+      catalog: {
+        storefrontPlayable: true,
+        appleSongId: appleSong.id,
+      },
+    });
+  });
+
+  test("V5.1 influence answers change the cited signal consumed by retrieval and counterfactually change selection", async () => {
+    const fixtureTracks = [
+      {
+        artist: "Cultural Fixture",
+        title: "Within Ireland",
+        sourceUrl: "https://www.loc.gov/item/irish-cultural-impact",
+      },
+      {
+        artist: "Global Fixture",
+        title: "Across the World",
+        sourceUrl: "https://www.loc.gov/item/irish-global-impact",
+      },
+      {
+        artist: "Balanced Fixture",
+        title: "Both Horizons",
+        sourceUrl: "https://www.loc.gov/item/irish-balanced-impact",
+      },
+    ] as const;
+    const catalogSongs = fixtureTracks.map((track, index) => (
+      song(520 + index, track.artist, track.title)
+    ));
+    const expectedByOption = {
+      within_scope_cultural_impact: [
+        "Across the World",
+        "Within Ireland",
+      ],
+      global_influence: [
+        "Across the World",
+        "Both Horizons",
+      ],
+      balanced_influence: [
+        "Both Horizons",
+        "Within Ireland",
+      ],
+    } as const;
+    const scoresByOption = {
+      within_scope_cultural_impact: [0.97, 0.50, 0.10],
+      global_influence: [0.10, 0.98, 0.50],
+      balanced_influence: [0.50, 0.10, 0.99],
+    } as const;
+    const selectedByOption = new Map<string, string[]>();
+
+    for (const optionId of Object.keys(expectedByOption) as Array<
+      keyof typeof expectedByOption
+    >) {
+      const selection = guidedIrishInfluenceSelection(optionId);
+      expect(selection.intents).toContain("editorial_ranking");
+      const influenceCriterion =
+        selection.playlistQualityPolicy?.criteria.find(
+          (criterion) => criterion === "documented historical influence",
+        );
+      expect(influenceCriterion).toBeDefined();
+      const membershipPredicate = selection.membershipPredicates.find(
+        ({ axis, operator }) => axis === "geography" && operator === "require",
+      );
+      expect(membershipPredicate).toBeDefined();
+      const createResponse = vi.fn(async (input: any) => {
+        const providerPayload = JSON.parse(input.input);
+        const influenceValues = (
+          providerPayload.rankingObjectives as Array<{
+            dimension: string;
+            values: string[];
+          }>
+        ).filter(({ dimension }) => dimension === "influence")
+          .flatMap(({ values }) => values);
+        const expectedOptionValue = optionId === "within_scope_cultural_impact"
+          ? "cultural impact within Irish musical culture"
+          : optionId === "global_influence"
+            ? "global musical influence and international impact"
+            : "balance Irish cultural impact with global influence";
+        expect(influenceValues).toContain(expectedOptionValue);
+        const messages = fixtureTracks.map((track, index) => {
+          const text =
+            `${track.artist} — ${track.title}, recorded by an artist from Ireland, `
+            + "is a seminal and historically influential recording. [source]";
+          const markerStart = text.indexOf("[source]");
+          return {
+            id: `msg_influence_${optionId}_${index}`,
+            type: "message",
+            content: [{
+              type: "output_text",
+              text,
+              annotations: [{
+                type: "url_citation",
+                url: track.sourceUrl,
+                start_index: markerStart,
+                end_index: markerStart + "[source]".length,
+              }],
+            }],
+          };
+        });
+        return {
+          id: `resp_influence_${optionId}`,
+          output_text: JSON.stringify({
+            candidates: fixtureTracks.map((track, index) => ({
+              artist: track.artist,
+              title: track.title,
+              album: catalogSongs[index]!.albumName,
+              centralQualityScore: scoresByOption[optionId][index],
+              influenceScore: scoresByOption[optionId][index],
+              centralQualityCriteria: [{
+                criterion: influenceCriterion,
+                verdict: "pass",
+              }],
+              sources: [{
+                url: track.sourceUrl,
+                predicateIds: [membershipPredicate!.id],
+              }],
+            })),
+          }),
+          output: [
+            {
+              type: "web_search_call",
+              action: {
+                sources: fixtureTracks.map(({ sourceUrl }) => ({
+                  url: sourceUrl,
+                })),
+              },
+            },
+            ...messages,
+          ],
+        };
+      });
+      const liveAdapters = createPipelineV3LiveAdapters({
+        createResponse: createResponse as any,
+        searchAppleSongs: vi.fn(async (
+          _storefront: string,
+          query: string,
+        ) => catalogSongs.filter((candidate) => (
+          query.includes(candidate.artistName)
+          && query.includes(candidate.name)
+        ))) as any,
+        lookupAppleByIsrc: vi.fn(async () => []) as any,
+      });
+      const discovery = {
+        ...discoveryRequest(selection, "editorial_tracks"),
+        runId: `influence-${optionId}`,
+        requestedRawCandidateCount: fixtureTracks.length,
+      };
+      const batch = await liveAdapters.discover(discovery);
+      expect(batch.candidates).toHaveLength(fixtureTracks.length);
+      const qualifications = await liveAdapters.qualify({
+        ...discovery,
+        candidates: batch.candidates,
+      });
+      expect(qualifications).toHaveLength(fixtureTracks.length);
+      expect(qualifications.every(({ catalog }) => (
+        catalog.storefrontPlayable
+      ))).toBe(true);
+      expect(qualifications.every(({ scope, evidence }) => (
+        scope.passed && evidence.passed
+      ))).toBe(true);
+      for (const qualification of qualifications) {
+        expect(qualification.centralQualityCriterionObservations)
+          .toContainEqual(expect.objectContaining({
+            criterion: influenceCriterion,
+            verdict: "pass",
+            bindingKind: "catalog",
+            sourceKind: "governed_evidence_snapshot",
+            sourceId: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          }));
+      }
+      expect(qualifications.every(({ rankingSignals }) => (
+        typeof rankingSignals.influence === "number"
+      ))).toBe(true);
+      expect(qualifications.map(({ rankingSignals }) => (
+        rankingSignals.influence
+      ))).toEqual([...scoresByOption[optionId]]);
+
+      let discoveryServed = false;
+      const result = await executeRetrievalV3({
+        runId: `retrieval-influence-${optionId}`,
+        plan: selection,
+        adapters: {
+          discover: async () => {
+            if (discoveryServed) {
+              return {
+                candidates: [],
+                nextCursor: null,
+                exhausted: true,
+                costUnits: 0,
+              };
+            }
+            discoveryServed = true;
+            return batch;
+          },
+          qualify: async () => qualifications,
+        },
+        policy: {
+          maximumGlobalRounds: 1,
+          maximumConcurrentDiscovery: 1,
+          maximumRawCandidates: fixtureTracks.length,
+          qualifiedPoolGoal: 2,
+          maximumCostUnits: 5,
+          maximumProviderFailuresPerStrategy: 1,
+        },
+      });
+      expect(result.selected).toHaveLength(2);
+      selectedByOption.set(
+        optionId,
+        result.selected.map(({ title }) => title).sort(),
+      );
+    }
+
+    expect(Object.fromEntries(selectedByOption)).toEqual(expectedByOption);
+    expect(new Set(
+      [...selectedByOption.values()].map((titles) => JSON.stringify(titles)),
+    ).size).toBe(3);
+  });
+
+  test("rejects model-only influence scores when the exact citation does not document influence", async () => {
+    const selection = guidedIrishInfluenceSelection("balanced_influence");
+    const influenceCriterion =
+      selection.playlistQualityPolicy!.criteria.find(
+        (criterion) => criterion === "documented historical influence",
+      )!;
+    const membershipPredicate = selection.membershipPredicates.find(
+      ({ axis, operator }) => axis === "geography" && operator === "require",
+    )!;
+    const sourceUrl = "https://www.loc.gov/item/irish-recording-biography";
+    const appleSong = song(530, "The Bothy Band", "The Kesh Jig");
+    const citationText =
+      "The Bothy Band — The Kesh Jig was recorded by an artist from Ireland "
+      + "and remains widely heard. [source]";
+    const markerStart = citationText.indexOf("[source]");
+    const createResponse = vi.fn(async () => ({
+      id: "resp_unattested_influence",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: "The Bothy Band",
+          title: "The Kesh Jig",
+          album: appleSong.albumName,
+          centralQualityScore: 0.99,
+          influenceScore: 0.99,
+          centralQualityCriteria: [{
+            criterion: influenceCriterion,
+            verdict: "pass",
+          }],
+          sources: [{
+            url: sourceUrl,
+            predicateIds: [membershipPredicate.id],
+          }],
+        }],
+      }),
+      output: [
+        {
+          type: "web_search_call",
+          action: { sources: [{ url: sourceUrl }] },
+        },
+        {
+          id: "msg_unattested_influence",
+          type: "message",
+          content: [{
+            type: "output_text",
+            text: citationText,
+            annotations: [{
+              type: "url_citation",
+              url: sourceUrl,
+              start_index: markerStart,
+              end_index: markerStart + "[source]".length,
+            }],
+          }],
+        },
+      ],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = {
+      ...discoveryRequest(selection, "editorial_tracks"),
+      requestedRawCandidateCount: 1,
+    };
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({
+      ...discovery,
+      candidates: batch.candidates,
+    });
+
+    expect(qualification).toMatchObject({
+      scope: { passed: true, failedMembershipPredicateIds: [] },
+      evidence: { passed: true },
+      catalog: {
+        storefrontPlayable: true,
+        appleSongId: appleSong.id,
+      },
+    });
+    expect(qualification?.rankingSignals).not.toHaveProperty("influence");
+    expect(qualification?.rankingSignals).not.toHaveProperty(
+      "central_quality",
+    );
+    expect(qualification?.centralQualityCriterionObservations).toContainEqual(
+      expect.objectContaining({
+        criterion: influenceCriterion,
+        verdict: "unknown",
+        bindingKind: "catalog",
+      }),
+    );
+  });
+
+  test("keeps artist-only historical influence unknown without a representative-work proof", async () => {
+    const selection = guidedIrishInfluenceSelection("balanced_influence");
+    const influenceCriterion = selection.playlistQualityPolicy!.criteria.find(
+      (criterion) => criterion === "documented historical influence",
+    )!;
+    const membershipPredicate = selection.membershipPredicates.find(
+      ({ axis, operator }) => axis === "geography" && operator === "require",
+    )!;
+    const sourceUrl = "https://www.loc.gov/item/bothy-band-influence";
+    const appleSong = song(531, "The Bothy Band", "The Kesh Jig");
+    const createResponse = vi.fn(async () => ({
+      id: "resp_artist_only_influence",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: appleSong.artistName,
+          title: appleSong.name,
+          album: appleSong.albumName,
+          centralQualityScore: 0.98,
+          influenceScore: 0.98,
+          centralQualityCriteria: [{
+            criterion: influenceCriterion,
+            verdict: "pass",
+          }],
+          sources: [{
+            url: sourceUrl,
+            predicateIds: [membershipPredicate.id],
+          }],
+        }],
+      }),
+      output: [
+        {
+          type: "web_search_call",
+          action: { sources: [{ url: sourceUrl }] },
+        },
+        hostedCitationMessage(
+          "msg_artist_only_influence",
+          sourceUrl,
+          "The Bothy Band is an influential and seminal Irish group. [source]",
+        ),
+      ],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = {
+      ...discoveryRequest(selection, "editorial_tracks"),
+      requestedRawCandidateCount: 1,
+    };
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({
+      ...discovery,
+      candidates: batch.candidates,
+    });
+
+    expect(qualification).toMatchObject({
+      scope: { passed: true },
+      evidence: { passed: true },
+      catalog: {
+        storefrontPlayable: true,
+        appleSongId: appleSong.id,
+      },
+    });
+    expect(qualification?.rankingSignals).not.toHaveProperty("influence");
+    expect(qualification?.rankingSignals).not.toHaveProperty(
+      "central_quality",
+    );
+    expect(qualification?.centralQualityCriterionObservations).toContainEqual(
+      expect.objectContaining({
+        criterion: influenceCriterion,
+        verdict: "unknown",
+        bindingKind: "catalog",
+      }),
+    );
+  });
+
+  test("accepts artist-level influence only with a separately cited representative work", async () => {
+    const selection = guidedIrishInfluenceSelection("balanced_influence");
+    const influenceCriterion = selection.playlistQualityPolicy!.criteria.find(
+      (criterion) => criterion === "documented historical influence",
+    )!;
+    const membershipPredicate = selection.membershipPredicates.find(
+      ({ axis, operator }) => axis === "geography" && operator === "require",
+    )!;
+    const influenceUrl = "https://www.loc.gov/item/bothy-band-influence";
+    const workUrl = "https://www.si.edu/object/kesh-jig-signature-work";
+    const appleSong = song(532, "The Bothy Band", "The Kesh Jig");
+    const createResponse = vi.fn(async () => ({
+      id: "resp_paired_artist_work_influence",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: appleSong.artistName,
+          title: appleSong.name,
+          album: appleSong.albumName,
+          centralQualityScore: 0.94,
+          influenceScore: 0.94,
+          centralQualityCriteria: [{
+            criterion: influenceCriterion,
+            verdict: "pass",
+          }],
+          sources: [
+            {
+              url: influenceUrl,
+              predicateIds: [membershipPredicate.id],
+            },
+            {
+              url: workUrl,
+              predicateIds: [membershipPredicate.id],
+            },
+          ],
+        }],
+      }),
+      output: [
+        {
+          type: "web_search_call",
+          action: {
+            sources: [{ url: influenceUrl }, { url: workUrl }],
+          },
+        },
+        hostedCitationMessage(
+          "msg_paired_artist_influence",
+          influenceUrl,
+          "The Bothy Band is an influential and seminal Irish group. [source]",
+        ),
+        hostedCitationMessage(
+          "msg_paired_representative_work",
+          workUrl,
+          "The Kesh Jig is a signature recording by The Bothy Band. [source]",
+        ),
+      ],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = {
+      ...discoveryRequest(selection, "editorial_tracks"),
+      requestedRawCandidateCount: 1,
+    };
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({
+      ...discovery,
+      candidates: batch.candidates,
+    });
+
+    expect(qualification).toMatchObject({
+      scope: { passed: true },
+      evidence: { passed: true },
+      rankingSignals: {
+        influence: 0.94,
+        central_quality: 0.94,
+      },
+    });
+    expect(qualification?.centralQualityCriterionObservations).toContainEqual(
+      expect.objectContaining({
+        criterion: influenceCriterion,
+        verdict: "pass",
+        bindingKind: "catalog",
+        sourceKind: "governed_evidence_snapshot",
+      }),
+    );
+    const qualityBindings = (batch.candidates[0] as any).metadata.bindings
+      .filter((binding: any) => (
+        binding.hostedEvidenceSnapshot?.predicateIds?.includes(
+          selection.rankingObjectives.find(
+            ({ dimension }) => dimension === "influence",
+          )!.id,
+        )
+      ));
+    expect(qualityBindings).toHaveLength(2);
+    expect(qualityBindings.map((binding: any) => (
+      binding.eligibilityAttestation?.kind
+    )).sort()).toEqual([
+      "approved_exact_artist_scope_source",
+      "approved_exact_track_scope_source",
+    ]);
+  });
+
+  test("rejects an artist-level influence bridge bound to the wrong artist or title", async () => {
+    const selection = guidedIrishInfluenceSelection("balanced_influence");
+    const influenceCriterion = selection.playlistQualityPolicy!.criteria.find(
+      (criterion) => criterion === "documented historical influence",
+    )!;
+    const membershipPredicate = selection.membershipPredicates.find(
+      ({ axis, operator }) => axis === "geography" && operator === "require",
+    )!;
+    const influenceUrl = "https://www.loc.gov/item/bothy-band-influence";
+    const wrongWorkUrl = "https://www.si.edu/object/wrong-signature-work";
+    const appleSong = song(533, "The Bothy Band", "The Kesh Jig");
+    const createResponse = vi.fn(async () => ({
+      id: "resp_wrong_artist_title_bridge",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: appleSong.artistName,
+          title: appleSong.name,
+          album: appleSong.albumName,
+          centralQualityScore: 0.96,
+          influenceScore: 0.96,
+          centralQualityCriteria: [{
+            criterion: influenceCriterion,
+            verdict: "pass",
+          }],
+          sources: [
+            {
+              url: influenceUrl,
+              predicateIds: [membershipPredicate.id],
+            },
+            {
+              url: wrongWorkUrl,
+              predicateIds: [membershipPredicate.id],
+            },
+          ],
+        }],
+      }),
+      output: [
+        {
+          type: "web_search_call",
+          action: {
+            sources: [{ url: influenceUrl }, { url: wrongWorkUrl }],
+          },
+        },
+        hostedCitationMessage(
+          "msg_wrong_bridge_artist_influence",
+          influenceUrl,
+          "The Bothy Band is an influential and seminal Irish group. [source]",
+        ),
+        hostedCitationMessage(
+          "msg_wrong_bridge_work",
+          wrongWorkUrl,
+          "The Silver Spear is a signature recording by Planxty. [source]",
+        ),
+      ],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = {
+      ...discoveryRequest(selection, "editorial_tracks"),
+      requestedRawCandidateCount: 1,
+    };
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({
+      ...discovery,
+      candidates: batch.candidates,
+    });
+
+    expect(qualification?.rankingSignals).not.toHaveProperty("influence");
+    expect(qualification?.centralQualityCriterionObservations).toContainEqual(
+      expect.objectContaining({
+        criterion: influenceCriterion,
+        verdict: "unknown",
+      }),
+    );
+  });
+
+  test("rejects a representative-work citation that ambiguously names multiple candidate tracks", async () => {
+    const selection = guidedIrishInfluenceSelection("balanced_influence");
+    const influenceCriterion = selection.playlistQualityPolicy!.criteria.find(
+      (criterion) => criterion === "documented historical influence",
+    )!;
+    const membershipPredicate = selection.membershipPredicates.find(
+      ({ axis, operator }) => axis === "geography" && operator === "require",
+    )!;
+    const influenceUrl = "https://www.loc.gov/item/bothy-band-influence";
+    const workUrl = "https://www.si.edu/object/bothy-band-signature-works";
+    const appleSongs = [
+      song(534, "The Bothy Band", "The Kesh Jig"),
+      song(535, "The Bothy Band", "The Green Groves of Erin"),
+    ];
+    const createResponse = vi.fn(async () => ({
+      id: "resp_ambiguous_representative_work",
+      output_text: JSON.stringify({
+        candidates: appleSongs.map((candidate) => ({
+          artist: candidate.artistName,
+          title: candidate.name,
+          album: candidate.albumName,
+          centralQualityScore: 0.91,
+          influenceScore: 0.91,
+          centralQualityCriteria: [{
+            criterion: influenceCriterion,
+            verdict: "pass",
+          }],
+          sources: [
+            {
+              url: influenceUrl,
+              predicateIds: [membershipPredicate.id],
+            },
+            {
+              url: workUrl,
+              predicateIds: [membershipPredicate.id],
+            },
+          ],
+        })),
+      }),
+      output: [
+        {
+          type: "web_search_call",
+          action: {
+            sources: [{ url: influenceUrl }, { url: workUrl }],
+          },
+        },
+        hostedCitationMessage(
+          "msg_ambiguous_artist_influence",
+          influenceUrl,
+          "The Bothy Band is an influential and seminal Irish group. [source]",
+        ),
+        hostedCitationMessage(
+          "msg_ambiguous_representative_work",
+          workUrl,
+          "The Kesh Jig and The Green Groves of Erin are signature tracks "
+            + "by The Bothy Band. [source]",
+        ),
+      ],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async (
+        _storefront: string,
+        query: string,
+      ) => appleSongs.filter((candidate) => (
+        query.includes(candidate.artistName)
+        && query.includes(candidate.name)
+      ))) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = {
+      ...discoveryRequest(selection, "editorial_tracks"),
+      requestedRawCandidateCount: 2,
+    };
+    const batch = await adapters.discover(discovery);
+    const qualifications = await adapters.qualify({
+      ...discovery,
+      candidates: batch.candidates,
+    });
+
+    expect(qualifications).toHaveLength(2);
+    expect(qualifications.every(({ rankingSignals }) => (
+      !Object.hasOwn(rankingSignals, "influence")
+    ))).toBe(true);
+    expect(qualifications.every(({ centralQualityCriterionObservations }) => (
+      centralQualityCriterionObservations?.some((observation) => (
+        observation.criterion === influenceCriterion
+        && observation.verdict === "unknown"
+      ))
+    ))).toBe(true);
+  });
+
+  test("accepts exact-track historical-influence evidence without an artist-level bridge", async () => {
+    const selection = guidedIrishInfluenceSelection("balanced_influence");
+    const influenceCriterion = selection.playlistQualityPolicy!.criteria.find(
+      (criterion) => criterion === "documented historical influence",
+    )!;
+    const membershipPredicate = selection.membershipPredicates.find(
+      ({ axis, operator }) => axis === "geography" && operator === "require",
+    )!;
+    const sourceUrl = "https://www.loc.gov/item/kesh-jig-influence";
+    const appleSong = song(536, "The Bothy Band", "The Kesh Jig");
+    const createResponse = vi.fn(async () => ({
+      id: "resp_exact_track_influence",
+      output_text: JSON.stringify({
+        candidates: [{
+          artist: appleSong.artistName,
+          title: appleSong.name,
+          album: appleSong.albumName,
+          centralQualityScore: 0.93,
+          influenceScore: 0.93,
+          centralQualityCriteria: [{
+            criterion: influenceCriterion,
+            verdict: "pass",
+          }],
+          sources: [{
+            url: sourceUrl,
+            predicateIds: [membershipPredicate.id],
+          }],
+        }],
+      }),
+      output: [
+        {
+          type: "web_search_call",
+          action: { sources: [{ url: sourceUrl }] },
+        },
+        hostedCitationMessage(
+          "msg_exact_track_influence",
+          sourceUrl,
+          "The Bothy Band — The Kesh Jig is an influential, seminal Irish "
+            + "recording. [source]",
+        ),
+      ],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      createResponse: createResponse as any,
+      searchAppleSongs: vi.fn(async () => [appleSong]) as any,
+      lookupAppleByIsrc: vi.fn(async () => []) as any,
+    });
+    const discovery = {
+      ...discoveryRequest(selection, "editorial_tracks"),
+      requestedRawCandidateCount: 1,
+    };
+    const batch = await adapters.discover(discovery);
+    const [qualification] = await adapters.qualify({
+      ...discovery,
+      candidates: batch.candidates,
+    });
+
+    expect(qualification).toMatchObject({
+      rankingSignals: {
+        influence: 0.93,
+        central_quality: 0.93,
+      },
+    });
+    expect(qualification?.centralQualityCriterionObservations).toContainEqual(
+      expect.objectContaining({
+        criterion: influenceCriterion,
+        verdict: "pass",
+        bindingKind: "catalog",
+        sourceKind: "governed_evidence_snapshot",
+      }),
+    );
+  });
+
+  test("permits a policy-approved Irish editorial scene association but never substitutes it for explicit artist origin", async () => {
+    const broadSelection = plan("Infuential irish music", 25);
+    const broadPredicate = broadSelection.membershipPredicates.find((value) => (
+      value.axis === "geography"
+      && value.values.includes("Ireland")
+    ))!;
+    const appleSong = song(507, "Irish Fixture Artist", "Fixture Track");
+    const searchAppleResources = vi.fn(async () => emptySearch({
+      playlists: [{
+        id: "pl.irish",
+        name: "Irish Music Essentials",
+        curatorName: "Apple Music",
+        description: "Landmark recordings from Ireland's music scene.",
+        url: "https://music.apple.com/us/playlist/irish-music-essentials/pl.irish",
+      }],
+    }));
+    const adapters = createPipelineV3LiveAdapters({
+      searchAppleResources: searchAppleResources as any,
+      getPlaylistTracks: vi.fn(async () => ({
+        items: [appleSong],
+        next: null,
+      })) as any,
+    });
+    const broadDiscovery = discoveryRequest(
+      broadSelection,
+      "trusted_containers",
+    );
+    const broadBatch = await adapters.discover(broadDiscovery);
+    expect((broadBatch.candidates[0] as any)?.metadata?.bindings?.[0])
+      .toMatchObject({
+        kind: "apple_editorial_container",
+        predicateIds: [broadPredicate.id],
+      });
+
+    const originSelection = plan("25 tracks by Irish artists", 25);
+    const originPredicate = originSelection.membershipPredicates.find(
+      (value) => value.axis === "geography",
+    );
+    expect(originPredicate).toMatchObject({
+      values: ["Ireland"],
+      geographyRelationship: "artist_origin",
+    });
+    const originBatch = await adapters.discover(discoveryRequest(
+      originSelection,
+      "trusted_containers",
+    ));
+    expect(originBatch.candidates).toEqual([]);
   });
 
   test("keeps valid structured hosted candidates when an invalid sibling invents its source URL", async () => {
@@ -4093,6 +5239,7 @@ describe("Pipeline V3 live read-only adapters", () => {
     expect(providerPayload).toEqual({
       operation: "catalog_bound_central_quality",
       centralQualityPolicy: selection.playlistQualityPolicy,
+      influenceRankingObjectives: [],
       requestedCandidateCount: 1,
       catalogCandidates: [{
         artist: exactSeed.artistName,

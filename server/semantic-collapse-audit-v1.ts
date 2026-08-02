@@ -24,12 +24,131 @@ export interface SemanticCollapseAuditV1 {
   limitingObligationIds: string[];
   independentDependencyRootIds: string[];
   dominantRejectionRatio: number;
+  qualificationCount: number;
+  canonicalUnknownCandidateCount: number;
+  dominantCanonicalUnknownRatio: number;
+  unknownCandidateCountsByObligationId: Record<string, number>;
   auditHash: string;
 }
 
 function unique(values: readonly string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))]
     .sort();
+}
+
+export interface SemanticCollapseObservationV1 {
+  qualificationCount: number;
+  canonicalUnknownCandidateCount: number;
+  dominantCanonicalUnknownRatio: number;
+  unknownCandidateCountsByObligationId: Record<string, number>;
+}
+
+function nonNegativeCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : 0;
+}
+
+function canonicalUnknownCandidateCount(
+  result: RetrievalResultV3,
+): number {
+  return Math.max(
+    nonNegativeCount(
+      result.deficit?.discardedByReason?.canonical_contract_unknown,
+    ),
+    (result.candidateLeads ?? []).filter(
+      ({ rejectionCode }) => rejectionCode === "canonical_contract_unknown",
+    ).length,
+  );
+}
+
+function isEvidenceVerificationAxis(axis: string): boolean {
+  const normalized = axis.trim().toLowerCase();
+  return normalized === "evidence"
+    || normalized === "evidence_policy"
+    || normalized === "factual_relationship"
+    || normalized === "track_factual_relationship";
+}
+
+/**
+ * The retrieval boundary deliberately does not retain raw provider prose, but
+ * it does retain the aggregate canonical-unknown ledger. Convert that ledger
+ * into a conservative per-obligation observation only where the remaining
+ * typed counters identify the obligation unambiguously:
+ *
+ * - a query with one non-allowing unknown leaf has only one possible
+ *   obligation;
+ * - an evidence-axis leaf is limiting when canonical qualification ran,
+ *   nothing passed the evidence gate, and the semantic-contract verifier
+ *   reported canonical unknowns.
+ *
+ * This is diagnostic evidence about our verifier, not proof of musical
+ * scarcity.
+ */
+export function deriveSemanticCollapseObservationV1(input: {
+  queryPlan: QueryPlanV3;
+  result: RetrievalResultV3;
+}): SemanticCollapseObservationV1 {
+  const leaves = input.queryPlan.verificationExpression
+    ? verificationLeavesV1(input.queryPlan.verificationExpression)
+    : [];
+  const qualificationCount = Math.max(
+    0,
+    nonNegativeCount(
+      input.result.predicateDiagnostics?.qualificationsObserved
+        ?? input.result.stages.validCandidates,
+    ),
+  );
+  const unknownCount = Math.min(
+    qualificationCount,
+    canonicalUnknownCandidateCount(input.result),
+  );
+  const unknownCandidateCountsByObligationId: Record<string, number> = {};
+  if (qualificationCount > 0 && unknownCount > 0) {
+    const blockingUnknownLeaves = leaves.filter(
+      ({ unknownPolicy }) => unknownPolicy !== "allow",
+    );
+    const exactClauseCounts =
+      input.result.predicateDiagnostics?.canonicalClauseDispositionCounts
+      ?? {};
+    for (const leaf of blockingUnknownLeaves) {
+      const exactUnknown = nonNegativeCount(
+        exactClauseCounts[leaf.clauseId]?.unknown,
+      );
+      if (exactUnknown > 0) {
+        unknownCandidateCountsByObligationId[leaf.obligationId] = Math.min(
+          qualificationCount,
+          exactUnknown,
+        );
+      }
+    }
+    if (Object.keys(unknownCandidateCountsByObligationId).length > 0) {
+      // Exact per-clause tri-state observations are authoritative. Do not add
+      // conservative inferred obligations beside them.
+    } else if (blockingUnknownLeaves.length === 1) {
+      unknownCandidateCountsByObligationId[
+        blockingUnknownLeaves[0]!.obligationId
+      ] = unknownCount;
+    } else if (
+      input.result.predicateDiagnostics?.rootCause === "semantic_contract"
+      && input.result.stages.evidenceEligible === 0
+    ) {
+      for (const leaf of blockingUnknownLeaves) {
+        if (isEvidenceVerificationAxis(leaf.axis)) {
+          unknownCandidateCountsByObligationId[leaf.obligationId] =
+            unknownCount;
+        }
+      }
+    }
+  }
+  return {
+    qualificationCount,
+    canonicalUnknownCandidateCount: unknownCount,
+    dominantCanonicalUnknownRatio: qualificationCount > 0
+      ? unknownCount / qualificationCount
+      : 0,
+    unknownCandidateCountsByObligationId,
+  };
 }
 
 /**
@@ -42,17 +161,43 @@ export function auditSemanticCollapseV1(input: {
   result: RetrievalResultV3;
   unresolvedUserSemanticClauseIds?: readonly string[];
   unknownCandidateCountsByObligationId?: Readonly<Record<string, number>>;
+  canonicalUnknownCandidateCount?: number;
 }): SemanticCollapseAuditV1 {
   const expression = input.queryPlan.verificationExpression;
   const coverage = input.queryPlan.executionCoverageReport;
   const leaves = expression ? verificationLeavesV1(expression) : [];
+  const derivedObservation = deriveSemanticCollapseObservationV1({
+    queryPlan: input.queryPlan,
+    result: input.result,
+  });
+  const mergedUnknownCandidateCounts = {
+    ...derivedObservation.unknownCandidateCountsByObligationId,
+    ...(input.unknownCandidateCountsByObligationId ?? {}),
+  };
+  const unknownCandidateCountsByObligationId: Record<string, number> = {};
+  for (const obligationId of Object.keys(mergedUnknownCandidateCounts).sort()) {
+    const count = Math.min(
+      derivedObservation.qualificationCount,
+      nonNegativeCount(mergedUnknownCandidateCounts[obligationId]),
+    );
+    if (count > 0) {
+      unknownCandidateCountsByObligationId[obligationId] = count;
+    }
+  }
   const failureCounts =
     input.result.predicateDiagnostics?.failedMembershipPredicateIds ?? {};
-  const qualificationCount = Math.max(
-    0,
-    input.result.predicateDiagnostics?.qualificationsObserved
-      ?? input.result.stages.validCandidates,
+  const qualificationCount = derivedObservation.qualificationCount;
+  const canonicalUnknownCount = Math.min(
+    qualificationCount,
+    Math.max(
+      derivedObservation.canonicalUnknownCandidateCount,
+      nonNegativeCount(input.canonicalUnknownCandidateCount),
+      ...Object.values(unknownCandidateCountsByObligationId),
+    ),
   );
+  const dominantCanonicalUnknownRatio = qualificationCount > 0
+    ? canonicalUnknownCount / qualificationCount
+    : 0;
   const attemptedClauseIds = new Set([
     ...(input.result.predicateDiagnostics?.attemptedCanonicalClauseIds ?? []),
     ...Object.keys(failureCounts),
@@ -68,7 +213,7 @@ export function auditSemanticCollapseV1(input: {
   const unknownEverywhere = leaves.flatMap(({ obligationId }) => (
     qualificationCount > 0
       && Number(
-        input.unknownCandidateCountsByObligationId?.[obligationId] ?? 0,
+        unknownCandidateCountsByObligationId[obligationId] ?? 0,
       ) >= qualificationCount
       ? [obligationId]
       : []
@@ -104,6 +249,12 @@ export function auditSemanticCollapseV1(input: {
   if (unknownEverywhere.length > 0) {
     signalCodes.push("hard_obligation_unknown_for_every_candidate");
   }
+  if (qualificationCount >= 10
+    && zeroQualified
+    && input.result.predicateDiagnostics?.rootCause === "semantic_contract"
+    && dominantCanonicalUnknownRatio >= 0.8) {
+    signalCodes.push("candidate_rich_semantic_contract_collapse");
+  }
   if (input.result.stages.canonicalUnique >= 10
     && dependencyRoots.length >= 2
     && zeroQualified
@@ -136,6 +287,12 @@ export function auditSemanticCollapseV1(input: {
     ...uncovered,
     ...unattempted,
     ...unknownEverywhere,
+    ...Object.entries(unknownCandidateCountsByObligationId)
+      .filter(([, count]) => (
+        qualificationCount > 0
+        && count / qualificationCount >= 0.8
+      ))
+      .map(([obligationId]) => obligationId),
   ]);
   const body = {
     version: SEMANTIC_COLLAPSE_AUDIT_VERSION,
@@ -145,6 +302,10 @@ export function auditSemanticCollapseV1(input: {
     limitingObligationIds,
     independentDependencyRootIds: dependencyRoots,
     dominantRejectionRatio,
+    qualificationCount,
+    canonicalUnknownCandidateCount: canonicalUnknownCount,
+    dominantCanonicalUnknownRatio,
+    unknownCandidateCountsByObligationId,
   };
   return {
     ...body,

@@ -24,8 +24,14 @@ import {
   REFERENCE_ARTIST_EXCLUSION_PREFIX,
   excludedReferenceArtists,
 } from "./similarity-policy.ts";
+import {
+  SELECTION_INFLUENCE_SCOPE_SIGNAL_V1,
+} from "./selection-plan-v2.ts";
 
-export const PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION = "selection_plan_shadow_bridge_v1" as const;
+export const LEGACY_PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION =
+  "selection_plan_shadow_bridge_v1" as const;
+export const PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION =
+  "selection_plan_shadow_bridge_v2" as const;
 export const PLAYLIST_CONTRACT_SHADOW_EVIDENCE_POLICY_VERSION =
   SHADOW_PLAYLIST_EVIDENCE_POLICY_VERSION;
 
@@ -71,6 +77,22 @@ const MUSIC_SCOPE_AXES = new Set<SelectionConstraintAxis>([
   "genre",
   "scene",
   "subgenre",
+]);
+
+// These are already typed selection axes, even when they are not concepts in
+// the music ontology. Treating geography, era, language, or an exact entity as
+// a generic factual relationship selects the wrong executor and can move an
+// immutable public assignment between rollout cohorts after guidance.
+const TRACK_MEMBERSHIP_AXES = new Set<SelectionConstraintAxis>([
+  ...MUSIC_SCOPE_AXES,
+  "era",
+  "geography",
+  "language",
+  "artist",
+  "album",
+  "track",
+  "label",
+  "venue",
 ]);
 
 const CENTRAL_SUITABILITY_AXES = new Set<SelectionConstraintAxis>([
@@ -326,7 +348,7 @@ function hardClauseKind(
   constraint: SelectionConstraint,
 ): PlaylistContractClauseDraftV1["kind"] {
   if (isNegativeConstraint(constraint)) return "exclusion";
-  if (MUSIC_SCOPE_AXES.has(constraint.axis)) return "membership";
+  if (TRACK_MEMBERSHIP_AXES.has(constraint.axis)) return "membership";
   if (constraint.axis === "recording_version" || constraint.axis === "content") {
     return "catalog_version";
   }
@@ -404,6 +426,15 @@ function addSuitabilityClause(input: {
     operator: "prefer",
     values: [input.value],
     source,
+    evidence: {
+      required: true,
+      minimumGrade: null,
+      permittedGrades: [
+        "track_specific_editorial_assertion",
+        "independent_secondary_source",
+      ],
+    },
+    unknownPolicy: "defer",
   });
   input.centralSuitabilityClauseIds.push(id);
 }
@@ -497,36 +528,14 @@ export function buildPlaylistContractShadowDraftV1(
   });
   hardTrackClauseIds.push(versionClauseId);
 
-  const evidenceClauseId = "bridge:evidence:qualification-policy";
-  addClause({
-    id: evidenceClauseId,
-    kind: "factual_relationship",
-    scope: "track",
-    hardness: "hard",
-    axis: "evidence",
-    operator: "require",
-    values: [input.selectionPlan.evidencePolicy],
-    source: {
-      provenance: "migration",
-      text: input.selectionPlan.evidencePolicy,
-    },
-    evidence: {
-      required: true,
-      // This bridge accepts several intentionally incomparable selection-grade
-      // evidence routes. The allowlist controls entailment; no false global
-      // ordering is imposed across those routes.
-      minimumGrade: null,
-      permittedGrades: [
-        "authoritative_structured_metadata",
-        "trusted_scoped_container",
-        "track_specific_editorial_assertion",
-        "primary_source",
-        "independent_secondary_source",
-      ],
-    },
-    unknownPolicy: "defer",
-  });
-  hardTrackClauseIds.push(evidenceClauseId);
+  // v1 projected one coarse, hard "has some qualifying evidence" leaf in
+  // addition to every claim-specific obligation. That leaf could not express
+  // which fact was being proved and turned a provider's missing citation span
+  // into zero musical eligibility even when origin, genre, catalog identity,
+  // version and storefront facts were already known. v2 keeps evidence on the
+  // exact clause it entails; the executor still fails closed for every
+  // required leaf, but an acquisition gap can now be attributed and repaired
+  // on its real axis.
 
   const contentRequiresGate = input.selectionPlan.contentPolicy.explicitContent === "clean_only"
     || input.selectionPlan.contentPolicy.instrumental === "exclude"
@@ -762,6 +771,65 @@ export function buildPlaylistContractShadowDraftV1(
     }
     const values = unique(constraint.values);
     if (values.length === 0) continue;
+    if (
+      constraint.kind === "soft"
+      && constraint.axis === "relationship"
+      && constraint.operator === "prefer"
+      && values.length === 1
+      && values[0] === SELECTION_INFLUENCE_SCOPE_SIGNAL_V1
+    ) {
+      // The selection compiler has already resolved the user-authored concept.
+      // Preserve two orthogonal, soft execution roles:
+      //
+      // 1. a central suitability criterion whose pass must be backed by
+      //    track-specific editorial or independent secondary evidence; and
+      // 2. a ranking preference that can order otherwise eligible tracks.
+      //
+      // Neither clause enters the hard track predicate, so missing influence
+      // evidence remains an honest quality unknown rather than silently
+      // turning broad Irish (or other geographic) membership into a per-track
+      // historical-influence gate.
+      const suitabilityClauseId =
+        `bridge:suitability:influence:${safeId(constraint.id)}:${constraintIndex + 1}`;
+      addClause({
+        id: suitabilityClauseId,
+        kind: "suitability",
+        scope: "track",
+        hardness: "soft",
+        axis: "influence",
+        operator: "prefer",
+        values: ["documented historical influence"],
+        source: {
+          provenance: "migration",
+          text: "Compiler-resolved historical influence objective",
+        },
+        evidence: {
+          required: true,
+          minimumGrade: null,
+          permittedGrades: [
+            "track_specific_editorial_assertion",
+            "independent_secondary_source",
+          ],
+        },
+        unknownPolicy: "defer",
+      });
+      centralSuitabilityClauseIds.push(suitabilityClauseId);
+      addClause({
+        id:
+          `bridge:ranking:influence:${safeId(constraint.id)}:${constraintIndex + 1}`,
+        kind: "ranking_preference",
+        scope: "track",
+        hardness: "soft",
+        axis: "influence",
+        operator: "prefer",
+        values: ["documented historical influence"],
+        source: {
+          provenance: "migration",
+          text: "Compiler-resolved historical influence objective",
+        },
+      });
+      continue;
+    }
     if (
       constraint.axis === "relationship"
       && isNegativeConstraint(constraint)

@@ -749,6 +749,81 @@ test("accounts both billable calls once when the bounded scout repair is unavail
   }));
 });
 
+test("never reintroduces raw narrative context during an envelope-backed scout repair", async () => {
+  vi.stubEnv("OPENAI_API_KEY", "sk-test-guidance-envelope-repair-privacy");
+  const sourceUrl = "https://example.org/rnb-history";
+  const requestBodies: Record<string, unknown>[] = [];
+  const fetchMock = vi.fn(async (_url, init) => {
+    requestBodies.push(JSON.parse(String(init?.body)));
+    if (requestBodies.length === 1) {
+      return new Response(JSON.stringify({
+        id: "response-envelope-primary-incomplete",
+        model: "gpt-5.4-mini",
+        status: "incomplete",
+        incomplete_details: { reason: "max_output_tokens" },
+        usage: { input_tokens: 100, output_tokens: 60 },
+        output_text: "{\"questions\":[",
+        output: [{
+          type: "web_search_call",
+          id: "search-rnb-history",
+          status: "completed",
+          action: {
+            type: "search",
+            query: "rhythm and blues history",
+            sources: [{
+              type: "url",
+              url: sourceUrl,
+              title: "R&B history",
+            }],
+          },
+        }],
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return hostedResponse({ questions: [] }, "response-envelope-repair");
+  });
+  vi.stubGlobal("fetch", fetchMock);
+
+  await scoutPlaylistGuidance(
+    "R&B for Maya inspired by when we met between Long Island and Del Mar",
+    {
+      ...guidedDraftBrief,
+      title: "Maya and my Long Island story",
+      description: "Remember when we met in Del Mar.",
+      subjectEntities: ["Maya", "Long Island", "Del Mar", "R&B"],
+    },
+    "gpt-5.4-mini",
+    {},
+    {
+      version: 1,
+      requestedTrackCount: 25,
+      storefront: "us",
+      intents: ["genre_scene"],
+      membership: [{
+        axis: "genre",
+        operator: "require",
+        values: ["rhythm and blues"],
+      }],
+      preferences: [],
+      unresolvedAxes: ["narrative_date_window"],
+      envelopeHash: "a".repeat(64),
+    },
+  );
+
+  expect(requestBodies).toHaveLength(2);
+  for (const body of requestBodies) {
+    const input = JSON.parse(String(body.input));
+    expect(input).toHaveProperty("musicIntentEnvelope");
+    expect(input).not.toHaveProperty("request");
+    expect(input).not.toHaveProperty("confirmedBrief");
+    expect(JSON.stringify(input)).not.toMatch(
+      /Maya|Long Island|Del Mar|when we met/iu,
+    );
+  }
+});
+
 test("accepts a grounded geographic relationship fork for an underspecified place request", async () => {
   vi.stubEnv("OPENAI_API_KEY", "sk-test-rio-guidance");
   const sourceUrl = "https://example.org/rio-music-history";

@@ -2,12 +2,18 @@ import releaseManifest from "./releases.json" with { type: "json" };
 
 export type AppRelease = {
   version: string;
-  releasedAt: string;
+  status: "candidate" | "released";
+  releasedAt: string | null;
   title: string;
   notes: readonly string[];
 };
 
-export const releaseHistory = releaseManifest.releases as readonly AppRelease[];
+export const releaseHistory = releaseManifest.releases.map((release) => ({
+  ...release,
+  status: "status" in release && release.status === "candidate"
+    ? "candidate" as const
+    : "released" as const,
+})) as readonly AppRelease[];
 
 if (releaseHistory.length === 0) {
   throw new Error("The gênio release manifest must contain at least one release");

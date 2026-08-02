@@ -48,6 +48,11 @@ export interface GuidanceOptionV3 {
   description: string;
   recommended: boolean;
   /**
+   * Server-owned explanation for a recommendation. Guidance V5 requires this
+   * exactly when `recommended` is true and binds it into the question hash.
+   */
+  recommendationReason?: string;
+  /**
    * A server-owned, explicitly labelled answer that confirms the already
    * compiled semantics. This is never an implicit default.
    */
@@ -359,6 +364,8 @@ export function smoothReggaetonHeatGuidanceDecisionV3(input: {
         label: "Reggaeton + Latin urban",
         description: "Keep at least 70% core reggaeton, with qualifying dembow and Latin urban around it.",
         recommended: true,
+        recommendationReason:
+          "The request explicitly pairs reggaeton with adjacent Latin urban tracks, so this option preserves both while keeping a core-reggaeton majority.",
         expectedFeasibilityDirection: "neutral",
         patch: {
           affectedClauseIds: [

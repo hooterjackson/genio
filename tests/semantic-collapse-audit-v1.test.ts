@@ -1,7 +1,10 @@
 import { describe, expect, test } from "vitest";
 import type { QueryPlanV3 } from "../shared/types.ts";
 import type { RetrievalResultV3 } from "../server/pipeline-v3-retrieval.ts";
-import { auditSemanticCollapseV1 } from "../server/semantic-collapse-audit-v1.ts";
+import {
+  auditSemanticCollapseV1,
+  deriveSemanticCollapseObservationV1,
+} from "../server/semantic-collapse-audit-v1.ts";
 
 function queryPlan(): QueryPlanV3 {
   return {
@@ -108,6 +111,120 @@ function result(patch: Partial<RetrievalResultV3> = {}): RetrievalResultV3 {
     dependencyOutages: [],
     ...patch,
   } as RetrievalResultV3;
+}
+
+function evidenceVerificationPlan(): QueryPlanV3 {
+  const base = queryPlan();
+  const verificationExpression = {
+    op: "allOf" as const,
+    children: [
+      base.verificationExpression!,
+      {
+        ...base.verificationExpression!,
+        obligationId: "verification:evidence",
+        clauseId: "evidence",
+        axis: "evidence",
+        verifierFamilies: ["track_editorial" as const],
+        capableProducerFamilies: ["track_editorial" as const],
+      },
+      {
+        ...base.verificationExpression!,
+        obligationId: "verification:version",
+        clauseId: "version",
+        axis: "recording_version",
+        verifierFamilies: ["recording_identity" as const],
+        capableProducerFamilies: ["recording_identity" as const],
+      },
+      {
+        ...base.verificationExpression!,
+        obligationId: "verification:storefront",
+        clauseId: "storefront",
+        axis: "storefront_availability",
+        verifierFamilies: ["apple_catalog" as const],
+        capableProducerFamilies: ["apple_catalog" as const],
+      },
+    ],
+  };
+  return {
+    ...base,
+    verificationExpression,
+    executionCoverageReport: {
+      ...base.executionCoverageReport!,
+      coveredObligationIds: [
+        "verification:evidence",
+        "verification:genre",
+        "verification:storefront",
+        "verification:version",
+      ],
+      producerFamilies: [
+        "apple_catalog",
+        "recording_identity",
+        "track_editorial",
+      ],
+    },
+  } as QueryPlanV3;
+}
+
+function canonicalUnknownResult(
+  canonicalUnknownCount: number,
+  dependencyOutages: RetrievalResultV3["dependencyOutages"] = [],
+): RetrievalResultV3 {
+  const base = result();
+  return result({
+    outcome: {
+      ...base.outcome,
+      requestedTrackCount: 50,
+      shortfall: 50,
+    },
+    stages: {
+      discovered: 80,
+      validCandidates: 77,
+      scopeEligible: 0,
+      hardConstraintEligible: 0,
+      evidenceEligible: 0,
+      versionCompatible: 0,
+      storefrontPlayable: 0,
+      canonicalUnique: 77,
+      selected: 0,
+      reserve: 0,
+    },
+    deficit: {
+      requested: 50,
+      qualifiedPoolGoal: 55,
+      targetShortfall: 50,
+      reserveShortfall: 5,
+      discovered: 80,
+      validCandidates: 77,
+      scopeEligible: 0,
+      hardConstraintEligible: 0,
+      evidenceEligible: 0,
+      versionCompatible: 0,
+      storefrontPlayable: 0,
+      canonicalUnique: 77,
+      selected: 0,
+      reserve: 0,
+      discardedByReason: {
+        canonical_contract_unknown: canonicalUnknownCount,
+      },
+      primaryShortfallReason: "frontier_exhausted",
+    },
+    predicateDiagnostics: {
+      qualificationsObserved: 77,
+      scopeFailures: 77,
+      failedMembershipPredicateIds: {},
+      attemptedCanonicalClauseIds: [
+        "evidence",
+        "genre",
+        "storefront",
+        "version",
+      ],
+      appleLookupCount: 77,
+      appleProviderRequestCount: 2,
+      rootCause: "semantic_contract",
+      recoveryAttemptCount: 0,
+    },
+    dependencyOutages,
+  });
 }
 
 describe("SemanticCollapseAuditV1", () => {
@@ -240,5 +357,122 @@ describe("SemanticCollapseAuditV1", () => {
     );
     expect(audit.limitingObligationIds).toEqual([]);
     expect(audit.disposition).not.toBe("technical_quarantine");
+  });
+
+  test("derives the limiting evidence obligation and quarantines candidate-rich all-unknown verification", () => {
+    const plan = evidenceVerificationPlan();
+    const retrieval = canonicalUnknownResult(77);
+    const observation = deriveSemanticCollapseObservationV1({
+      queryPlan: plan,
+      result: retrieval,
+    });
+
+    expect(observation).toEqual({
+      qualificationCount: 77,
+      canonicalUnknownCandidateCount: 77,
+      dominantCanonicalUnknownRatio: 1,
+      unknownCandidateCountsByObligationId: {
+        "verification:evidence": 77,
+      },
+    });
+
+    const audit = auditSemanticCollapseV1({
+      queryPlan: plan,
+      result: retrieval,
+      unknownCandidateCountsByObligationId:
+        observation.unknownCandidateCountsByObligationId,
+      canonicalUnknownCandidateCount:
+        observation.canonicalUnknownCandidateCount,
+    });
+    expect(audit).toMatchObject({
+      triggered: true,
+      disposition: "technical_quarantine",
+      qualificationCount: 77,
+      canonicalUnknownCandidateCount: 77,
+      dominantCanonicalUnknownRatio: 1,
+      limitingObligationIds: ["verification:evidence"],
+      signalCodes: expect.arrayContaining([
+        "candidate_rich_semantic_contract_collapse",
+        "hard_obligation_unknown_for_every_candidate",
+      ]),
+    });
+  });
+
+  test("uses exact multi-clause tri-state counts instead of guessing the limiting obligation", () => {
+    const plan = evidenceVerificationPlan();
+    const base = canonicalUnknownResult(77);
+    const retrieval = {
+      ...base,
+      predicateDiagnostics: {
+        ...base.predicateDiagnostics!,
+        canonicalClauseDispositionCounts: {
+          evidence: { pass: 0, fail: 0, unknown: 77 },
+          genre: { pass: 77, fail: 0, unknown: 0 },
+          version: { pass: 73, fail: 0, unknown: 4 },
+          storefront: { pass: 73, fail: 4, unknown: 0 },
+        },
+      },
+    };
+
+    const observation = deriveSemanticCollapseObservationV1({
+      queryPlan: plan,
+      result: retrieval,
+    });
+    expect(observation.unknownCandidateCountsByObligationId).toEqual({
+      "verification:evidence": 77,
+      "verification:version": 4,
+    });
+
+    const audit = auditSemanticCollapseV1({
+      queryPlan: plan,
+      result: retrieval,
+    });
+    expect(audit.limitingObligationIds).toEqual([
+      "verification:evidence",
+    ]);
+    expect(audit.disposition).toBe("technical_quarantine");
+  });
+
+  test("does not call a dominant canonical-unknown verifier collapse scarcity", () => {
+    const plan = evidenceVerificationPlan();
+    const retrieval = canonicalUnknownResult(73);
+    const audit = auditSemanticCollapseV1({
+      queryPlan: plan,
+      result: retrieval,
+    });
+
+    expect(audit.disposition).toBe("technical_quarantine");
+    expect(audit.signalCodes).toContain(
+      "candidate_rich_semantic_contract_collapse",
+    );
+    expect(audit.signalCodes).not.toContain(
+      "hard_obligation_unknown_for_every_candidate",
+    );
+    expect(audit.limitingObligationIds).toContain(
+      "verification:evidence",
+    );
+  });
+
+  test("turns the same verifier collapse into a dependency blocker during an active outage", () => {
+    const plan = evidenceVerificationPlan();
+    const retrieval = canonicalUnknownResult(77, [{
+      dependencyId: "hosted_web",
+      active: true,
+      outageCount: 1,
+      failureAttempts: 1,
+      circuitOpen: true,
+      failureClass: "transient",
+      retryAfterUntil: "2026-08-01T12:05:00.000Z",
+      affectedStrategyIds: ["two"],
+    }]);
+    const audit = auditSemanticCollapseV1({
+      queryPlan: plan,
+      result: retrieval,
+    });
+
+    expect(audit.disposition).toBe("dependency_blocker");
+    expect(audit.limitingObligationIds).toContain(
+      "verification:evidence",
+    );
   });
 });

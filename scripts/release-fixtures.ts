@@ -12,7 +12,11 @@ import {
   SMOOTH_REGGAETON_HEAT_PROMPT,
   compileGuidanceSelectionV3,
 } from "../server/adaptive-guidance-v3.ts";
-import { guidanceDecisionV3FromPublicQuestion } from "../server/adaptive-guidance-contract-bridge.ts";
+import {
+  guidanceDecisionV3FromPublicQuestion,
+  guidanceDecisionV5FromPublicQuestion,
+} from "../server/adaptive-guidance-contract-bridge.ts";
+import { compileGuidanceSelectionV5 } from "../server/adaptive-guidance-v5.ts";
 import type { PlaylistGuidanceQuestion } from "../shared/types.ts";
 import {
   validateSitesControlPlaneTrustPolicyV1,
@@ -48,13 +52,13 @@ import {
   verifyHistoricalStablePredecessor,
 } from "./historical-stable-predecessor.ts";
 import {
-  PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
   type PublicRolloutIntentGroup,
 } from "../shared/public-rollout-evidence.ts";
 import {
   buildReleaseConvergenceEvidence,
   type ReleaseConvergenceObservation,
 } from "./verify-release-convergence.ts";
+import { validateIrishInfluenceReleaseProofV1 } from "./irish-influence-release-proof.ts";
 
 /**
  * Release fixtures are code-owned product contracts. A live canary may accept
@@ -71,6 +75,7 @@ export const RELEASE_FIXTURE_IDS = [
   "fixed-three-track-control-v1",
   "smooth-reggaeton-heat-50-v1",
   "french-jazz-guided-constraint-25-v1",
+  "irish-influence-recovery-25-v1",
 ] as const;
 
 export type ReleaseFixtureId = typeof RELEASE_FIXTURE_IDS[number];
@@ -149,11 +154,11 @@ export interface FinalPublicAssignmentProbeFixtureV1 {
 }
 
 /**
- * These prompts are deliberately recognizable as release canaries while still
- * exercising the ordinary anonymous public-assignment path. Raw prompts never
- * enter release evidence; only the code-owned fixture ID, group, and count do.
+ * Immutable compatibility corpus for already-signed final-browser v2
+ * evidence. Historical evidence is verified against this snapshot rather
+ * than being reinterpreted through the current rollout registry.
  */
-export const FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1 = Object.freeze([
+export const LEGACY_FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1 = Object.freeze([
   Object.freeze({
     fixtureId: "final-public-assignment-genre-scene-v1",
     intentGroup: "genre_scene",
@@ -202,6 +207,41 @@ export const FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1 = Object.freeze([
     prompt:
       "[GENIO PUBLIC ASSIGNMENT CANARY:exhaustive:v1] Create an exhaustive selection of 3 Nigerian boogie tracks.",
     targetTrackCount: 3,
+  }),
+] as const satisfies readonly FinalPublicAssignmentProbeFixtureV1[]);
+
+/**
+ * These prompts are deliberately recognizable as release canaries while still
+ * exercising the ordinary anonymous public-assignment path. Raw prompts never
+ * enter release evidence; only the code-owned fixture ID, group, and count do.
+ */
+export const FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1 = Object.freeze([
+  Object.freeze({
+    fixtureId: "final-public-assignment-editorial-influence-typo-v1",
+    intentGroup: "editorial_influence",
+    prompt: "Infuential irish music",
+    targetTrackCount: 25,
+  }),
+  Object.freeze({
+    fixtureId: "final-public-assignment-editorial-influence-corrected-v1",
+    intentGroup: "editorial_influence",
+    prompt: "Influential Irish music",
+    targetTrackCount: 25,
+  }),
+] as const satisfies readonly FinalPublicAssignmentProbeFixtureV1[]);
+
+/**
+ * Immutable compatibility snapshot for already-produced final-browser v5
+ * evidence. V6 adds the corrected public prompt and switches both anonymous
+ * probes to the database-fenced manifest-only boundary.
+ */
+const FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V5 = Object.freeze([
+  Object.freeze({
+    fixtureId: "final-public-assignment-editorial-influence-v1",
+    intentGroup: "editorial_influence",
+    prompt:
+      "[GENIO PUBLIC ASSIGNMENT CANARY:editorial_influence:v2] Infuential irish music",
+    targetTrackCount: 25,
   }),
 ] as const satisfies readonly FinalPublicAssignmentProbeFixtureV1[]);
 
@@ -278,6 +318,8 @@ const FRENCH_JAZZ_GUIDED_CONSTRAINT_PROMPT = [
   "and order the playlist from intimate acoustic performances to more energetic modern jazz.",
 ].join(" ");
 
+const IRISH_INFLUENCE_RECOVERY_PROMPT = "Infuential irish music";
+
 const FIXTURE_DEFINITIONS: Readonly<Record<ReleaseFixtureId, ReleaseFixtureDefinitionV1>> =
   Object.freeze({
     "fixed-three-track-control-v1": Object.freeze({
@@ -343,6 +385,31 @@ const FIXTURE_DEFINITIONS: Readonly<Record<ReleaseFixtureId, ReleaseFixtureDefin
       }),
       promotable: true,
     }),
+    "irish-influence-recovery-25-v1": Object.freeze({
+      schemaVersion: RELEASE_FIXTURE_SCHEMA_V1,
+      id: "irish-influence-recovery-25-v1",
+      prompt: IRISH_INFLUENCE_RECOVERY_PROMPT,
+      targetTrackCount: 25,
+      guidanceMode: "recommended",
+      guidanceSemantics: Object.freeze({
+        questionId: "v5-nuance:influence-scope",
+        question: "Which kind of influence should lead the playlist?",
+        optionIds: Object.freeze([
+          "within_scope_cultural_impact",
+          "global_influence",
+          "balanced_influence",
+          "keep_current_interpretation",
+        ]),
+        selectedOptionId: "balanced_influence",
+        required: true,
+        minimumCoreRatio: null,
+        hardConstraintLabels: Object.freeze([
+          "artist_origin:Irish",
+          "ranking:historical_influence",
+        ]),
+      }),
+      promotable: true,
+    }),
   });
 
 const GATE_FIXTURE_IDS = {
@@ -352,9 +419,13 @@ const GATE_FIXTURE_IDS = {
   staging_fixed_three_track: ["fixed-three-track-control-v1"],
   staging_affected_regression: ["smooth-reggaeton-heat-50-v1"],
   staging_guided_constraint: ["french-jazz-guided-constraint-25-v1"],
-  semantic_ranking_blinded_review: RELEASE_FIXTURE_IDS,
+  semantic_ranking_blinded_review: [
+    "fixed-three-track-control-v1",
+    "smooth-reggaeton-heat-50-v1",
+    "french-jazz-guided-constraint-25-v1",
+  ],
   production_fixed_three_track: ["fixed-three-track-control-v1"],
-  production_affected_regression: ["smooth-reggaeton-heat-50-v1"],
+  production_affected_regression: ["irish-influence-recovery-25-v1"],
   backend_release_convergence: [],
   release_convergence: [],
   final_custom_domain_browser: [],
@@ -435,9 +506,14 @@ export const RELEASE_GATE_ASSERTIONS: Readonly<Record<ReleaseGateName, readonly 
     ]),
     production_affected_regression: Object.freeze([
       "immutable_manifest_exact_count",
-      "reggaeton_question_semantics",
-      "recommended_core_quota_at_least_70_percent",
+      "signed_owner_editorial_assignment",
+      "influence_scope_question_semantics",
       "guidance_lineage_binding",
+      "successor_query_plan_binding",
+      "worker_guidance_consumption",
+      "candidate_first_recovery_classification",
+      "false_scarcity_rejected",
+      "owner_real_ui_publication",
       "apple_ordered_ids_independently_verified",
       "public_playlist_browser_verified",
       "worker_identity_binding",
@@ -467,7 +543,13 @@ export const RELEASE_GATE_ASSERTIONS: Readonly<Record<ReleaseGateName, readonly 
       "anonymous_playlist_directory",
       "public_playlist_contents_visible",
       "privacy_projection",
-      "public_assignment_all_intents_v3",
+      "public_editorial_influence_v5_flow",
+      "typo_and_corrected_real_ui_prompts",
+      "public_editorial_influence_exact_manifest",
+      "worker_consumed_query_plan",
+      "database_fenced_zero_apple_writes",
+      "zero_publication_orphans",
+      "unrelated_v3_intents_unchanged",
     ]),
   });
 
@@ -576,7 +658,10 @@ export interface ReleaseFixtureExecutionProofV1 {
  * persisted public guidance lineage after the recommended answer is accepted.
  */
 export function validateReleaseFixtureGuidancePayload(
-  fixtureId: "smooth-reggaeton-heat-50-v1" | "french-jazz-guided-constraint-25-v1",
+  fixtureId:
+    | "smooth-reggaeton-heat-50-v1"
+    | "french-jazz-guided-constraint-25-v1"
+    | "irish-influence-recovery-25-v1",
   payloadValue: unknown,
 ): ReleaseFixtureGuidanceValidationV1 {
   const payload = asRecord(payloadValue, "release fixture guidance payload");
@@ -594,6 +679,77 @@ export function validateReleaseFixtureGuidancePayload(
   }
   const publicQuestion = payload.questions[0] as PlaylistGuidanceQuestion;
   const expected = FIXTURE_DEFINITIONS[fixtureId].guidanceSemantics!;
+  if (fixtureId === "irish-influence-recovery-25-v1") {
+    const decision = guidanceDecisionV5FromPublicQuestion(publicQuestion);
+    if (
+      decision.id !== expected.questionId
+      || decision.question !== expected.question
+      || decision.mode !== "nuance_optional"
+      || decision.criticality !== "optional"
+      || decision.axis !== "influence_scope"
+      || decision.rolloutGroup !== "editorial_influence"
+      || decision.selectionMode !== "single"
+      || decision.options.length !== expected.optionIds.length
+      || decision.options.some(
+        (option, index) => option.id !== expected.optionIds[index],
+      )
+      || decision.options.filter(({ recommended }) => recommended).length !== 1
+      || decision.options.find(({ recommended }) => recommended)?.id
+        !== expected.selectedOptionId
+      || decision.options.find(
+        ({ id }) => id === "keep_current_interpretation",
+      )?.patch.operations.length !== 0
+    ) {
+      throw new Error(
+        "release Irish-influence Guidance V5.1 semantics do not match",
+      );
+    }
+    const selectedSimulation = decision.simulations.find(
+      ({ optionId }) => optionId === expected.selectedOptionId,
+    );
+    if (
+      !selectedSimulation?.executionEffect
+      || !selectedSimulation.consumerReceipt
+      || selectedSimulation.executionEffect.field !== "rankingObjectives"
+      || selectedSimulation.executionEffect.consumerId
+        !== selectedSimulation.consumerReceipt.consumerId
+      || selectedSimulation.successorSemanticHash === null
+      || selectedSimulation.baseRolloutGroup !== "editorial_influence"
+      || selectedSimulation.successorRolloutGroup !== "editorial_influence"
+    ) {
+      throw new Error(
+        "release Irish-influence guidance lacks a worker-consumable editorial simulation",
+      );
+    }
+    const compiled = compileGuidanceSelectionV5(decision, {
+      optionIds: [expected.selectedOptionId],
+    });
+    const serialized = stableReleaseFixtureJson(compiled.operations);
+    if (
+      compiled.state !== "accepted"
+      || !serialized.includes("guidance:v5:influence-scope:balanced_influence")
+      || !serialized.includes('"axis":"influence"')
+      || !serialized.includes("balance Irish cultural impact with global influence")
+      || compiled.operations.some((operation) => (
+        operation.op === "remove_clause"
+        || operation.op === "replace_clause"
+        || operation.op === "set_playlist_constraints"
+        || operation.op === "set_quality_policy"
+      ))
+    ) {
+      throw new Error(
+        "release Irish-influence guidance does not preserve membership and count while changing ranking",
+      );
+    }
+    return {
+      fixtureId,
+      questionSetHash,
+      questionHash: decision.questionHash,
+      selectedOptionId: expected.selectedOptionId,
+      executionDeltaHash: releaseFixtureSha256(compiled.operations),
+      affectedClauseIds: [...compiled.affectedClauseIds],
+    };
+  }
   const decision = guidanceDecisionV3FromPublicQuestion(publicQuestion);
   if (
     decision.id !== expected.questionId
@@ -688,7 +844,8 @@ export function createReleaseFixtureExecutionProof(input: {
     ? validateReleaseFixtureGuidancePayload(
       input.fixtureId as
         | "smooth-reggaeton-heat-50-v1"
-        | "french-jazz-guided-constraint-25-v1",
+        | "french-jazz-guided-constraint-25-v1"
+        | "irish-influence-recovery-25-v1",
       guidancePayload,
     )
     : null;
@@ -885,7 +1042,8 @@ function validateFixtureExecutionProof(
     const validation = validateReleaseFixtureGuidancePayload(
       expected.fixtureId as
         | "smooth-reggaeton-heat-50-v1"
-        | "french-jazz-guided-constraint-25-v1",
+        | "french-jazz-guided-constraint-25-v1"
+        | "irish-influence-recovery-25-v1",
       proof.guidancePayload,
     );
     for (const field of ["questionSetHash", "questionHash", "executionDeltaHash"]) {
@@ -1042,10 +1200,15 @@ function validateHostedPublicationSource(
   expected: {
     targetTrackCount: number;
     guidanceLineageHash: string | null;
+    ownerUiPublicationRequired: boolean;
   },
 ): JsonRecord {
   const hosted = asRecord(value, "hosted publication evidence");
-  const hostedFields = [
+  const hostedV2 =
+    hosted.schemaVersion === "genio-hosted-publication-smoke/v2";
+  const hostedV1 =
+    hosted.schemaVersion === "genio-hosted-publication-smoke/v1";
+  const hostedPrefixFields = [
     "schemaVersion",
     "canaryId",
     "cacheMode",
@@ -1063,19 +1226,71 @@ function validateHostedPublicationSource(
     "allAttemptsComplete",
     "serverReportedOrderedAppleReconciliation",
     "orderedAppleIdsHash",
+  ] as const;
+  const hostedSuffixFields = [
     "independentAppleEvidenceHash",
     "volumes",
     "evidenceHash",
   ] as const;
-  exactKeys(hosted, hostedFields, "hosted publication evidence");
+  const hostedFields: readonly string[] = hostedV2
+    ? [...hostedPrefixFields, "ownerUiPublication", ...hostedSuffixFields]
+    : [...hostedPrefixFields, ...hostedSuffixFields];
+  exactKeys(
+    hosted,
+    hostedFields,
+    "hosted publication evidence",
+  );
   if (
-    hosted.schemaVersion !== "genio-hosted-publication-smoke/v1"
+    (!hostedV1 && !hostedV2)
     || hosted.cacheMode !== "reuse_disabled"
     || Number(hosted.targetTrackCount) !== expected.targetTrackCount
     || hosted.allAttemptsComplete !== true
     || Number(hosted.completedAttemptCount) < 1
     || hosted.serverReportedOrderedAppleReconciliation !== true
   ) throw new Error("hosted publication evidence did not prove exact publication");
+  if (expected.ownerUiPublicationRequired) {
+    if (!hostedV2) {
+      throw new Error(
+        "production regression lacks owner UI publication evidence",
+      );
+    }
+    const ownerUi = asRecord(
+      hosted.ownerUiPublication,
+      "owner UI publication evidence",
+    );
+    exactKeys(ownerUi, [
+      "schemaVersion",
+      "exercised",
+      "publishRequestObserved",
+      "publishResponseStatus",
+      "selectedTrackCount",
+      "completedUiVisible",
+      "directoryEntryVisible",
+      "runAccessIdHash",
+      "screenshotHash",
+      "evidenceHash",
+    ], "owner UI publication evidence");
+    if (
+      ownerUi.schemaVersion !== "genio-owner-ui-publication/v1"
+      || ownerUi.exercised !== true
+      || ownerUi.publishRequestObserved !== true
+      || ![200, 201, 202].includes(Number(ownerUi.publishResponseStatus))
+      || Number(ownerUi.selectedTrackCount) !== expected.targetTrackCount
+      || ownerUi.completedUiVisible !== true
+      || ownerUi.directoryEntryVisible !== true
+    ) {
+      throw new Error(
+        "production regression did not publish through the real owner UI",
+      );
+    }
+    digest(ownerUi.runAccessIdHash, "owner UI run access ID hash");
+    digest(ownerUi.screenshotHash, "owner UI screenshot hash");
+    recomputeHash(ownerUi, "evidenceHash", "owner UI publication evidence");
+  } else if (hostedV2 && hosted.ownerUiPublication !== null) {
+    throw new Error(
+      "non-owner publication fixture unexpectedly contains owner UI evidence",
+    );
+  }
   for (const field of [
     "manifestContentHash",
     "contractHash",
@@ -1143,16 +1358,28 @@ function validatePublicationSources(
     fixtures: ReleaseFixtureBindingV1[];
   },
 ): void {
+  const fixture = input.fixtures[0]!;
   exactKeys(
     sources,
-    ["hostedPublication", "independentApple", "fixtureExecution"],
+    fixture.fixtureId === "irish-influence-recovery-25-v1"
+      ? [
+          "hostedPublication",
+          "independentApple",
+          "fixtureExecution",
+          "irishInfluenceRecovery",
+        ]
+      : ["hostedPublication", "independentApple", "fixtureExecution"],
     "publication gate sources",
   );
-  const fixture = input.fixtures[0]!;
-  validateFixtureExecutionProof(sources.fixtureExecution, fixture);
+  const fixtureExecution = validateFixtureExecutionProof(
+    sources.fixtureExecution,
+    fixture,
+  );
   const hosted = validateHostedPublicationSource(sources.hostedPublication, {
     targetTrackCount: fixture.targetTrackCount,
     guidanceLineageHash: fixture.guidanceLineageHash,
+    ownerUiPublicationRequired:
+      fixture.fixtureId === "irish-influence-recovery-25-v1",
   });
   const independent = validateIndependentAppleSource(sources.independentApple, {
     environment: input.environment,
@@ -1163,6 +1390,36 @@ function validatePublicationSources(
   if (hosted.independentAppleEvidenceHash !== independent.evidenceHash
     || hosted.orderedAppleIdsHash !== independent.observedOrderedIdsHash) {
     throw new Error("hosted and independent Apple evidence are not cross-bound");
+  }
+  if (fixture.fixtureId === "irish-influence-recovery-25-v1") {
+    validateIrishInfluenceReleaseProofV1(sources.irishInfluenceRecovery, {
+      version: input.candidate.version,
+      sourceRevision: input.candidate.sourceRevision,
+      workerConfigurationHashes: safeStringArray(
+        hosted.configurationHashes,
+        "Irish-influence hosted worker configurations",
+      ),
+      contractHash: digest(
+        hosted.contractHash,
+        "Irish-influence hosted contract hash",
+      ),
+      questionSetHash: digest(
+        fixtureExecution.questionSetHash,
+        "Irish-influence fixture question-set hash",
+      ),
+      questionHash: digest(
+        fixtureExecution.questionHash,
+        "Irish-influence fixture question hash",
+      ),
+      queryPlanRevisionHash: digest(
+        hosted.queryPlanRevisionHash,
+        "Irish-influence hosted query-plan revision hash",
+      ),
+      orderedAppleIdsHash: digest(
+        independent.observedOrderedIdsHash,
+        "Irish-influence independent ordered Apple IDs hash",
+      ),
+    });
   }
 }
 
@@ -1259,7 +1516,13 @@ function validateManifestSource(
   ) throw new Error("manifest canary evidence does not prove the fixture");
   const zeroWrite = asRecord(evidence.zeroWriteProof, "manifest canary zero-write proof");
   if (zeroWrite.autoPublish !== false
-    || ["manifestRows", "matchingJobs", "publicationJobs", "publicationVolumeRows"]
+    || [
+      "manifestRows",
+      "matchingJobs",
+      "publicationJobs",
+      "publicationVolumeRows",
+      "orphanPlaylistRows",
+    ]
       .some((field) => Number(zeroWrite[field]) !== 0)) {
     throw new Error("manifest canary did not prove the database write fence");
   }
@@ -1477,8 +1740,12 @@ function validateSemanticReviewSources(
     || evaluated.passed !== true
     || artifact.candidate.sourceRevision !== candidate.sourceRevision
     || artifact.candidate.imageDigest !== candidate.imageDigest
-    || artifact.pairs.length !== RELEASE_FIXTURE_IDS.length
-    || artifact.pairs.some((pair, index) => pair.fixtureId !== RELEASE_FIXTURE_IDS[index])) {
+    || artifact.pairs.length
+      !== GATE_FIXTURE_IDS.semantic_ranking_blinded_review.length
+    || artifact.pairs.some(
+      (pair, index) => pair.fixtureId
+        !== GATE_FIXTURE_IDS.semantic_ranking_blinded_review[index],
+    )) {
     throw new Error("semantic review source does not prove every immutable release fixture");
   }
 }
@@ -1821,7 +2088,17 @@ function validateFinalBrowserSources(
     now: String(sitesTrust.verifiedAt),
   });
   const browser = asRecord(sources.browser, "final custom-domain browser evidence");
-  exactKeys(browser, [
+  const browserV2 =
+    browser.schemaVersion === "genio-final-custom-domain-browser/v2";
+  const browserV5 =
+    browser.schemaVersion === "genio-final-custom-domain-browser/v5";
+  const browserV6 =
+    browser.schemaVersion === "genio-final-custom-domain-browser/v6";
+  const browserV7 =
+    browser.schemaVersion === "genio-final-custom-domain-browser/v7";
+  const browserV8 =
+    browser.schemaVersion === "genio-final-custom-domain-browser/v8";
+  const commonBrowserFields = [
     "schemaVersion",
     "origin",
     "candidateRevision",
@@ -1834,12 +2111,32 @@ function validateFinalBrowserSources(
     "screenshotHashes",
     "publicAssignmentProbes",
     "evidenceHash",
-  ], "final custom-domain browser evidence");
+  ];
+  exactKeys(
+    browser,
+    browserV5 || browserV6 || browserV7 || browserV8
+      ? [
+        ...commonBrowserFields,
+        "noDirectRailwayRequests",
+        ...(browserV7 || browserV8 ? ["assignmentMode"] : []),
+        ...(browserV8
+          ? ["exposureClass", "organicReliabilityProven"]
+          : []),
+      ]
+      : commonBrowserFields,
+    "final custom-domain browser evidence",
+  );
   const publicAssignmentProbes = Array.isArray(browser.publicAssignmentProbes)
     ? browser.publicAssignmentProbes
     : [];
+  const probeFixtures: readonly FinalPublicAssignmentProbeFixtureV1[] =
+    browserV2
+      ? LEGACY_FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1
+      : browserV5
+        ? FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V5
+        : FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1;
   if (
-    browser.schemaVersion !== "genio-final-custom-domain-browser/v2"
+    (!browserV2 && !browserV5 && !browserV6 && !browserV7 && !browserV8)
     || browser.origin !== "https://9enio.com"
     || browser.candidateRevision !== candidate.sourceRevision
     || browser.tlsValid !== true
@@ -1847,24 +2144,29 @@ function validateFinalBrowserSources(
     || browser.anonymousPlaylistDirectory !== true
     || browser.publicPlaylistContentsVisible !== true
     || browser.privacyProjectionPassed !== true
-    || safeStringArray(browser.screenshotHashes, "final browser screenshots").length < 1
-    || publicAssignmentProbes.length
-      !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+    || (browserV7
+      && browser.assignmentMode !== "pre_exposure_release_canary")
+    || (browserV8 && (
+      browser.assignmentMode !== "direct_exposure"
+      || browser.exposureClass !== "fully_exposed_unproven"
+      || browser.organicReliabilityProven !== false
+    ))
+    || ((browserV5 || browserV6 || browserV7 || browserV8)
+      && browser.noDirectRailwayRequests !== true)
+    || safeStringArray(
+      browser.screenshotHashes,
+      "final browser screenshots",
+    ).length < (browserV5 || browserV6 || browserV7 || browserV8 ? 3 : 1)
+    || publicAssignmentProbes.length !== probeFixtures.length
   ) throw new Error("final custom-domain browser evidence did not pass");
-  const fixturesById = new Map<
-    string,
-    (typeof FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1)[number]
-  >(
-    FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.map((fixture) => [
+  const fixturesById = new Map<string, FinalPublicAssignmentProbeFixtureV1>(
+    probeFixtures.map((fixture) => [
       fixture.fixtureId,
       fixture,
     ]),
   );
   const seenFixtureIds = new Set<string>();
   const seenIntentGroups = new Set<string>();
-  const governedIntentGroups = Object.keys(
-    PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
-  );
   const rolloutEvidenceHashes = new Set<string>();
   const rolloutStages = new Set<string>();
   const assignmentHashes = new Set<string>();
@@ -1873,7 +2175,7 @@ function validateFinalBrowserSources(
       probeValue,
       `final public assignment probe ${index}`,
     );
-    exactKeys(probe, [
+    const commonProbeFields = [
       "fixtureId",
       "intentGroup",
       "targetTrackCount",
@@ -1881,8 +2183,81 @@ function validateFinalBrowserSources(
       "rolloutStage",
       "assignmentHash",
       "contractVersion",
-      "cleanupStatus",
-    ], `final public assignment probe ${index}`);
+    ];
+    exactKeys(
+      probe,
+      browserV5
+        ? [
+          ...commonProbeFields,
+          "guidancePolicyVersion",
+          "questionSetHash",
+          "questionHash",
+          "axis",
+          "selectedOptionId",
+          "answerAccepted",
+          "successorContractHash",
+          "executionRouteReceiptHash",
+          "runResolutionState",
+          "runAccessIdHash",
+          "workerConsumptionReceiptHash",
+          "workerExecutionEffectHash",
+          "workerResultEffectHash",
+          "manifestContentHash",
+          "expectedOrderedIdsHash",
+          "observedOrderedIdsHash",
+          "selectedTrackCount",
+          "manifestedTrackCount",
+          "appendedTrackCount",
+          "reconciledPublishedTrackCount",
+          "runReused",
+          "realUiPath",
+        ]
+        : browserV6 || browserV7 || browserV8
+          ? [
+            ...commonProbeFields,
+            ...(browserV7 || browserV8
+              ? [
+                "assignmentAuthority",
+                "assignmentReceiptHash",
+                "publicPercentageBypass",
+                "organicAssignment",
+              ]
+              : []),
+            "guidancePolicyVersion",
+            "questionSetHash",
+            "questionHash",
+            "axis",
+            "selectedOptionId",
+            "answerAccepted",
+            "successorContractHash",
+            ...(browserV7 || browserV8 ? ["queryPlanHash"] : []),
+            "executionRouteReceiptHash",
+            "runAccessIdHash",
+            "workerConsumptionReceiptHash",
+            "workerExecutionEffectHash",
+            "workerResultEffectHash",
+            "manifestCanaryEvidenceHash",
+            "qualifiedManifestHash",
+            "selectedTrackCount",
+            "reserveTrackCount",
+            "attemptCount",
+            "executorIdentityHashes",
+            "configurationHashes",
+            "manifestOnly",
+            "appleWriteAccess",
+            "autoPublish",
+            "manifestRows",
+            "matchingJobs",
+            "publicationJobs",
+            "publicationVolumeRows",
+            "orphanPlaylistRows",
+            "noPublishedUi",
+            "runReused",
+            "realUiPath",
+          ]
+        : [...commonProbeFields, "cleanupStatus"],
+      `final public assignment probe ${index}`,
+    );
     const fixture = typeof probe.fixtureId === "string"
       ? fixturesById.get(probe.fixtureId)
       : undefined;
@@ -1892,15 +2267,154 @@ function validateFinalBrowserSources(
     if (
       !fixture
       || seenFixtureIds.has(fixture.fixtureId)
-      || seenIntentGroups.has(fixture.intentGroup)
+      || (!browserV6 && !browserV7 && !browserV8
+        && seenIntentGroups.has(fixture.intentGroup))
       || probe.intentGroup !== fixture.intentGroup
       || probe.targetTrackCount !== fixture.targetTrackCount
       || probe.contractVersion !== 3
-      || probe.cleanupStatus !== 204
-      || !/^[0-9a-f]{64}$/u.test(String(probe.rolloutEvidenceHash))
-      || !/^[0-9a-f]{64}$/u.test(String(probe.assignmentHash))
-      || !/^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->100$/u
-        .test(rolloutStage)
+      || (browserV7
+        ? (
+          probe.rolloutEvidenceHash !== null
+          || probe.rolloutStage !== null
+          || probe.assignmentHash !== null
+          || probe.assignmentAuthority !== "signed_release_canary"
+          || !/^[0-9a-f]{64}$/u.test(
+            String(probe.assignmentReceiptHash),
+          )
+          || probe.publicPercentageBypass !== true
+          || probe.organicAssignment !== false
+        )
+        : browserV8
+          ? (
+            !/^[0-9a-f]{64}$/u.test(String(probe.rolloutEvidenceHash))
+            || probe.rolloutStage
+              !== "editorial_influence:0->100:fully_exposed_unproven"
+            || !/^[0-9a-f]{64}$/u.test(String(probe.assignmentHash))
+            || probe.assignmentAuthority
+              !== "signed_public_direct_exposure"
+            || probe.assignmentReceiptHash !== probe.assignmentHash
+            || probe.publicPercentageBypass !== false
+            || probe.organicAssignment !== false
+          )
+          : (
+          !/^[0-9a-f]{64}$/u.test(String(probe.rolloutEvidenceHash))
+          || !/^[0-9a-f]{64}$/u.test(String(probe.assignmentHash))
+        ))
+      || (
+        browserV2
+          ? (
+            probe.cleanupStatus !== 204
+            || !/^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->100$/u
+              .test(rolloutStage)
+          )
+          : browserV5
+            ? (
+            probe.guidancePolicyVersion !== "adaptive_guidance_v5"
+            || probe.axis !== "influence_scope"
+            || probe.selectedOptionId !== "balanced_influence"
+            || probe.answerAccepted !== true
+            || probe.realUiPath !== true
+            || !/^[0-9a-f]{64}$/u.test(String(probe.questionSetHash))
+            || !/^[0-9a-f]{64}$/u.test(String(probe.questionHash))
+            || !/^[0-9a-f]{64}$/u.test(
+              String(probe.successorContractHash),
+            )
+            || !/^[0-9a-f]{64}$/u.test(
+              String(probe.executionRouteReceiptHash),
+            )
+            || !/^[0-9a-f]{64}$/u.test(String(probe.runAccessIdHash))
+            || !/^[0-9a-f]{64}$/u.test(
+              String(probe.workerConsumptionReceiptHash),
+            )
+            || !/^[0-9a-f]{64}$/u.test(
+              String(probe.workerExecutionEffectHash),
+            )
+            || !/^[0-9a-f]{64}$/u.test(
+              String(probe.workerResultEffectHash),
+            )
+            || !/^[0-9a-f]{64}$/u.test(
+              String(probe.manifestContentHash),
+            )
+            || !/^[0-9a-f]{64}$/u.test(
+              String(probe.expectedOrderedIdsHash),
+            )
+            || probe.expectedOrderedIdsHash
+              !== probe.observedOrderedIdsHash
+            || probe.runResolutionState !== "completed"
+            || probe.selectedTrackCount !== fixture.targetTrackCount
+            || probe.manifestedTrackCount !== fixture.targetTrackCount
+            || probe.appendedTrackCount !== fixture.targetTrackCount
+            || probe.reconciledPublishedTrackCount
+              !== fixture.targetTrackCount
+            || probe.runReused !== false
+            || !/^editorial_influence:(?:0|1|10|50|100)->100$/u
+              .test(rolloutStage)
+          )
+            : (
+              probe.guidancePolicyVersion !== "adaptive_guidance_v5"
+              || probe.axis !== "influence_scope"
+              || probe.selectedOptionId !== "balanced_influence"
+              || probe.answerAccepted !== true
+              || probe.realUiPath !== true
+              || probe.manifestOnly !== true
+              || probe.appleWriteAccess !== "forbidden"
+              || probe.noPublishedUi !== true
+              || probe.autoPublish !== false
+              || probe.manifestRows !== 0
+              || probe.matchingJobs !== 0
+              || probe.publicationJobs !== 0
+              || probe.publicationVolumeRows !== 0
+              || probe.orphanPlaylistRows !== 0
+              || !/^[0-9a-f]{64}$/u.test(String(probe.questionSetHash))
+              || !/^[0-9a-f]{64}$/u.test(String(probe.questionHash))
+              || !/^[0-9a-f]{64}$/u.test(
+                String(probe.successorContractHash),
+              )
+              || ((browserV7 || browserV8) && !/^[0-9a-f]{64}$/u.test(
+                String(probe.queryPlanHash),
+              ))
+              || !/^[0-9a-f]{64}$/u.test(
+                String(probe.executionRouteReceiptHash),
+              )
+              || !/^[0-9a-f]{64}$/u.test(String(probe.runAccessIdHash))
+              || !/^[0-9a-f]{64}$/u.test(
+                String(probe.workerConsumptionReceiptHash),
+              )
+              || !/^[0-9a-f]{64}$/u.test(
+                String(probe.workerExecutionEffectHash),
+              )
+              || !/^[0-9a-f]{64}$/u.test(
+                String(probe.workerResultEffectHash),
+              )
+              || !/^[0-9a-f]{64}$/u.test(
+                String(probe.manifestCanaryEvidenceHash),
+              )
+              || !/^[0-9a-f]{64}$/u.test(
+                String(probe.qualifiedManifestHash),
+              )
+              || probe.selectedTrackCount !== fixture.targetTrackCount
+              || !Number.isSafeInteger(probe.reserveTrackCount)
+              || Number(probe.reserveTrackCount) < 1
+              || !Number.isSafeInteger(probe.attemptCount)
+              || Number(probe.attemptCount) < 1
+              || safeStringArray(
+                probe.executorIdentityHashes,
+                `final public assignment probe ${index} executor identities`,
+              ).length < 1
+              || safeStringArray(
+                probe.configurationHashes,
+                `final public assignment probe ${index} configurations`,
+              ).length !== 1
+              || probe.runReused !== false
+              || (browserV7
+                ? rolloutStage !== ""
+                : browserV8
+                  ? rolloutStage
+                    !== "editorial_influence:0->100:fully_exposed_unproven"
+                : !/^editorial_influence:(?:0|1|10|50|100)->100$/u
+                  .test(rolloutStage))
+            )
+      )
     ) {
       throw new Error(
         `final public assignment probe ${index} did not prove its code-owned V3 assignment`,
@@ -1913,14 +2427,23 @@ function validateFinalBrowserSources(
     assignmentHashes.add(String(probe.assignmentHash));
   }
   if (
-    seenFixtureIds.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
-    || seenIntentGroups.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
-    || governedIntentGroups.length
-      !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
-    || governedIntentGroups.some((group) => !seenIntentGroups.has(group))
+    seenFixtureIds.size !== probeFixtures.length
+    || seenIntentGroups.size !== (
+      browserV6 || browserV7 || browserV8 ? 1 : probeFixtures.length
+    )
     || rolloutEvidenceHashes.size !== 1
     || rolloutStages.size !== 1
-    || assignmentHashes.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
+    || assignmentHashes.size !== probeFixtures.length
+    || (
+      browserV2
+        ? LEGACY_FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.some(
+          (fixture) => !seenIntentGroups.has(fixture.intentGroup),
+        )
+        : (
+          seenIntentGroups.size !== 1
+          || !seenIntentGroups.has("editorial_influence")
+        )
+    )
   ) {
     throw new Error(
       "final public assignment probes do not bind one exact signed rollout state",

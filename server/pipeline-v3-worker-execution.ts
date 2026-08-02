@@ -15,6 +15,7 @@ import type {
 import {
   evaluatePlaylistOptimizationV3,
   executeRetrievalV3,
+  validateCanonicalPublicationSetV3,
   RetrievalDependencyErrorV3,
   RetrievalPlaylistOptimizationBudgetExceededErrorV3,
   type CandidateQualificationV3,
@@ -24,6 +25,8 @@ import {
   type QualifiedTrackV3,
   type RetrievalAdaptersV3,
   type RetrievalExecutionModeV3,
+  type EvidenceEnrichmentDirectiveV1,
+  type EvidenceAcquisitionObservationV3,
   type RetrievalContinuationSeedV3,
   type RetrievalDependencyFailureClassV3,
   type RetrievalPolicyV3,
@@ -74,7 +77,10 @@ import type {
   ColdCorpusBuilderPortV3,
   ColdCorpusBuildResultV3,
 } from "./pipeline-v3-corpus-builder.ts";
-import type { SemanticPlanRevisionArtifactV3 } from "./pipeline-v3-semantic-recovery.ts";
+import type {
+  PipelineCandidateLeadArtifactV3,
+  SemanticPlanRevisionArtifactV3,
+} from "./pipeline-v3-semantic-recovery.ts";
 import {
   assessPlaylistRuntimeFeasibilityV1,
   playlistCoverageAuditReasonV1,
@@ -92,9 +98,33 @@ import {
 } from "./playlist-contract-backend-capability-v1.ts";
 import {
   canonicalExecutionEvidencePolicyVersionV1,
+  centralQualityVerificationLeavesV1,
   revalidateExecutionCoverageReportV1,
+  verificationLeavesV1,
 } from "./verification-expression-v1.ts";
-import { auditSemanticCollapseV1 } from "./semantic-collapse-audit-v1.ts";
+import {
+  semanticCollapseCoverageV2,
+  parseSemanticCollapseCoverageV2,
+  type PersistedSemanticCollapseCoverageV2,
+  type SemanticCollapseDatabaseFactsV2,
+} from "./semantic-collapse-coverage-v2.ts";
+import {
+  auditSemanticCollapseV2,
+  type SemanticCollapseAuditV2,
+} from "./semantic-collapse-audit-v2.ts";
+import {
+  assertStrategyDeltaProofV1,
+  createStrategyDeltaProofV1,
+  strategyDeltaAuthorizesRetryV1,
+  type StrategyDeltaProofV1,
+} from "./strategy-delta-proof-v1.ts";
+import {
+  assertGuidanceWorkerConsumptionReceiptV5,
+  GUIDANCE_V5_EXECUTION_AUTHORITY_CHECKPOINT,
+  guidanceWorkerConsumptionCheckpointKeyV5,
+  guidanceWorkerConsumptionTargetV5,
+  verifyGuidanceWorkerConsumptionV5,
+} from "./guidance-worker-consumption-v5.ts";
 
 /**
  * Durable worker boundary for Pipeline V3 retrieval.
@@ -202,6 +232,27 @@ export interface PipelineV3WorkerRepository {
     qualifications: readonly CandidateQualificationV3[];
     fence: PipelineV3WriteFence;
   }): Promise<void>;
+  /** Durable before/after receipt for one explicit evidence provider call. */
+  persistPipelineV3EvidenceAcquisitionAttempt?(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    request: DiscoveryRequestV3 | QualificationRequestV3;
+    observation: EvidenceAcquisitionObservationV3;
+    fence: PipelineV3WriteFence;
+  }): Promise<void>;
+  /**
+   * Read the candidate-first database projection used for semantic-collapse
+   * classification. Schema-6 execution must never classify from only the
+   * worker's in-memory aggregate.
+   */
+  readPipelineV3SemanticCollapseDatabaseFacts?(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    queryPlanHash: string;
+    result: RetrievalResultV3;
+    capturedAt: string;
+    fence: PipelineV3WriteFence;
+  }): Promise<SemanticCollapseDatabaseFactsV2>;
   /**
    * Before a canonical continuation trusts checkpoint tracks, re-read the
    * authoritative final qualification rows and recompute their stable
@@ -276,6 +327,10 @@ export interface PipelineV3RetrievalExecutionInput {
   recordQualificationBatch?: (
     request: QualificationRequestV3,
     qualifications: readonly CandidateQualificationV3[],
+  ) => Promise<void>;
+  recordEvidenceAcquisitionAttempt?: (
+    request: DiscoveryRequestV3 | QualificationRequestV3,
+    observation: EvidenceAcquisitionObservationV3,
   ) => Promise<void>;
   signal?: AbortSignal;
 }
@@ -352,6 +407,24 @@ export class PipelineV3OptimizerComputeBudgetError extends Error {
   }
 }
 
+/**
+ * Internal semantic rescue signal.  WorkerRunner schedules exactly the
+ * persisted, proof-bound continuation; it is not a provider outage and must
+ * never enter the provider circuit or be described as scarcity.
+ */
+export class PipelineV3EvidenceEnrichmentRetryError extends Error {
+  readonly name = "PipelineV3EvidenceEnrichmentRetryError";
+  readonly code = "pipeline_v3_evidence_enrichment_retry";
+
+  constructor(
+    readonly automaticRescueOrdinal: 1 | 2,
+    readonly strategyDeltaProofHash: string,
+    readonly nextRetryAt: Date,
+  ) {
+    super("Pipeline V3 scheduled one bounded evidence-enrichment pass");
+  }
+}
+
 function parsedRetryAfterUntil(value: unknown): Date | null {
   const timestamp = value instanceof Date
     ? value.getTime()
@@ -401,6 +474,280 @@ function retrievalRetryAfterUntil(result: RetrievalResultV3): Date | null {
         ? candidate
         : latest;
     }, null);
+}
+
+const SEMANTIC_COLLAPSE_COVERAGE_CHECKPOINT_V2 =
+  "v3:semantic-collapse:coverage:v2";
+const SEMANTIC_COLLAPSE_AUDIT_CHECKPOINT_V2 =
+  "v3:semantic-collapse:audit:v2";
+const LEGACY_SEMANTIC_COLLAPSE_AUDIT_CHECKPOINT =
+  "v3:semantic-collapse:audit";
+const SEMANTIC_COLLAPSE_RESCUE_CODE =
+  "v3_semantic_collapse_bounded_evidence_enrichment";
+
+interface SemanticCollapseRescueCheckpointV2 {
+  readonly schemaVersion: typeof PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA;
+  readonly state: "waiting_evidence_enrichment";
+  readonly code: typeof SEMANTIC_COLLAPSE_RESCUE_CODE;
+  readonly stageKey: string;
+  readonly queryPlanHash: string;
+  readonly strategyDeltaProof: StrategyDeltaProofV1;
+  readonly evidenceEnrichment: EvidenceEnrichmentDirectiveV1;
+  readonly approvedStrategyIds: readonly string[];
+  readonly stages: RetrievalResultV3["stages"];
+  readonly strategies: RetrievalResultV3["strategies"];
+  readonly candidateLeads: readonly PipelineCandidateLeadArtifactV3[];
+  readonly nextRetryAt: string;
+}
+
+interface SemanticCollapseProviderWaitCheckpointV2 {
+  readonly schemaVersion: typeof PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA;
+  readonly state: "waiting_provider";
+  readonly reasonCode: "v3_retrieval_provider_failed";
+  readonly stageKey: string;
+  readonly queryPlanHash: string;
+  readonly strategyDeltaProof: StrategyDeltaProofV1;
+  readonly evidenceEnrichment: EvidenceEnrichmentDirectiveV1;
+  readonly approvedStrategyIds: readonly string[];
+  readonly stages: RetrievalResultV3["stages"];
+  readonly strategies: RetrievalResultV3["strategies"];
+  readonly candidateLeads: readonly PipelineCandidateLeadArtifactV3[];
+  readonly retryAfterUntil: string | null;
+  readonly failureClass: RetrievalDependencyFailureClassV3;
+  readonly leaseEpoch: number | null;
+}
+
+function parseSemanticCollapseRescueCheckpointV2(
+  value: unknown,
+  expected: { stageKey: string; queryPlanHash: string },
+): SemanticCollapseRescueCheckpointV2 | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (row.schemaVersion !== PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA
+    || row.state !== "waiting_evidence_enrichment"
+    || row.code !== SEMANTIC_COLLAPSE_RESCUE_CODE
+    || row.stageKey !== expected.stageKey
+    || row.queryPlanHash !== expected.queryPlanHash
+    || !Array.isArray(row.approvedStrategyIds)
+    || row.approvedStrategyIds.length === 0
+    || !row.stages || typeof row.stages !== "object" || Array.isArray(row.stages)
+    || !Array.isArray(row.strategies)
+    || parseCheckpointCandidateLeadsV3(row.candidateLeads) === null
+    || typeof row.nextRetryAt !== "string"
+    || !Number.isFinite(Date.parse(row.nextRetryAt))
+    || !row.strategyDeltaProof
+    || typeof row.strategyDeltaProof !== "object"
+    || Array.isArray(row.strategyDeltaProof)
+    || !row.evidenceEnrichment
+    || typeof row.evidenceEnrichment !== "object"
+    || Array.isArray(row.evidenceEnrichment)) {
+    return null;
+  }
+  try {
+    const proof = row.strategyDeltaProof as unknown as StrategyDeltaProofV1;
+    assertStrategyDeltaProofV1(proof);
+    const directive = row.evidenceEnrichment as unknown as EvidenceEnrichmentDirectiveV1;
+    if (directive.strategyDeltaProofHash !== proof.proofHash
+      || directive.automaticRescueOrdinal !== proof.automaticRescueOrdinal
+      || ![1, 2].includes(directive.automaticRescueOrdinal)
+      || !directive.producerFamily?.trim()
+      || !directive.dependencyRootId?.trim()
+      || !Array.isArray(directive.deficitObligationIds)
+      || directive.deficitObligationIds.length === 0
+      || !strategyDeltaAuthorizesRetryV1(proof, new Date(row.nextRetryAt))) {
+      return null;
+    }
+    return row as unknown as SemanticCollapseRescueCheckpointV2;
+  } catch {
+    return null;
+  }
+}
+
+function parseSemanticCollapseProviderWaitCheckpointV2(
+  value: unknown,
+  expected: { stageKey: string; queryPlanHash: string },
+): SemanticCollapseProviderWaitCheckpointV2 | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (row.schemaVersion !== PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA
+    || row.state !== "waiting_provider"
+    || row.reasonCode !== "v3_retrieval_provider_failed"
+    || row.stageKey !== expected.stageKey
+    || row.queryPlanHash !== expected.queryPlanHash
+    || !Array.isArray(row.approvedStrategyIds)
+    || row.approvedStrategyIds.length === 0
+    || !row.stages || typeof row.stages !== "object" || Array.isArray(row.stages)
+    || !Array.isArray(row.strategies)
+    || parseCheckpointCandidateLeadsV3(row.candidateLeads) === null
+    || (row.retryAfterUntil !== null
+      && (typeof row.retryAfterUntil !== "string"
+        || !Number.isFinite(Date.parse(row.retryAfterUntil))))
+    || !row.strategyDeltaProof
+    || typeof row.strategyDeltaProof !== "object"
+    || Array.isArray(row.strategyDeltaProof)
+    || !row.evidenceEnrichment
+    || typeof row.evidenceEnrichment !== "object"
+    || Array.isArray(row.evidenceEnrichment)) {
+    return null;
+  }
+  try {
+    const proof = row.strategyDeltaProof as unknown as StrategyDeltaProofV1;
+    assertStrategyDeltaProofV1(proof);
+    const directive =
+      row.evidenceEnrichment as unknown as EvidenceEnrichmentDirectiveV1;
+    if (directive.strategyDeltaProofHash !== proof.proofHash
+      || directive.automaticRescueOrdinal !== proof.automaticRescueOrdinal
+      || ![1, 2].includes(directive.automaticRescueOrdinal)
+      || !directive.producerFamily?.trim()
+      || !directive.dependencyRootId?.trim()
+      || !Array.isArray(directive.deficitObligationIds)
+      || directive.deficitObligationIds.length === 0
+      || uniqueStrings(directive.deficitObligationIds).length
+        !== directive.deficitObligationIds.length
+      || uniqueStrings(row.approvedStrategyIds as string[]).length
+        !== row.approvedStrategyIds.length) {
+      return null;
+    }
+    return row as unknown as SemanticCollapseProviderWaitCheckpointV2;
+  } catch {
+    return null;
+  }
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))]
+    .sort();
+}
+
+function semanticCollapseRescueV2(input: {
+  queryPlan: QueryPlanV3;
+  result: RetrievalResultV3;
+  coverage: PersistedSemanticCollapseCoverageV2;
+  audit: SemanticCollapseAuditV2;
+  priorProof: StrategyDeltaProofV1 | null;
+}): {
+  proof: StrategyDeltaProofV1;
+  directive: EvidenceEnrichmentDirectiveV1;
+  approvedStrategyIds: readonly string[];
+} | null {
+  const ordinal = (input.priorProof?.automaticRescueOrdinal ?? 0) + 1;
+  if (ordinal < 1 || ordinal > 2) return null;
+  const currentAttemptedFamilies = uniqueStrings(input.coverage.obligations
+    .flatMap(({ attemptedProducerFamilies }) => attemptedProducerFamilies));
+  const sourceProducerFamilies = uniqueStrings([
+    ...(input.priorProof?.successorProducerFamilies ?? []),
+    ...currentAttemptedFamilies,
+  ]);
+  const currentAttemptedRoots = uniqueStrings(input.coverage.obligations
+    .flatMap(({ attemptedProducerRoots }) => (
+      attemptedProducerRoots.map(({ dependencyRootId }) => dependencyRootId)
+    )));
+  const sourceDependencyRootIds = uniqueStrings([
+    ...(input.priorProof?.successorDependencyRootIds ?? []),
+    ...currentAttemptedRoots,
+  ]);
+  const limiting = new Set(input.audit.limitingObligationIds);
+  const capableFamilies = new Set(input.coverage.obligations
+    .filter(({ obligationId }) => limiting.has(obligationId))
+    .flatMap(({ capableProducerFamilies }) => capableProducerFamilies));
+  const candidates = input.coverage.producers
+    .filter(({ producerFamily, health }) => (
+      capableFamilies.has(producerFamily) && health === "healthy"
+    ))
+    .flatMap((producer) => {
+      // One repair pass is authorized for the obligations that this exact
+      // producer can satisfy. A union of all limiting obligations can span
+      // disjoint producer families; binding that union to one directive
+      // creates an internally invalid continuation on the next lease.
+      const deficitObligationIds = uniqueStrings(input.coverage.obligations
+        .filter(({ obligationId, capableProducerFamilies }) => (
+          limiting.has(obligationId)
+          && capableProducerFamilies.includes(producer.producerFamily)
+        ))
+        .map(({ obligationId }) => obligationId));
+      const approvedStrategyIds = input.result.strategies
+        .filter((strategy) => [
+          ...strategy.discoveryDependencyIds,
+          ...strategy.qualificationDependencyIds,
+        ].includes(producer.dependencyRootId as never))
+        .map(({ id }) => id);
+      return deficitObligationIds.length > 0
+        && approvedStrategyIds.length > 0
+        && (!sourceProducerFamilies.includes(producer.producerFamily)
+          || !sourceDependencyRootIds.includes(producer.dependencyRootId))
+        ? [{ producer, approvedStrategyIds, deficitObligationIds }]
+        : [];
+    })
+    .sort((left, right) => {
+      const leftIndependent = sourceDependencyRootIds.includes(
+        left.producer.dependencyRootId,
+      ) ? 1 : 0;
+      const rightIndependent = sourceDependencyRootIds.includes(
+        right.producer.dependencyRootId,
+      ) ? 1 : 0;
+      return leftIndependent - rightIndependent
+        || left.producer.producerFamily.localeCompare(
+          right.producer.producerFamily,
+        )
+        || left.producer.dependencyRootId.localeCompare(
+          right.producer.dependencyRootId,
+        );
+    });
+  const selected = candidates[0];
+  if (!selected) return null;
+  const successorProducerFamilies = uniqueStrings([
+    ...sourceProducerFamilies,
+    selected.producer.producerFamily,
+  ]);
+  const successorDependencyRootIds = uniqueStrings([
+    ...sourceDependencyRootIds,
+    selected.producer.dependencyRootId,
+  ]);
+  const sourceStrategySemanticHash = input.priorProof
+    ?.successorStrategySemanticHash
+    ?? input.queryPlan.strategySemanticHash
+    ?? "";
+  if (!/^[a-f0-9]{64}$/u.test(sourceStrategySemanticHash)) return null;
+  const successorStrategySemanticHash = createHash("sha256")
+    .update(stableStringify({
+      sourceStrategySemanticHash,
+      producerFamilies: successorProducerFamilies,
+      dependencyRootIds: successorDependencyRootIds,
+      deficitObligationIds: selected.deficitObligationIds,
+      approvedStrategyIds: selected.approvedStrategyIds,
+      automaticRescueOrdinal: ordinal,
+    }))
+    .digest("hex");
+  const newProducer = !sourceProducerFamilies.includes(
+    selected.producer.producerFamily,
+  );
+  const proof = createStrategyDeltaProofV1({
+    sourceStrategySemanticHash,
+    successorStrategySemanticHash,
+    reason: newProducer ? "new_deficit_producer" : "new_dependency_root",
+    sourceProducerFamilies,
+    successorProducerFamilies,
+    sourceDependencyRootIds,
+    successorDependencyRootIds,
+    deficitObligationIds: selected.deficitObligationIds,
+    automaticRescueOrdinal: ordinal as 1 | 2,
+    providerRetryAfter: null,
+    circuitOrdinal: null,
+    healthEpoch: null,
+    successorContractRevisionId: null,
+  });
+  const directive: EvidenceEnrichmentDirectiveV1 = {
+    producerFamily: selected.producer.producerFamily,
+    dependencyRootId: selected.producer.dependencyRootId as EvidenceEnrichmentDirectiveV1["dependencyRootId"],
+    deficitObligationIds: selected.deficitObligationIds,
+    strategyDeltaProofHash: proof.proofHash,
+    automaticRescueOrdinal: ordinal as 1 | 2,
+  };
+  return {
+    proof,
+    directive,
+    approvedStrategyIds: uniqueStrings(selected.approvedStrategyIds),
+  };
 }
 
 export interface PipelineV3RuntimeFeasibilityAssessment {
@@ -950,76 +1297,50 @@ export function createPipelineV3RetrievalExecutionPort(input: {
   return Object.freeze({
     async execute(request: PipelineV3RetrievalExecutionInput): Promise<RetrievalResultV3> {
       abortIfNeeded(request.signal);
-      const discoveryBatches: Array<{
-        request: DiscoveryRequestV3;
-        batch: DiscoveryBatchV3;
-      }> = [];
-      const qualificationBatches: Array<{
-        request: QualificationRequestV3;
-        qualifications: readonly CandidateQualificationV3[];
-      }> = [];
       const adapters: RetrievalAdaptersV3 = {
         discover: async (discoveryRequest) => {
           abortIfNeeded(request.signal);
           const batch = await input.adapters.discover(discoveryRequest);
           abortIfNeeded(request.signal);
-          if (request.recordDiscoveryBatch) {
-            discoveryBatches.push({ request: discoveryRequest, batch });
-          }
+          // Persist paid discovery immediately. Waiting until the complete
+          // portfolio returns loses valid provider work when a later strategy
+          // fails and makes the durable counters depend on scheduler outcome.
+          await request.recordDiscoveryBatch?.(discoveryRequest, batch);
+          abortIfNeeded(request.signal);
           return batch;
         },
         qualify: async (qualificationRequest) => {
           abortIfNeeded(request.signal);
           const qualifications = await input.adapters.qualify(qualificationRequest);
           abortIfNeeded(request.signal);
-          if (request.recordQualificationBatch) {
-            qualificationBatches.push({
-              request: qualificationRequest,
-              qualifications,
-            });
-          }
+          // Candidate-first persistence is part of accepting a qualification
+          // observation, not a best-effort flush after retrieval. The
+          // scheduler rethrows non-provider errors unchanged, so a stale fence
+          // or persistence failure remains an integrity failure rather than
+          // being misreported as provider scarcity.
+          await request.recordQualificationBatch?.(
+            qualificationRequest,
+            qualifications,
+          );
+          abortIfNeeded(request.signal);
           return qualifications;
         },
       };
-      // Flush outside the retrieval scheduler's provider try/catch. A durable
-      // persistence/fence failure is an integrity failure, never a provider
-      // outage or evidence scarcity signal. Flush successful observations even
-      // when a later provider/budget operation fails so a durable retry can
-      // resume from paid work instead of purchasing the same evidence again.
-      const flushObservedBatches = async (): Promise<void> => {
-        for (const observed of discoveryBatches) {
-          await request.recordDiscoveryBatch?.(observed.request, observed.batch);
-          abortIfNeeded(request.signal);
-        }
-        for (const observed of qualificationBatches) {
-          await request.recordQualificationBatch?.(
-            observed.request,
-            observed.qualifications,
-          );
-          abortIfNeeded(request.signal);
-        }
-      };
-      try {
-        const result = await executeRetrievalV3({
-          runId: request.runId,
-          plan: request.plan,
-          adapters,
-          executionMode: request.executionMode,
-          routingHints: request.routingHints,
-          modelRoute: request.modelRoute,
-          semanticRecoveryEnabled: request.semanticRecoveryEnabled,
-          claimSemanticRecovery: request.claimSemanticRecovery,
-          policy: request.policy,
-          continuation: request.continuation,
-          signal: request.signal,
-        });
-        abortIfNeeded(request.signal);
-        await flushObservedBatches();
-        return result;
-      } catch (error) {
-        await flushObservedBatches();
-        throw error;
-      }
+      return executeRetrievalV3({
+        runId: request.runId,
+        plan: request.plan,
+        adapters,
+        executionMode: request.executionMode,
+        routingHints: request.routingHints,
+        modelRoute: request.modelRoute,
+        semanticRecoveryEnabled: request.semanticRecoveryEnabled,
+        claimSemanticRecovery: request.claimSemanticRecovery,
+        recordEvidenceAcquisitionAttempt:
+          request.recordEvidenceAcquisitionAttempt,
+        policy: request.policy,
+        continuation: request.continuation,
+        signal: request.signal,
+      });
     },
   });
 }
@@ -1112,6 +1433,48 @@ function fullCheckpointKey(stageKey: string): string {
   return stageKey.slice(0, 120);
 }
 
+function parseCheckpointCandidateLeadsV3(
+  value: unknown,
+): PipelineCandidateLeadArtifactV3[] | null {
+  if (!Array.isArray(value) || value.length > 100_000) return null;
+  const leads: PipelineCandidateLeadArtifactV3[] = [];
+  const candidateKeys = new Set<string>();
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      return null;
+    }
+    const lead = candidate as Record<string, unknown>;
+    if (typeof lead.strategyId !== "string"
+      || lead.strategyId.length < 1
+      || lead.strategyId.length > 160
+      || typeof lead.candidateKey !== "string"
+      || !/^[a-f0-9]{64}$/u.test(lead.candidateKey)
+      || candidateKeys.has(lead.candidateKey)
+      || typeof lead.artist !== "string"
+      || lead.artist.trim().length < 1
+      || lead.artist.length > 240
+      || typeof lead.title !== "string"
+      || lead.title.trim().length < 1
+      || lead.title.length > 240
+      || (lead.album !== null
+        && (typeof lead.album !== "string" || lead.album.length > 240))
+      || !Array.isArray(lead.sourceRecordIds)
+      || !Array.isArray(lead.citationHashes)
+      || !Array.isArray(lead.predicateCoverage)
+      || (lead.rejectionCode !== null
+        && (typeof lead.rejectionCode !== "string"
+          || lead.rejectionCode.length < 1
+          || lead.rejectionCode.length > 120))) {
+      return null;
+    }
+    candidateKeys.add(lead.candidateKey);
+    leads.push(structuredClone(
+      candidate as unknown as PipelineCandidateLeadArtifactV3,
+    ));
+  }
+  return leads;
+}
+
 function latestCheckpoint(
   result: RetrievalResultV3,
   plan: SelectionPlanV3,
@@ -1140,8 +1503,14 @@ function latestCheckpoint(
       plan,
       tracks: result.selected,
     }),
+    continuationTelemetryScope: result.continuationTelemetryScope
+      ?? "cumulative",
     predicateDiagnostics: result.predicateDiagnostics ?? null,
     compatibleAlternatesByRecordingFamily: result.compatibleAlternatesByRecordingFamily,
+    // Continuations are cumulative. Persist every unique source lead, not
+    // only selected/reserve tracks, so rejected and evidence-unknown
+    // identities remain visible and auditable on the successor pass.
+    candidateLeads: result.candidateLeads ?? [],
     completedAt: new Date().toISOString(),
   };
 }
@@ -1315,6 +1684,18 @@ export class PipelineV3WorkerExecution {
       ...source.selected,
       ...source.reserve,
     ] as RetrievalContinuationSeedV3["qualifiedTracks"];
+    const candidateLeads = parseCheckpointCandidateLeadsV3(
+      source.candidateLeads,
+    );
+    // Query-plan schema 6 reports cumulative semantic-collapse facts. A
+    // question-plan continuation without its complete source lead telemetry
+    // would undercount rejected/unknown identities and can falsely turn a
+    // healthy continuation into an integrity or scarcity outcome.
+    if (queryPlan.schemaVersion >= 6 && candidateLeads === null) {
+      throw new Error(
+        "Pipeline V3 continuation source candidate-lead telemetry is unavailable",
+      );
+    }
     if (queryPlan.schemaVersion >= 4) {
       if (!this.repository.validatePipelineV3ContinuationQualifications) {
         throw new Error(
@@ -1339,6 +1720,7 @@ export class PipelineV3WorkerExecution {
         : source.compatibleAlternatesByRecordingFamily as RetrievalContinuationSeedV3["compatibleAlternatesByRecordingFamily"],
       stages: source.stages as unknown as RetrievalContinuationSeedV3["stages"],
       strategies: source.strategies as RetrievalContinuationSeedV3["strategies"],
+      candidateLeads: candidateLeads ?? [],
     };
   }
 
@@ -1384,6 +1766,9 @@ export class PipelineV3WorkerExecution {
 
     let optimizerBudgetPass = 1;
     let optimizerRetryContinuation: RetrievalContinuationSeedV3 | undefined;
+    let semanticCollapseRescueContinuation:
+      RetrievalContinuationSeedV3 | undefined;
+    let priorSemanticCollapseProof: StrategyDeltaProofV1 | null = null;
     const prior = await this.repository.getResearchCheckpoint(input.runId, fullCheckpointKey(stageKey));
     if (prior && typeof prior === "object" && !Array.isArray(prior)) {
       const priorRecord = prior as Record<string, unknown>;
@@ -1445,6 +1830,10 @@ export class PipelineV3WorkerExecution {
           || !retryRecord.stages
           || typeof retryRecord.stages !== "object"
           || Array.isArray(retryRecord.stages)
+          || (input.queryPlan.schemaVersion >= 6
+            && parseCheckpointCandidateLeadsV3(
+              retryRecord.candidateLeads,
+            ) === null)
           || !retryRecord.compatibleAlternatesByRecordingFamily
           || typeof retryRecord.compatibleAlternatesByRecordingFamily !== "object"
           || Array.isArray(retryRecord.compatibleAlternatesByRecordingFamily)) {
@@ -1453,22 +1842,91 @@ export class PipelineV3WorkerExecution {
         optimizerRetryContinuation = retrySeed as RetrievalContinuationSeedV3;
         optimizerBudgetPass = priorBudgetPass + 1;
       }
+      if (priorState === "waiting_evidence_enrichment") {
+        const rescue = parseSemanticCollapseRescueCheckpointV2(priorRecord, {
+          stageKey,
+          queryPlanHash,
+        });
+        if (!rescue) {
+          await this.repository.updateRun(input.runId, {
+            status: "failed_integrity",
+            phase: "v3_semantic_collapse_rescue_checkpoint_invalid",
+            error: null,
+          }, fence);
+          return;
+        }
+        const nextRetryAt = new Date(rescue.nextRetryAt);
+        if (nextRetryAt.getTime() > Date.now()) {
+          throw new PipelineV3EvidenceEnrichmentRetryError(
+            rescue.evidenceEnrichment.automaticRescueOrdinal,
+            rescue.strategyDeltaProof.proofHash,
+            nextRetryAt,
+          );
+        }
+        priorSemanticCollapseProof = rescue.strategyDeltaProof;
+        semanticCollapseRescueContinuation = {
+          approvedStrategyIds: [...rescue.approvedStrategyIds],
+          evidenceEnrichment: structuredClone(rescue.evidenceEnrichment),
+          qualifiedTracks: [],
+          compatibleAlternatesByRecordingFamily: {},
+          stages: structuredClone(rescue.stages),
+          strategies: structuredClone(rescue.strategies),
+          candidateLeads: structuredClone(rescue.candidateLeads),
+        };
+      }
       if (priorState === "waiting_provider") {
         const priorLeaseEpoch = Number(priorRecord.leaseEpoch);
         const currentLeaseEpoch = Number(input.payload?.__jobLeaseEpoch);
+        const enrichmentWait =
+          parseSemanticCollapseProviderWaitCheckpointV2(priorRecord, {
+            stageKey,
+            queryPlanHash,
+          });
+        if (priorRecord.strategyDeltaProof !== undefined && !enrichmentWait) {
+          await this.repository.updateRun(input.runId, {
+            status: "failed_integrity",
+            phase: "v3_semantic_collapse_provider_checkpoint_invalid",
+            error: null,
+          }, fence);
+          return;
+        }
         // An incomplete dependency wait must never look like a successful
         // handler return. Only a successor lease with a configured provider
         // may resume; all other deliveries stay on the durable retry circuit.
-        if (!this.retrieval || (Number.isSafeInteger(priorLeaseEpoch)
-          && currentLeaseEpoch <= priorLeaseEpoch)) {
+        const retryAfterUntil = parsedRetryAfterUntil(
+          priorRecord.retryAfterUntil,
+        );
+        if (!this.retrieval
+          || (Number.isSafeInteger(priorLeaseEpoch)
+            && currentLeaseEpoch <= priorLeaseEpoch)
+          || (retryAfterUntil
+            && retryAfterUntil.getTime() > Date.now())) {
           throw new PipelineV3DependencyUnavailableError(
-            "v3_retrieval_provider",
+            enrichmentWait
+              ? "v3_evidence_enrichment_provider"
+              : "v3_retrieval_provider",
             typeof priorRecord.reasonCode === "string"
               ? priorRecord.reasonCode
               : "v3_retrieval_provider_unavailable",
-            parsedRetryAfterUntil(priorRecord.retryAfterUntil),
+            retryAfterUntil,
             parsedRetrievalDependencyFailureClass(priorRecord.failureClass),
           );
+        }
+        if (enrichmentWait) {
+          priorSemanticCollapseProof =
+            structuredClone(enrichmentWait.strategyDeltaProof);
+          semanticCollapseRescueContinuation = {
+            approvedStrategyIds:
+              [...enrichmentWait.approvedStrategyIds],
+            evidenceEnrichment:
+              structuredClone(enrichmentWait.evidenceEnrichment),
+            qualifiedTracks: [],
+            compatibleAlternatesByRecordingFamily: {},
+            stages: structuredClone(enrichmentWait.stages),
+            strategies: structuredClone(enrichmentWait.strategies),
+            candidateLeads:
+              structuredClone(enrichmentWait.candidateLeads),
+          };
         }
       }
     }
@@ -1662,6 +2120,111 @@ export class PipelineV3WorkerExecution {
       return;
     }
 
+    if (input.queryPlan.guidancePolicyVersion === "adaptive_guidance_v5") {
+      try {
+        const runtimeConfigurationHash =
+          input.payload?.__executorSemanticConfigurationHash?.trim() ?? "";
+        const runtimeCapability = canonicalExecutorCapabilityForSchemaV1({
+          queryPlanSchemaVersion: 6,
+        });
+        if (!this.repository.getActivePlaylistContractRevision
+          || !/^[a-f0-9]{64}$/u.test(runtimeConfigurationHash)) {
+          throw new Error("guidance_v5_worker_claim_authority_unavailable");
+        }
+        const [authority, activeContractRow] =
+          await Promise.all([
+            this.repository.getResearchCheckpoint(
+              input.runId,
+              GUIDANCE_V5_EXECUTION_AUTHORITY_CHECKPOINT,
+            ),
+            this.repository.getActivePlaylistContractRevision({
+              runId: input.runId,
+            }),
+          ]);
+        if (!activeContractRow
+          || activeContractRow.id
+            !== input.payload?.__contractRevisionDatabaseId
+          || activeContractRow.contractHash
+            !== input.queryPlan.playlistContractSemanticHash) {
+          throw new Error("guidance_v5_worker_active_contract_mismatch");
+        }
+        const activeContract = activeContractRow.contract as unknown as
+          PlaylistContractRevisionV1;
+        assertPlaylistContractIntegrityV1(activeContract);
+        const consumptionTarget = guidanceWorkerConsumptionTargetV5({
+          authority,
+          queryPlan: input.queryPlan,
+          queryPlanRevisionId:
+            input.payload?.__queryPlanRevisionId ?? null,
+        });
+        const consumptionCheckpointKey =
+          guidanceWorkerConsumptionCheckpointKeyV5(
+            consumptionTarget.checkpointQueryPlanHash,
+          );
+        const priorConsumption =
+          await this.repository.getResearchCheckpoint(
+            input.runId,
+            consumptionCheckpointKey,
+          );
+        const consumption = verifyGuidanceWorkerConsumptionV5({
+          authority,
+          activeContract,
+          queryPlan: consumptionTarget.queryPlan,
+          queryPlanRevisionId:
+            consumptionTarget.queryPlanRevisionId,
+          rehydratedPlan: plan,
+          runtimeCapabilitySnapshotHash: runtimeCapability.hash,
+          runtimeSemanticConfigurationHash: runtimeConfigurationHash,
+          jobId: fence.jobId,
+          workerId: fence.workerId,
+          leaseEpoch: fence.leaseEpoch,
+        });
+        if (consumptionTarget.requiresExistingReceipt
+          && priorConsumption === null) {
+          throw new Error(
+            "guidance_v5_worker_parent_consumption_receipt_missing",
+          );
+        }
+        if (priorConsumption === null) {
+          await this.repository.saveResearchCheckpoint(
+            input.runId,
+            consumptionCheckpointKey,
+            consumption,
+            fence,
+          );
+        } else {
+          assertGuidanceWorkerConsumptionReceiptV5(
+            priorConsumption,
+            consumption.receiptHash,
+          );
+        }
+      } catch (error) {
+        const reason = error instanceof Error
+          ? error.message
+          : "guidance_v5_worker_consumption_failed";
+        await this.repository.saveResearchCheckpoint(
+          input.runId,
+          fullCheckpointKey(stageKey),
+          {
+            schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+            state: "failed_integrity",
+            stageKey,
+            queryPlanHash,
+            code: "v3_guidance_worker_consumption_failed",
+            reason,
+            failedAt: new Date().toISOString(),
+          },
+          fence,
+        );
+        await this.repository.updateRun(input.runId, {
+          status: "failed_integrity",
+          phase: "v3_guidance_worker_consumption_failed",
+          error: null,
+        }, fence);
+        return;
+      }
+    }
+
     const preflightCorpusReason = governedCorpusActionReasonV3(input.queryPlan);
     if (preflightCorpusReason) {
       if (!this.corpusBuilder) {
@@ -1779,6 +2342,7 @@ export class PipelineV3WorkerExecution {
     let continuation: RetrievalContinuationSeedV3 | undefined;
     try {
       continuation = optimizerRetryContinuation
+        ?? semanticCollapseRescueContinuation
         ?? await this.continuationSeed(input.runId, input.queryPlan);
     } catch {
       abortIfNeeded(input.signal);
@@ -1801,7 +2365,12 @@ export class PipelineV3WorkerExecution {
       && input.queryPlan.schemaVersion >= 4;
     if (requiresSeparatedRecoveryPersistence
       && (!this.repository.persistPipelineV3DiscoveryBatch
-        || !this.repository.persistPipelineV3QualificationBatch)) {
+        || !this.repository.persistPipelineV3QualificationBatch
+        || !this.repository.persistPipelineV3EvidenceAcquisitionAttempt
+        || (
+          input.queryPlan.schemaVersion === 6
+          && !this.repository.readPipelineV3SemanticCollapseDatabaseFacts
+        ))) {
       await this.repository.saveResearchCheckpoint(input.runId, fullCheckpointKey(stageKey), {
         schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
         state: "failed_integrity",
@@ -1897,13 +2466,45 @@ export class PipelineV3WorkerExecution {
               });
             },
             recordQualificationBatch: async (request, qualifications) => {
-              await this.repository.persistPipelineV3QualificationBatch!({
-                runId: input.runId,
-                queryPlan: input.queryPlan,
-                request,
-                qualifications,
-                fence,
-              });
+              const candidateById = new Map(
+                request.candidates.map((candidate) => [candidate.id, candidate]),
+              );
+              // Each evaluated candidate gets its own fenced, idempotent
+              // transaction. A crash cannot roll back already-observed peers,
+              // and replay uses the persisted identity/qualification hashes.
+              for (const qualification of qualifications) {
+                const candidate = candidateById.get(qualification.candidateId);
+                if (!candidate) {
+                  throw new CanonicalExecutionIntegrityError(
+                    "pipeline_v3_qualification_candidate_missing",
+                  );
+                }
+                await this.repository.persistPipelineV3QualificationBatch!({
+                  runId: input.runId,
+                  queryPlan: input.queryPlan,
+                  request: {
+                    ...request,
+                    candidates: [candidate],
+                  },
+                  qualifications: [qualification],
+                  fence,
+                });
+                abortIfNeeded(input.signal);
+              }
+            },
+            recordEvidenceAcquisitionAttempt: async (
+              request,
+              observation,
+            ) => {
+              await this.repository
+                .persistPipelineV3EvidenceAcquisitionAttempt!({
+                  runId: input.runId,
+                  queryPlan: input.queryPlan,
+                  request,
+                  observation,
+                  fence,
+                });
+              abortIfNeeded(input.signal);
             },
           } : {}),
           claimSemanticRecovery: async (revision) => {
@@ -2003,38 +2604,78 @@ export class PipelineV3WorkerExecution {
       result,
     );
     if (input.queryPlan.schemaVersion === 6
-      && result.outcome.status === "no_compatible_tracks"
-      && !governedCorpusActionPending) {
-      const collapseAudit = auditSemanticCollapseV1({
+      && !governedCorpusActionPending
+      // A provider-failed enrichment pass has no completed candidate
+      // projection to compare with cumulative database truth. Persist the
+      // exact proof-bound provider wait below; auditing its pass-local zeroes
+      // here would misclassify the outage as telemetry corruption.
+      && result.outcome.status !== "failed_system") {
+      const capturedAt = new Date().toISOString();
+      const databaseFacts =
+        await this.repository.readPipelineV3SemanticCollapseDatabaseFacts!({
+          runId: input.runId,
+          queryPlan: input.queryPlan,
+          queryPlanHash,
+          result,
+          capturedAt,
+          fence,
+        });
+      const coverage = semanticCollapseCoverageV2({
         queryPlan: input.queryPlan,
+        queryPlanHash,
         result,
+        databaseFacts,
+        capturedAt,
+        authenticatedEvidenceRepairContinuation:
+          semanticCollapseRescueContinuation?.evidenceEnrichment
+            ? {
+                strategyDeltaProofHash:
+                  semanticCollapseRescueContinuation.evidenceEnrichment
+                    .strategyDeltaProofHash,
+                automaticRescueOrdinal:
+                  semanticCollapseRescueContinuation.evidenceEnrichment
+                    .automaticRescueOrdinal,
+              }
+            : undefined,
+        unresolvedUserSemanticClauseIds:
+          input.queryPlan.conceptDiscoveryHints
+            ?.filter(({ status }) => status === "unresolved")
+            .map(({ clauseId }) => clauseId) ?? [],
       });
       await this.repository.saveResearchCheckpoint(
         input.runId,
-        "v3:semantic-collapse:audit",
-        {
-          ...collapseAudit,
-          queryPlanHash,
-          queryPlanRevisionId:
-            input.payload?.__queryPlanRevisionId ?? null,
-          recordedAt: new Date().toISOString(),
-        },
+        SEMANTIC_COLLAPSE_COVERAGE_CHECKPOINT_V2,
+        coverage,
         fence,
       );
-      if (collapseAudit.disposition === "technical_quarantine") {
+      const rereadCoverage = parseSemanticCollapseCoverageV2(
+        await this.repository.getResearchCheckpoint(
+          input.runId,
+          SEMANTIC_COLLAPSE_COVERAGE_CHECKPOINT_V2,
+        ),
+      );
+      const quarantine = async (
+        reasonCode: string,
+        audit: SemanticCollapseAuditV2 | null,
+      ): Promise<void> => {
         await this.repository.saveResearchCheckpoint(
           input.runId,
           fullCheckpointKey(stageKey),
           {
             schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
             state: "failed_integrity",
-            code: "v3_semantic_collapse_technical_quarantine",
+            code: reasonCode,
             stageKey,
             queryPlanHash,
-            auditHash: collapseAudit.auditHash,
-            signalCodes: collapseAudit.signalCodes,
-            limitingObligationIds:
-              collapseAudit.limitingObligationIds,
+            coverageHash: rereadCoverage?.coverageHash ?? coverage.coverageHash,
+            auditHash: audit?.auditHash ?? null,
+            signalCodes: audit?.signalCodes ?? [],
+            limitingObligationIds: audit?.limitingObligationIds ?? [],
+            nextAction: {
+              kind: "replay_after_repair",
+              incidentRef: reasonCode,
+              available: false,
+            },
             failedAt: new Date().toISOString(),
           },
           fence,
@@ -2049,17 +2690,375 @@ export class PipelineV3WorkerExecution {
             jobId: input.payload.__jobId,
             workerId: input.payload.__jobWorkerId,
             leaseGeneration: Number(input.payload.__jobLeaseEpoch),
-            reasonCode:
-              "v3_semantic_collapse_technical_quarantine",
+            reasonCode,
           }),
         );
         if (!quarantined) {
           await this.repository.updateRun(input.runId, {
             status: "failed_integrity",
-            phase: "v3_semantic_collapse_technical_quarantine",
+            phase: reasonCode,
             error: null,
           }, fence);
         }
+      };
+      if (!rereadCoverage
+        || rereadCoverage.queryPlanHash !== queryPlanHash
+        || rereadCoverage.coverageHash !== coverage.coverageHash
+        || rereadCoverage.databaseFactsHash !== databaseFacts.factsHash) {
+        await quarantine(
+          "v3_semantic_collapse_coverage_integrity_failure",
+          null,
+        );
+        return;
+      }
+      if (rereadCoverage.nullCandidateQualificationCount > 0) {
+        await quarantine(
+          "v3_semantic_collapse_null_candidate_qualification",
+          null,
+        );
+        return;
+      }
+      if (rereadCoverage.telemetryDivergenceCodes.length > 0) {
+        await quarantine(
+          "v3_semantic_collapse_database_telemetry_divergence",
+          null,
+        );
+        return;
+      }
+      const collapseAudit = auditSemanticCollapseV2(rereadCoverage);
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        SEMANTIC_COLLAPSE_AUDIT_CHECKPOINT_V2,
+        {
+          ...collapseAudit,
+          coverageHash: rereadCoverage.coverageHash,
+          queryPlanHash,
+          queryPlanRevisionId:
+            input.payload?.__queryPlanRevisionId ?? null,
+          recordedAt: new Date().toISOString(),
+        },
+        fence,
+      );
+      // Preserve the schema-20/protocol-12 checkpoint projection consumed by
+      // v2.5.3-era diagnostics while the versioned V2 key becomes canonical
+      // for new evidence-coverage tooling.
+      await this.repository.saveResearchCheckpoint(
+        input.runId,
+        LEGACY_SEMANTIC_COLLAPSE_AUDIT_CHECKPOINT,
+        {
+          ...collapseAudit,
+          coverageHash: rereadCoverage.coverageHash,
+          queryPlanHash,
+          queryPlanRevisionId:
+            input.payload?.__queryPlanRevisionId ?? null,
+          recordedAt: new Date().toISOString(),
+        },
+        fence,
+      );
+      if (collapseAudit.triggered) {
+        if (collapseAudit.disposition === "technical_quarantine") {
+          await quarantine(
+            collapseAudit.reasonCode === "capability_gap"
+              ? "v3_semantic_collapse_capability_gap"
+              : "v3_semantic_collapse_evidence_binding_defect",
+            collapseAudit,
+          );
+          return;
+        }
+        if (collapseAudit.disposition === "dependency_blocker") {
+          const retryAfterUntil = collapseAudit.nextRetryAt
+            ? new Date(collapseAudit.nextRetryAt)
+            : retrievalRetryAfterUntil(result)
+              ?? new Date(Date.now() + 5 * 60_000);
+        const failureClass = retrievalFailureClass(result);
+        const waitingCheckpoint = {
+          schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+          state: "waiting_provider",
+          stageKey,
+          queryPlanHash,
+          queryPlanRevisionId:
+            input.payload?.__queryPlanRevisionId ?? null,
+          graphSnapshotId: input.queryPlan.graphSnapshotId,
+          executionMode: mode,
+          reasonCode:
+            "v3_semantic_collapse_evidence_dependency",
+          coverageHash: rereadCoverage.coverageHash,
+          auditHash: collapseAudit.auditHash,
+          signalCodes: collapseAudit.signalCodes,
+          limitingObligationIds:
+            collapseAudit.limitingObligationIds,
+          dependencyOutages: result.dependencyOutages ?? [],
+          retryAfterUntil: retryAfterUntil.toISOString(),
+          nextAction: {
+            kind: "resume_at",
+            nextRetryAt: retryAfterUntil.toISOString(),
+            blockerId: "v3_evidence_enrichment_provider",
+          },
+          failureClass,
+          waitingAt: new Date().toISOString(),
+        };
+        await this.repository.saveResearchCheckpoint(
+          input.runId,
+          fullCheckpointKey(stageKey),
+          waitingCheckpoint,
+          fence,
+        );
+        await this.repository.saveResearchCheckpoint(
+          input.runId,
+          "v3:retrieval:latest",
+          waitingCheckpoint,
+          fence,
+        );
+        await this.repository.updateRun(input.runId, {
+          status: "queued",
+          phase: "v3_waiting_for_evidence_enrichment_provider",
+          error: null,
+        }, fence);
+        throw new PipelineV3DependencyUnavailableError(
+          "v3_evidence_enrichment_provider",
+          "v3_semantic_collapse_evidence_dependency",
+          retryAfterUntil,
+          failureClass,
+        );
+        }
+        if (collapseAudit.disposition === "deficit_research") {
+          const rescue = semanticCollapseRescueV2({
+            queryPlan: input.queryPlan,
+            result,
+            coverage: rereadCoverage,
+            audit: collapseAudit,
+            priorProof: priorSemanticCollapseProof,
+          });
+          if (!rescue) {
+            await quarantine(
+              priorSemanticCollapseProof?.automaticRescueOrdinal === 2
+                ? "v3_semantic_collapse_evidence_enrichment_exhausted"
+                : "v3_semantic_collapse_strategy_delta_unavailable",
+              collapseAudit,
+            );
+            return;
+          }
+          const nextRetryAt = new Date(Date.now() + 2_000);
+          const retryCheckpoint: SemanticCollapseRescueCheckpointV2 & {
+            readonly coverageHash: string;
+            readonly auditHash: string;
+            readonly nextAction: Record<string, unknown>;
+          } = {
+            schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+            state: "waiting_evidence_enrichment",
+            code: SEMANTIC_COLLAPSE_RESCUE_CODE,
+            stageKey,
+            queryPlanHash,
+            coverageHash: rereadCoverage.coverageHash,
+            auditHash: collapseAudit.auditHash,
+            strategyDeltaProof: rescue.proof,
+            evidenceEnrichment: rescue.directive,
+            approvedStrategyIds: rescue.approvedStrategyIds,
+            stages: structuredClone(result.stages),
+            strategies: structuredClone(result.strategies),
+            candidateLeads: structuredClone(result.candidateLeads ?? []),
+            nextRetryAt: nextRetryAt.toISOString(),
+            nextAction: {
+              kind: "resume_at",
+              nextRetryAt: nextRetryAt.toISOString(),
+              blockerId: `v3_evidence_enrichment_pass_${rescue.directive.automaticRescueOrdinal}`,
+            },
+          };
+          await this.repository.saveResearchCheckpoint(
+            input.runId,
+            fullCheckpointKey(stageKey),
+            retryCheckpoint,
+            fence,
+          );
+          await this.repository.saveResearchCheckpoint(
+            input.runId,
+            "v3:retrieval:latest",
+            retryCheckpoint,
+            fence,
+          );
+          await this.repository.updateRun(input.runId, {
+            status: "recovering",
+            phase: "v3_bounded_evidence_enrichment_retry",
+            error: null,
+          }, fence);
+          throw new PipelineV3EvidenceEnrichmentRetryError(
+            rescue.directive.automaticRescueOrdinal,
+            rescue.proof.proofHash,
+            nextRetryAt,
+          );
+        }
+        if (collapseAudit.disposition === "needs_input") {
+          const activeContract = this.repository.getActivePlaylistContractRevision
+            ? await this.repository.getActivePlaylistContractRevision({
+                runId: input.runId,
+              })
+            : null;
+          const guidanceAction = activeContract
+            && this.repository.preparePlaylistRunRescueGuidance
+            && input.payload?.__contractRevisionDatabaseId === activeContract.id
+            ? await this.repository.preparePlaylistRunRescueGuidance({
+                runId: input.runId,
+                contractRevisionId: activeContract.id,
+                contractSemanticHash: activeContract.contractHash,
+                limitingClauseIds: input.queryPlan.verificationExpression
+                  ? verificationLeavesV1(input.queryPlan.verificationExpression)
+                    .filter(({ obligationId }) => (
+                      collapseAudit.limitingObligationIds.includes(obligationId)
+                    ))
+                    .map(({ clauseId }) => clauseId)
+                  : [],
+                fence,
+              })
+            : null;
+          if (!guidanceAction) {
+            await quarantine(
+              "v3_semantic_collapse_guidance_action_unavailable",
+              collapseAudit,
+            );
+            return;
+          }
+          await this.repository.saveResearchCheckpoint(
+            input.runId,
+            fullCheckpointKey(stageKey),
+            {
+              schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+              state: "awaiting_guidance",
+              code: "v3_semantic_collapse_needs_input",
+              stageKey,
+              queryPlanHash,
+              coverageHash: rereadCoverage.coverageHash,
+              auditHash: collapseAudit.auditHash,
+              guidanceAction,
+              nextAction: {
+                kind: "answer_question",
+                questionSetHash: typeof guidanceAction === "object"
+                  && !Array.isArray(guidanceAction)
+                  && "questionSetHash" in guidanceAction
+                  ? String(guidanceAction.questionSetHash)
+                  : null,
+              },
+              reachedAt: new Date().toISOString(),
+            },
+            fence,
+          );
+          await this.repository.updateRun(input.runId, {
+            status: "awaiting_guidance",
+            phase: "v3_semantic_collapse_guidance_required",
+            error: null,
+          }, fence);
+          return;
+        }
+        if (collapseAudit.disposition === "actionable_decision"
+          || collapseAudit.disposition === "scarcity_decision") {
+          const activeContract = this.repository.getActivePlaylistContractRevision
+            ? await this.repository.getActivePlaylistContractRevision({
+                runId: input.runId,
+              })
+            : null;
+          if (!activeContract) {
+            await quarantine(
+              "v3_semantic_collapse_decision_contract_missing",
+              collapseAudit,
+            );
+            return;
+          }
+          const contract = activeContract.contract as unknown as PlaylistContractRevisionV1;
+          try {
+            assertPlaylistContractIntegrityV1(contract);
+          } catch {
+            await quarantine(
+              "v3_semantic_collapse_decision_contract_invalid",
+              collapseAudit,
+            );
+            return;
+          }
+          const limitingClauseIds = uniqueStrings([
+            ...(input.queryPlan.verificationExpression
+              ? verificationLeavesV1(input.queryPlan.verificationExpression)
+              : []),
+            ...(input.queryPlan.canonicalContractPolicy
+              ? centralQualityVerificationLeavesV1({
+                  policy: input.queryPlan.canonicalContractPolicy,
+                  qualityPolicy: input.queryPlan.playlistQualityPolicy,
+                })
+              : []),
+          ].filter(({ obligationId }) => (
+            collapseAudit.limitingObligationIds.includes(obligationId)
+          )).map(({ clauseId }) => clauseId));
+          const decision = createAdaptiveRunDecisionV1({
+            contract,
+            reason: collapseAudit.disposition === "scarcity_decision"
+              ? "frontier_exhausted_under_policy"
+              : "runtime_feasibility_unknown",
+            verifiedTrackCount: result.selected.length,
+            remainingStrategyCount: collapseAudit.disposition === "actionable_decision"
+              ? result.strategies.filter(({ status }) => (
+                  status === "available" || status === "running"
+                )).length
+              : 0,
+            consumedActiveComputeMs: Math.max(
+              0,
+              Number(input.payload?.__contractActiveComputeConsumedMs ?? 0)
+                + Math.max(0, Date.now() - Date.parse(startedAt)),
+            ),
+            limitingClauseIds,
+          });
+          const decisionState = {
+            ...decision,
+            reasonCode: collapseAudit.reasonCode,
+            coverageHash: rereadCoverage.coverageHash,
+            auditHash: collapseAudit.auditHash,
+            limitingObligationIds: collapseAudit.limitingObligationIds,
+            independentDependencyRootIds:
+              collapseAudit.independentDependencyRootIds,
+          };
+          await this.repository.saveResearchCheckpoint(
+            input.runId,
+            "run_decision",
+            decisionState,
+            fence,
+          );
+          if (this.repository.openPlaylistRunBlocker
+            && input.payload?.__contractRevisionDatabaseId === activeContract.id) {
+            await this.repository.openPlaylistRunBlocker({
+              runId: input.runId,
+              contractRevisionId: activeContract.id,
+              blockerKind: "scope_decision",
+              dependencyKey: collapseAudit.reasonCode,
+              retryCount: 0,
+              nextRetryAt: null,
+              automaticRetryUntil: null,
+              state: decisionState,
+              fence,
+            });
+          }
+          await this.repository.saveResearchCheckpoint(
+            input.runId,
+            fullCheckpointKey(stageKey),
+            {
+              ...decisionState,
+              schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
+              state: "needs_decision",
+              stageKey,
+              queryPlanHash,
+              reachedAt: new Date().toISOString(),
+            },
+            fence,
+          );
+          await this.repository.updateRun(input.runId, {
+            status: "needs_decision",
+            phase: collapseAudit.reasonCode
+              ?? "v3_semantic_collapse_decision",
+            error: null,
+          }, fence);
+          return;
+        }
+        // `none` is impossible when triggered. Keep the boundary fail-closed
+        // if a future audit version adds a disposition without a worker path.
+        await quarantine(
+          "v3_semantic_collapse_disposition_unhandled",
+          collapseAudit,
+        );
         return;
       }
     }
@@ -2154,6 +3153,34 @@ export class PipelineV3WorkerExecution {
           failureClass,
         );
       }
+      const enrichmentRetry = priorSemanticCollapseProof
+        && continuation?.evidenceEnrichment
+        && continuation.evidenceEnrichment.strategyDeltaProofHash
+          === priorSemanticCollapseProof.proofHash
+        && continuation.evidenceEnrichment.automaticRescueOrdinal
+          === priorSemanticCollapseProof.automaticRescueOrdinal
+        && continuation.approvedStrategyIds.length > 0
+        ? {
+            strategyDeltaProof:
+              structuredClone(priorSemanticCollapseProof),
+            evidenceEnrichment:
+              structuredClone(continuation.evidenceEnrichment),
+            approvedStrategyIds:
+              [...continuation.approvedStrategyIds],
+            // Discovery may have committed before a later qualification
+            // dependency failed. Carry the failed pass's cumulative,
+            // normalized observations so the successor result and database
+            // include exactly the same authenticated source-plus-retry work.
+            stages: structuredClone(result.stages),
+            strategies: structuredClone(result.strategies),
+            candidateLeads:
+              structuredClone(
+                result.candidateLeads
+                  ?? continuation.candidateLeads
+                  ?? [],
+              ),
+          }
+        : null;
       const waitingCheckpoint = {
         schemaVersion: PIPELINE_V3_WORKER_CHECKPOINT_SCHEMA,
         state: "waiting_provider",
@@ -2174,6 +3201,7 @@ export class PipelineV3WorkerExecution {
         dependencyOutages: result.dependencyOutages ?? [],
         retryAfterUntil: retryAfterUntil?.toISOString() ?? null,
         failureClass,
+        ...(enrichmentRetry ?? {}),
         waitingAt: new Date().toISOString(),
       };
       await this.repository.saveResearchCheckpoint(
@@ -2190,11 +3218,15 @@ export class PipelineV3WorkerExecution {
       );
       await this.repository.updateRun(input.runId, {
         status: "queued",
-        phase: "v3_waiting_for_retrieval_provider",
+        phase: enrichmentRetry
+          ? "v3_waiting_for_evidence_enrichment_provider"
+          : "v3_waiting_for_retrieval_provider",
         error: null,
       }, fence);
       throw new PipelineV3DependencyUnavailableError(
-        "v3_retrieval_provider",
+        enrichmentRetry
+          ? "v3_evidence_enrichment_provider"
+          : "v3_retrieval_provider",
         "v3_retrieval_provider_failed",
         retryAfterUntil,
         failureClass,
@@ -2243,12 +3275,54 @@ export class PipelineV3WorkerExecution {
       });
       return;
     }
+    const canonicalPartialSelectedSet = result.outcome.status === "partial_ready"
+      && isCanonicalQueryPlanV3SchemaVersion(input.queryPlan.schemaVersion);
+    const canonicalPartialValidation = canonicalPartialSelectedSet
+      ? validateCanonicalPublicationSetV3({
+          plan,
+          tracks: result.selected,
+          partialPublicationAuthorized: true,
+        })
+      : null;
+    const canonicalPartialReasonCodes =
+      canonicalPartialValidation?.reasonCodes ?? [];
+    const selectedSetCentralQualityMissed = canonicalPartialReasonCodes
+      .includes("canonical_central_quality_failed");
+    const selectedSetPlaylistConstraintsMissed = canonicalPartialReasonCodes
+      .some((reason) => (
+        reason.startsWith("canonical_quota_failed:")
+        || (reason.startsWith("canonical_playlist_optimization_failed:")
+          && !reason.includes("central_quality"))
+        || reason.startsWith("canonical_sequence_")
+      ));
+    const centralQualityMissed = selectedSetCentralQualityMissed
+      || (!canonicalPartialSelectedSet
+        && result.outcome.stopReason === "central_quality_floor");
+    const playlistConstraintsMissed = selectedSetPlaylistConstraintsMissed
+      || (!canonicalPartialSelectedSet
+        && result.outcome.stopReason === "playlist_optimization_constraints");
+    if (canonicalPartialValidation
+      && !canonicalPartialValidation.valid
+      && !selectedSetCentralQualityMissed
+      && !selectedSetPlaylistConstraintsMissed) {
+      throw new CanonicalExecutionIntegrityError(
+        "partial_selected_set_integrity_invalid",
+      );
+    }
+    // A shortfall reason describes why the requested count was not reached;
+    // it does not make an otherwise policy-valid selected set unpublishable.
+    // Let the repository revalidate and freeze valid partial selections so
+    // the existing hash/manifest-bound consent flow can render. Only a real
+    // selected-set quality or playlist-constraint miss belongs in the generic
+    // contract decision panel.
+    const canonicalPartialRequiresConstraintDecision =
+      canonicalPartialSelectedSet
+      && canonicalPartialValidation?.valid === false
+      && (selectedSetCentralQualityMissed
+        || selectedSetPlaylistConstraintsMissed);
     if (mode === "active" && (
       result.outcome.status === "needs_decision"
-      || (
-        result.outcome.status === "partial_ready"
-        && isCanonicalQueryPlanV3SchemaVersion(input.queryPlan.schemaVersion)
-      )
+      || canonicalPartialRequiresConstraintDecision
     )) {
       await this.repository.saveResearchCheckpoint(
         input.runId,
@@ -2263,8 +3337,6 @@ export class PipelineV3WorkerExecution {
         fence,
       );
       const computeLimitReached = result.outcome.stopReason === "deadline_reached";
-      const playlistConstraintsMissed =
-        result.outcome.stopReason === "playlist_optimization_constraints";
       const activeComputeAllowanceMs = Number.isFinite(
         input.payload?.__contractActiveComputeAllowanceMs,
       )
@@ -2278,11 +3350,11 @@ export class PipelineV3WorkerExecution {
             strategy.status === "available" || strategy.status === "running"
           )).map(({ id }) => id)
         : [];
-      // A selected subset is evidence for the decision panel, never a
-      // publishable manifest under the unchanged exact-count contract.
-      // Publication requires an explicit user-authorized successor revision;
-      // freezing a partial here would silently weaken count and any
-      // count-derived quota/diversity constraints.
+      // Policy-valid selected subsets bypass this branch and are frozen only
+      // as consent-pending partial manifests. A subset that reaches this
+      // branch has either missed a named selected-set constraint or has not
+      // reached a persistence-safe publication boundary; it must never be
+      // treated as implicitly publishable.
       const activeContract = this.repository.getActivePlaylistContractRevision
         ? await this.repository.getActivePlaylistContractRevision({ runId: input.runId })
         : null;
@@ -2318,6 +3390,13 @@ export class PipelineV3WorkerExecution {
           ).sort(([, left], [, right]) => right - left)
             .map(([clauseId]) => clauseId)
             .slice(0, 5);
+          const centralQualityClauseIds = [...new Set([
+            ...(input.queryPlan.playlistQualityPolicy?.clauseIds ?? []),
+            ...contract.qualityPolicy.centralSuitabilityClauseIds,
+            ...contract.clauses
+              .filter(({ kind }) => kind === "suitability")
+              .map(({ id }) => id),
+          ])];
           const limitingClauseIds = runtimeFeasibilityDecisionRequired
             ? (runtimeFeasibility?.report.limitingPredicateIds ?? []).slice(0, 5)
             : playlistConstraintsMissed
@@ -2334,6 +3413,8 @@ export class PipelineV3WorkerExecution {
               ))
               .map(({ id }) => id)
               .slice(0, 5)
+            : centralQualityMissed
+            ? centralQualityClauseIds.slice(0, 5)
             : diagnosticLimitingClauseIds;
           decisionState = createAdaptiveRunDecisionV1({
             contract,
@@ -2343,7 +3424,9 @@ export class PipelineV3WorkerExecution {
               ? "active_compute_limit"
               : playlistConstraintsMissed
                 ? "playlist_optimization_constraints"
-              : "central_quality_floor",
+              : centralQualityMissed
+                ? "central_quality_floor"
+                : "frontier_exhausted_under_policy",
             verifiedTrackCount: result.selected.length,
             remainingStrategyCount: continuationStrategyIds.length,
             consumedActiveComputeMs: runtimeFeasibilityDecisionRequired
@@ -2396,7 +3479,9 @@ export class PipelineV3WorkerExecution {
                 ? "active_compute"
                 : playlistConstraintsMissed
                   ? "playlist_constraints"
-                  : "central_quality",
+                  : centralQualityMissed
+                    ? "central_quality"
+                    : "frontier_exhausted_under_policy",
               state: decisionState,
               fence,
             });
@@ -2456,7 +3541,9 @@ export class PipelineV3WorkerExecution {
           ? "active_compute_limit_reached"
           : playlistConstraintsMissed
             ? "playlist_optimization_constraints_missed"
-            : "central_quality_floor_missed",
+            : centralQualityMissed
+              ? "central_quality_floor_missed"
+              : "frontier_exhausted_under_policy",
         error: null,
       }, fence);
       return;

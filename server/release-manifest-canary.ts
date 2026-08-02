@@ -71,6 +71,7 @@ export interface ReleaseManifestCanaryZeroWriteCountsV1 {
   matchingJobs: number;
   publicationJobs: number;
   publicationVolumeRows: number;
+  orphanPlaylistRows?: number;
 }
 
 export interface ReleaseManifestCanaryEvidenceV1 {
@@ -110,6 +111,7 @@ export interface ReleaseManifestCanaryEvidenceV1 {
     matchingJobs: 0;
     publicationJobs: 0;
     publicationVolumeRows: 0;
+    orphanPlaylistRows: 0;
   };
   completedAt: string;
   evidenceHash: string;
@@ -455,6 +457,7 @@ export function buildReleaseManifestCanaryEvidence(input: {
     || input.zeroWriteCounts.matchingJobs !== 0
     || input.zeroWriteCounts.publicationJobs !== 0
     || input.zeroWriteCounts.publicationVolumeRows !== 0
+    || (input.zeroWriteCounts.orphanPlaylistRows ?? 0) !== 0
   ) {
     throw new Error("release_manifest_canary_crossed_the_apple_write_boundary");
   }
@@ -592,6 +595,7 @@ export function buildReleaseManifestCanaryEvidence(input: {
       matchingJobs: 0,
       publicationJobs: 0,
       publicationVolumeRows: 0,
+      orphanPlaylistRows: 0,
     },
     completedAt: checkpoint.completedAt,
   } as const;

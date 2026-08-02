@@ -402,7 +402,7 @@ function runtimeSnapshot(input: {
     || result.workerProtocol !== "playlist-pipeline-v12"
     || result.briefContractVersion !== "3"
     || result.queryPlanSchemaVersion !== "6"
-    || result.policyVersions.guidance !== "adaptive_guidance_v4"
+    || result.policyVersions.guidance !== "adaptive_guidance_v5"
     || result.policyVersions.evidence !== "governed_evidence_v2"
   ) {
     throw new Error(
@@ -463,7 +463,7 @@ function publicRolloutSnapshot(input: {
     };
   }
   const stagePattern =
-    /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u;
+    /^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u;
   if (
     typeof authorityEvidenceHash !== "string"
     || !SHA256.test(authorityEvidenceHash)

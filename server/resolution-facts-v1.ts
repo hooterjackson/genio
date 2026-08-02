@@ -1,8 +1,10 @@
 import type {
+  RunDecisionActionView,
   RunNextAction,
   RunStatus,
   RunWorkMotion,
 } from "../shared/types.ts";
+import { advancingAdaptiveRunDecisionActionV1 } from "./adaptive-run-decision-v1.ts";
 import type {
   PlaylistResolutionStateV1,
 } from "./playlist-resolution-service-v1.ts";
@@ -23,10 +25,14 @@ export interface ResolutionFactsV1 {
   requestedTrackCount: number | null;
   reconciledPublishedTrackCount: number | null;
   exactAppleReconciliation: boolean;
+  approvedPartialPublication: boolean;
   workMotion: RunWorkMotion;
   integrityIncident: boolean;
   cancellationRequested: boolean;
-  decisionAvailable: boolean;
+  activeContractSemanticRevisionId: string | null;
+  activeContractSemanticHash: string | null;
+  decision: RunDecisionActionView | null;
+  verifiedPartialDecisionAvailable: boolean;
 }
 
 export interface ResolutionReductionV1 {
@@ -50,8 +56,31 @@ function exactCompletion(input: ResolutionFactsV1): boolean {
     && input.reconciledPublishedTrackCount === input.requestedTrackCount;
 }
 
-function executableMotion(motion: RunWorkMotion): boolean {
-  return motion === "running" || motion === "retry_scheduled";
+function approvedPartialCompletion(input: ResolutionFactsV1): boolean {
+  return input.approvedPartialPublication
+    && input.manifestId !== null
+    && input.exactAppleReconciliation
+    && Number.isSafeInteger(input.requestedTrackCount)
+    && input.requestedTrackCount! > 0
+    && Number.isSafeInteger(input.reconciledPublishedTrackCount)
+    && input.reconciledPublishedTrackCount! > 0
+    && input.reconciledPublishedTrackCount! < input.requestedTrackCount!
+    && (input.legacyStatus === "partial" || input.legacyStatus === "complete");
+}
+
+function advancingDecisionAction(
+  input: ResolutionFactsV1,
+): "resume_research" | "review_contract" | null {
+  if (!input.decision
+    || !input.activeContractSemanticRevisionId
+    || !input.activeContractSemanticHash
+    || input.decision.contractRevisionId
+      !== input.activeContractSemanticRevisionId
+    || input.decision.contractSemanticHash
+      !== input.activeContractSemanticHash) {
+    return null;
+  }
+  return advancingAdaptiveRunDecisionActionV1(input.decision);
 }
 
 /**
@@ -97,13 +126,23 @@ export function reduceResolutionFactsV1(
     };
   }
 
+  if (approvedPartialCompletion(input)) {
+    return {
+      state: "completed",
+      nextAction: "none",
+      reasonCode: "approved_partial_apple_reconciliation",
+      observedAppleSideEffect: true,
+      incidentRequired: false,
+    };
+  }
+
   if (input.legacyStatus === "complete") {
     return {
-      state: "needs_decision",
-      nextAction: "review_contract",
+      state: "quarantined",
+      nextAction: "contact_support",
       reasonCode: "legacy_completion_missing_exact_apple_reconciliation",
       observedAppleSideEffect,
-      incidentRequired: observedAppleSideEffect,
+      incidentRequired: true,
     };
   }
 
@@ -145,32 +184,87 @@ export function reduceResolutionFactsV1(
     };
   }
 
-  const decisionState = input.decisionAvailable
-    || input.blockerKind === "budget"
-    || input.blockerKind === "scope_decision"
-    || input.legacyStatus === "needs_decision"
-    || input.legacyStatus === "awaiting_budget"
-    || input.legacyStatus === "partial_ready"
-    || input.legacyStatus === "partial"
-    || input.legacyStatus === "no_compatible_tracks";
-  if (decisionState) {
-    if (executableMotion(input.workMotion)) {
+  if (input.legacyStatus === "partial_ready") {
+    if (!input.verifiedPartialDecisionAvailable) {
       return {
         state: "quarantined",
         nextAction: "contact_support",
-        reasonCode: "decision_state_has_executable_work",
+        reasonCode: "partial_ready_missing_verified_manifest_proof",
+        observedAppleSideEffect,
+        incidentRequired: true,
+      };
+    }
+    if (input.workMotion !== "none") {
+      return {
+        state: "quarantined",
+        nextAction: "contact_support",
+        reasonCode: "decision_state_has_nonquiescent_work",
         observedAppleSideEffect,
         incidentRequired: true,
       };
     }
     return {
       state: "needs_decision",
-      nextAction: "review_contract",
-      reasonCode: input.legacyStatus === "no_compatible_tracks"
-        ? "compatibility_or_scarcity_decision_required"
-        : "explicit_user_decision_required",
+      nextAction: "decide_verified_partial",
+      reasonCode: "verified_partial_consent_required",
       observedAppleSideEffect,
       incidentRequired: false,
+    };
+  }
+
+  const decisionState = input.blockerKind === "budget"
+    || input.blockerKind === "scope_decision"
+    || input.legacyStatus === "needs_decision"
+    || input.legacyStatus === "awaiting_budget"
+    || input.legacyStatus === "partial"
+    || input.legacyStatus === "no_compatible_tracks";
+  if (decisionState) {
+    if (input.workMotion !== "none") {
+      return {
+        state: "quarantined",
+        nextAction: "contact_support",
+        reasonCode: "decision_state_has_nonquiescent_work",
+        observedAppleSideEffect,
+        incidentRequired: true,
+      };
+    }
+    const nextAction = advancingDecisionAction(input);
+    if (nextAction === null) {
+      return {
+        state: "quarantined",
+        nextAction: "contact_support",
+        reasonCode: "decision_missing_advancing_contract_action",
+        observedAppleSideEffect,
+        incidentRequired: true,
+      };
+    }
+    return {
+      state: "needs_decision",
+      nextAction,
+      reasonCode: "explicit_bound_user_decision_required",
+      observedAppleSideEffect,
+      incidentRequired: false,
+    };
+  }
+
+  if (input.workMotion === "waiting_dependency") {
+    return {
+      state: "quarantined",
+      nextAction: "contact_support",
+      reasonCode: "dependency_wait_missing_provider_blocker",
+      observedAppleSideEffect,
+      incidentRequired: true,
+    };
+  }
+  if (input.workMotion === "retry_scheduled"
+    || input.workMotion === "paused"
+    || input.workMotion === "stalled") {
+    return {
+      state: "quarantined",
+      nextAction: "contact_support",
+      reasonCode: `work_${input.workMotion}_without_actionable_blocker`,
+      observedAppleSideEffect,
+      incidentRequired: true,
     };
   }
 
@@ -209,28 +303,15 @@ export function reduceResolutionFactsV1(
     };
   }
 
-  if (input.workMotion === "waiting_dependency") {
-    return {
-      state: "blocked_dependency",
-      nextAction: "wait_for_dependency",
-      reasonCode: "dependency_wait",
-      observedAppleSideEffect,
-      incidentRequired: false,
-    };
-  }
-  if (input.workMotion === "running"
-    || input.workMotion === "retry_scheduled"
-    || input.workMotion === "paused"
-    || input.workMotion === "stalled") {
+  if (input.workMotion === "running") {
     return {
       state: "executing",
       nextAction: "none",
-      reasonCode: `work_${input.workMotion}`,
+      reasonCode: "work_running",
       observedAppleSideEffect,
       incidentRequired: false,
     };
   }
-
   return {
     state: "accepted",
     nextAction: "none",

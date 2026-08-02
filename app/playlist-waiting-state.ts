@@ -76,6 +76,16 @@ const discoverySignals = [
   "catalog_refill",
 ];
 
+function isTechnicalVerificationRepair(run: WaitingRun): boolean {
+  const phase = run.phase?.trim().toLowerCase() ?? "";
+  return run.resolution?.state === "quarantined"
+    || phase === "capability_evidence_coverage_audit"
+    || phase === "runtime_feasibility_unknown"
+    || phase === "canonical_contract_unknown"
+    || phase === "evidence_verification_unknown"
+    || phase.startsWith("v3_semantic_collapse_");
+}
+
 export function isAutomaticPlaylistHandoff(run: WaitingRun): boolean {
   return run.autoPublish === true
     && (run.status === "visitor_review" || run.status === "manifest_ready");
@@ -118,6 +128,7 @@ export function playlistWorkMotion(run: WaitingRun): PlaylistWorkMotion {
  * even though it contains the word "catalog".
  */
 export function playlistWorkStage(run: WaitingRun): PlaylistWorkStage {
+  if (isTechnicalVerificationRepair(run)) return "verify";
   if (run.resolution?.nextAction === "answer_initial_guidance"
     || run.resolution?.nextAction === "answer_rescue_guidance"
     || run.resolution?.nextAction === "review_contract") return "plan";

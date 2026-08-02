@@ -36,7 +36,9 @@ const workerReplicaCount = releasePhase.phase === "bootstrap" ? 0 : 1;
 // remains in the already-proven schema-20 native-proof activation mode; only the signed
 // cohort literals and their evidence marker change.
 const runtimeDeploymentPhase =
-  releasePhase.phase === "rollout" ? "activate" : releasePhase.phase;
+  releasePhase.phase === "rollout" || releasePhase.phase === "redeploy_native"
+    ? "activate"
+    : releasePhase.phase;
 
 const releaseIdentityVariables = {
   APP_VERSION: releaseVersion,
@@ -45,6 +47,12 @@ const releaseIdentityVariables = {
   RELEASE_DEPLOYMENT_PHASE: runtimeDeploymentPhase,
   RELEASE_EXPECTED_DATABASE_SCHEMA_VERSION: releasePhase.expectedDatabaseSchemaVersion,
   RELEASE_EXECUTION_ENABLED: releasePhase.phase === "bootstrap" ? "false" : "true",
+  // v2.5.4 is the first production artifact whose admission contract requires
+  // the V5.1 checkpoint for every new canonical brief. Pin this on all three
+  // lanes as release identity instead of preserving the v2.5.3 `false` value;
+  // otherwise an immutable v2.5.4 image would deploy successfully while
+  // silently continuing to serve the questionless V4 path.
+  GUIDANCE_V5_ENABLED: "true",
   RELEASE_SECRET_VERSIONS_HASH: releaseSecretVersionsHash,
   ...(releasePhase.phase === "bootstrap"
     ? {
@@ -173,14 +181,6 @@ const stagingWorkerVariables: Record<string, string> = releasePhase.staging
     }
   : {};
 
-// Activate can only use the signed owner-only preflight. Rollout replaces that
-// complete variable set with the signed public transition target; no direct
-// Railway percentage survives either phase.
-const verifiedRolloutVariables =
-  releasePhase.publicRolloutConfiguration
-  ?? releasePhase.activationRollout
-  ?? {};
-
 const promotedReleaseSource = () => image(releaseImage, {
   autoUpdates: { type: "disabled" },
 });
@@ -189,6 +189,44 @@ const preserved = <const Names extends readonly string[]>(names: Names) =>
   Object.fromEntries(names.map((name) => [name, preserve()])) as {
     [Name in Names[number]]: ReturnType<typeof preserve>;
   };
+
+// A native point release changes only the exact artifact and release identity.
+// The schema-20 activation and any signed public-rollout lineage were already
+// proven by the currently healthy deployment and must survive byte-for-byte.
+const nativeRedeployVariables = releasePhase.phase === "redeploy_native"
+  ? preserved([
+      "RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION",
+      "RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION",
+      "RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION",
+      "RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION",
+      "PIPELINE_V3_PROOF_ARCHITECTURE_MODE",
+      "RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH",
+      "RELEASE_PUBLIC_ROLLOUT_STAGE",
+      "RELEASE_PUBLIC_ROLLOUT_EVIDENCE_ENVELOPE_BASE64",
+      "RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH",
+      "RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_ENVELOPE_BASE64",
+      "RELEASE_PUBLIC_ROLLOUT_VERIFICATION_KEY_BASE64",
+      "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH",
+      "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_ENVELOPE_BASE64",
+      "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_VERIFICATION_KEY_BASE64",
+      "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_KEY_ID",
+      "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_KEY_SHA256",
+      "RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_AUTHORITY_POLICY_SHA256",
+      "RELEASE_V254_DIRECT_EXPOSURE_AUTHORITY_HASH",
+      "RELEASE_V254_DIRECT_EXPOSURE_ROLLBACK_WARRANT_HASH",
+      "RELEASE_V254_DIRECT_EXPOSURE_STAGE",
+      "RELEASE_V254_DIRECT_EXPOSURE_TARGET_CONFIGURATION_HASH",
+    ] as const)
+  : {};
+
+// Activate can only use the signed owner-only preflight. Rollout replaces that
+// complete variable set with the signed public transition target; no direct
+// Railway percentage survives either phase. Native redeploy preserves the
+// exact already-authorized activation/rollout settings.
+const verifiedRolloutVariables =
+  releasePhase.publicRolloutConfiguration
+  ?? releasePhase.activationRollout
+  ?? nativeRedeployVariables;
 
 const apiVariables: Record<string, ReturnType<typeof preserve>> =
   releasePhase.phase === "bootstrap" ? {} : preserved([
@@ -249,6 +287,7 @@ const apiVariables: Record<string, ReturnType<typeof preserve>> =
   "PIPELINE_V3_BASELINE_MODEL_ID",
   "PIPELINE_V3_ESCALATION_MODEL_ID",
   "PIPELINE_V3_MODEL_CATALOG_VALIDATED_AT",
+  "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
   "PIPELINE_V3_GENRE_SCENE_PERCENT",
   "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
   "PIPELINE_V3_SIMILARITY_PERCENT",
@@ -315,6 +354,7 @@ const workerVariables: Record<string, ReturnType<typeof preserve>> =
   "PIPELINE_V3_OWNER_CANARY_GROUPS",
   "PIPELINE_V3_OWNER_CANARY_MAX_TRACKS",
   "PIPELINE_V3_ASSIGNMENT_ENABLED",
+  "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
   "PIPELINE_V3_GENRE_SCENE_PERCENT",
   "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
   "PIPELINE_V3_SIMILARITY_PERCENT",
@@ -464,6 +504,8 @@ export default defineRailway((context) => {
       PIPELINE_V3_OWNER_CANARY_GROUPS: needleWorker.env.PIPELINE_V3_OWNER_CANARY_GROUPS,
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS:
         needleWorker.env.PIPELINE_V3_OWNER_CANARY_MAX_TRACKS,
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT:
+        needleWorker.env.PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT,
       PIPELINE_V3_GENRE_SCENE_PERCENT: needleWorker.env.PIPELINE_V3_GENRE_SCENE_PERCENT,
       PIPELINE_V3_MOOD_ACTIVITY_PERCENT:
         needleWorker.env.PIPELINE_V3_MOOD_ACTIVITY_PERCENT,

@@ -320,7 +320,15 @@ function canonicalEngines(
   // suitability floor. They still require the mood/activity execution lane;
   // deriving engines only from hard membership axes silently dropped that
   // lane for requests such as "dark ambient for sleep".
-  if (contract.qualityPolicy.centralSuitabilityClauseIds.length > 0) {
+  const centralSuitabilityAxes = new Set(
+    contract.qualityPolicy.centralSuitabilityClauseIds.flatMap((id) => {
+      const clause = contract.clauses.find((candidate) => candidate.id === id);
+      return clause ? [clause.axis] : [];
+    }),
+  );
+  if ([...centralSuitabilityAxes].some((axis) => (
+    ["mood", "activity", "theme", "central_suitability"].includes(axis)
+  ))) {
     engines.add("mood_activity_theme");
   }
   if ([...axes].some((axis) => ["genre", "subgenre", "scene", "geography", "language"].includes(axis))) {
@@ -507,6 +515,25 @@ function canonicalRankingObjectives(
 }
 
 /**
+ * Keep rollout/executor intent ownership derived from the same canonical
+ * objectives that the worker consumes. Historical influence is a ranking
+ * objective rather than a membership engine, so deriving intents from hard
+ * predicate engines alone would silently move an accepted editorial request
+ * into the generic genre cohort after guidance created its successor
+ * contract.
+ */
+function canonicalExecutionIntents(
+  engines: readonly IntentEngineV3[],
+  rankingObjectives: readonly RankingObjectiveV3[],
+): IntentV3[] {
+  const intents = new Set<IntentV3>(intentsForEngines(engines));
+  if (rankingObjectives.some(({ dimension }) => dimension === "influence")) {
+    intents.add("editorial_ranking");
+  }
+  return [...intents];
+}
+
+/**
  * Preserve only non-resolved concepts whose clause has no executable role.
  * These values may widen discovery, but never enter a predicate, evidence
  * obligation, ranking objective, quota, quality floor, or sequencing rule.
@@ -571,6 +598,11 @@ function canonicalSelectionPlanV3(input: {
   const semanticClauses = semantic;
   const catalogPolicies = semantic.filter(({ role }) => role === "catalog_policy");
   const engines = canonicalEngines(input.contract, predicates);
+  const rankingObjectives = canonicalRankingObjectives(
+    input.contract,
+    input.qualityPolicy,
+  );
+  const intents = canonicalExecutionIntents(engines, rankingObjectives);
   const scopeKind = canonicalScopeKind(input.contract, engines);
   const summary = input.policy.clauses
     .map((clause) => `${clause.axis} ${clause.operator} ${clause.values.join(" or ")}`)
@@ -588,12 +620,12 @@ function canonicalSelectionPlanV3(input: {
     prompt: summary,
     requestedTrackCount: input.contract.requestedTrackCount,
     storefront: input.contract.storefront,
-    intents: intentsForEngines(engines),
+    intents,
     engines,
     membershipPredicates: predicates.filter((predicate) => (
       predicate.axis !== "recording_version" && predicate.axis !== "content"
     )),
-    rankingObjectives: canonicalRankingObjectives(input.contract, input.qualityPolicy),
+    rankingObjectives,
     scopeKind,
     hardConstraints: [],
     softPreferences: [],
@@ -678,7 +710,10 @@ function canonicalCompatibilityPlanV2(
     }];
   });
   const engines = canonicalEngines(contract, canonicalMembershipPredicates(contract));
-  const intents = intentsForEngines(engines) as ResearchIntent[];
+  const intents = canonicalExecutionIntents(
+    engines,
+    canonicalRankingObjectives(contract, null),
+  ) as ResearchIntent[];
   const archetypeFor: Partial<Record<ResearchIntent, ResearchArchetype>> = {
     genre_scene: "genre_scene",
     similarity: "similarity",

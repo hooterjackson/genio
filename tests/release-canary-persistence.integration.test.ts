@@ -1,8 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { Pool } from "pg";
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from "vitest";
 import { createDatabase } from "../db/index.ts";
+import {
+  EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+  type ExecutionRouteReceiptV1,
+} from "../server/execution-route-receipt-v1.ts";
 import { buildPipelineOutcome } from "../server/pipeline-outcome-v2.ts";
 import { readReleaseCanaryInventory } from "../server/release-canary-inventory.ts";
 import { persistReleaseCanaryMarker } from "../server/release-canary-persistence.ts";
@@ -101,6 +114,10 @@ databaseDescribe("release-canary durable persistence", () => {
          ('release_manifest_canary_guards_version','1')`,
     );
   }, 30_000);
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
 
   afterAll(async () => {
     if (repository) await repository.close();
@@ -871,6 +888,133 @@ databaseDescribe("release-canary durable persistence", () => {
         { operation: "brief", count: 1 },
         { operation: "run", count: 1 },
       ],
+    });
+  });
+
+  test("keeps ordinary owner refreshes on the public route and grants V2 canary routing only to signed authority", async () => {
+    vi.stubEnv("SOURCE_COMMIT_SHA", "a".repeat(40));
+    vi.stubEnv("APPLE_STOREFRONT", "us");
+    vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "false");
+    vi.stubEnv("PIPELINE_V2_OWNER_CANARY", "true");
+    vi.stubEnv("PIPELINE_V2_CURATED_PERCENT", "0");
+    vi.stubEnv("PIPELINE_V2_SIMILARITY_PERCENT", "0");
+    const routeBrief: PlaylistBrief = {
+      title: "Route authority fixture",
+      description: "A deterministic three-track curated playlist.",
+      mode: "curated",
+      subjectEntities: ["House music"],
+      relationship: "genre membership",
+      include: ["officially released house recordings"],
+      exclude: ["unreleased recordings"],
+      versionPolicy: "canonical studio recordings",
+      evidencePolicy: "verified or corroborated",
+      orderingPolicy: "smooth energy progression",
+      targetSize: { min: 3, max: 3 },
+      ambiguities: [],
+    };
+    const createDirect = (
+      label: string,
+      forceFreshResearch: boolean,
+    ) => repository.createRunIdempotent({
+      prompt: "Build three house tracks",
+      brief: routeBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket: `route-parity-${label}`,
+      clientBucketAliases: [`route-parity-${label}`],
+      idempotencyKey: randomUUID(),
+      autoPublish: false,
+      reuseDays: 30,
+      globalLimit: 100,
+      forceFreshResearch,
+    });
+    const publicRun = await createDirect("public", false);
+    const ownerRefresh = await createDirect("owner-refresh", true);
+    const parity = await pool.query<{
+      id: string;
+      pipeline_version: string;
+      receipt: ExecutionRouteReceiptV1;
+    }>(
+      `SELECT run.id,run.pipeline_version,receipt.state_json receipt
+       FROM research_runs run
+       JOIN research_checkpoints receipt
+         ON receipt.run_id=run.id AND receipt.phase=$2
+       WHERE run.id=ANY($1::uuid[])
+       ORDER BY array_position($1::uuid[],run.id)`,
+      [
+        [publicRun.runId, ownerRefresh.runId],
+        EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+      ],
+    );
+    expect(parity.rows).toHaveLength(2);
+    for (const row of parity.rows) {
+      expect(row).toMatchObject({
+        pipeline_version: "legacy_v1",
+        receipt: {
+          trafficClass: "public",
+          executionRoute: "legacy_v1",
+          assignmentAuthority: {
+            kind: "legacy_control",
+            assignmentReason: "legacy_control",
+          },
+        },
+      });
+    }
+
+    const canaryId = `signed-v2-${randomUUID()}`;
+    const canaryBucket = `signed-v2-${randomUUID()}`;
+    const canaryBrief = await repository.createBriefRequest({
+      prompt: "Build three house tracks",
+      requestedTrackCount: 3,
+      model: "test-model",
+      clientBucket: canaryBucket,
+      clientBucketAliases: [canaryBucket],
+      idempotencyKey: randomUUID(),
+      releaseCanary: marker("brief", canaryId),
+    });
+    await repository.saveBriefResult(canaryBrief.id, {
+      status: "complete",
+      brief: routeBrief,
+      estimateUsd: 0,
+    });
+    const signed = await repository.createRunIdempotent({
+      prompt: "Build three house tracks",
+      briefRequestId: canaryBrief.id,
+      brief: routeBrief,
+      estimateUsd: 0,
+      approvedBudgetUsd: 1,
+      clientBucket: canaryBucket,
+      clientBucketAliases: [canaryBucket],
+      idempotencyKey: randomUUID(),
+      autoPublish: false,
+      reuseDays: 30,
+      globalLimit: 100,
+      forceFreshResearch: true,
+      releaseCanary: marker("run", canaryId),
+      releaseCanaryOwnerAuthorized: true,
+    });
+    const signedRoute = (await pool.query<{
+      pipeline_version: string;
+      receipt: ExecutionRouteReceiptV1;
+    }>(
+      `SELECT run.pipeline_version,receipt.state_json receipt
+       FROM research_runs run
+       JOIN research_checkpoints receipt
+         ON receipt.run_id=run.id AND receipt.phase=$2
+       WHERE run.id=$1`,
+      [signed.runId, EXECUTION_ROUTE_RECEIPT_PHASE_V1],
+    )).rows[0]!;
+    expect(signedRoute).toMatchObject({
+      pipeline_version: "catalog_first_v2",
+      receipt: {
+        trafficClass: "owner_canary",
+        executionRoute: "catalog_first_v2",
+        assignmentAuthority: {
+          kind: "signed_owner_canary",
+          intentGroup: "curated_core",
+          assignmentReason: "owner_canary",
+        },
+      },
     });
   });
 

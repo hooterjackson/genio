@@ -39,6 +39,9 @@ import {
   MUSIC_CONCEPT_POLICY_VERSION,
 } from "./music-concepts-v3.ts";
 import { excludedReferenceArtists } from "./similarity-policy.ts";
+import {
+  hasHistoricalInfluenceSemanticsV1,
+} from "./historical-influence-semantics-v1.ts";
 
 export const PIPELINE_V3_VERSION = "corpus_first_v3" as const;
 export const PIPELINE_V3_POLICY_VERSION = "corpus_first_v3_policy_v1" as const;
@@ -394,6 +397,7 @@ const GEOGRAPHIC_QUALIFIERS: readonly GeographicQualifierV3[] = [
   { aliases: ["french", "france"], scenePrefix: "French", originValue: "France", languageValue: "French", ambiguousBareGenre: true },
   { aliases: ["german", "germany"], scenePrefix: "German", originValue: "Germany", languageValue: "German" },
   { aliases: ["italian", "italy"], scenePrefix: "Italian", originValue: "Italy", languageValue: "Italian" },
+  { aliases: ["irish", "ireland"], scenePrefix: "Irish", originValue: "Ireland" },
   { aliases: ["japanese", "japan"], scenePrefix: "Japanese", originValue: "Japan", languageValue: "Japanese" },
   { aliases: ["nigerian", "nigeria"], scenePrefix: "Nigerian", originValue: "Nigeria" },
   { aliases: ["jamaican", "jamaica"], scenePrefix: "Jamaican", originValue: "Jamaica", languageValue: "English" },
@@ -532,6 +536,27 @@ function explicitRawGeographicPredicates(rawPrompt: string): MembershipPredicate
         `The request explicitly requires ${qualifier.languageValue}-language recordings.`,
         "language",
       ));
+    } else if (relationship === "unspecified") {
+      const intrinsicMusicScope = qualifier.aliases.some((alias) => (
+        new RegExp(
+          `\\b${escapedPattern(alias)}\\s+(?:music|songs?|tracks?|recordings?|playlist|mix)\\b`,
+          "u",
+        ).test(normalizedPrompt)
+      ));
+      if (intrinsicMusicScope) {
+        // A broad national-music request is hard membership even when the
+        // listener has not chosen between artist origin and documented scene
+        // association. Either proof route may satisfy this one broad
+        // geography obligation; neither is silently reinterpreted as
+        // language or recording location.
+        predicates.push(predicate(
+          "geography",
+          "require",
+          [qualifier.originValue],
+          `The request explicitly requires music bound to ${qualifier.originValue} by exact artist origin or a documented local scene association.`,
+          "unspecified",
+        ));
+      }
     }
   }
   return predicates;
@@ -1030,7 +1055,7 @@ function semanticClauseFromPredicate(value: MembershipPredicateV3): SemanticPlan
 
 function semanticClauseFromObjective(value: RankingObjectiveV3, rawPrompt: string): SemanticPlanClauseV32 {
   const explicit = value.dimension === "influence"
-    ? /\b(?:influential|foundational|important|landmark|shaped)\b/iu.test(rawPrompt)
+    ? hasHistoricalInfluenceSemanticsV1(rawPrompt)
     : value.dimension === "similarity"
       ? new RegExp(`\\b(?:${SIMILARITY_CUE_SOURCE}|${REFERENCE_POINT_CUE_SOURCE})\\b`, "iu").test(rawPrompt)
       : value.values.length > 0 && value.values.some((item) => normalize(rawPrompt).includes(normalize(item)));
@@ -1300,7 +1325,7 @@ export function createRunSpecV3(input: RunSpecV3Input): RunSpecV3 {
   if (/\b(?:for (?:sleep|studying|study|running|work|dinner|party|road trip|gaming|a smoke session)|workout|focus|relaxing|calm|upbeat|dark|melanchol|gaming|smoking|late[ -]?night|chill(?:ed|ing)?)\b/u.test(prompt)) {
     intents.push("mood_activity");
   }
-  if (/\b(?:influential|foundational|essential|important|best|canonical|iconic)\b/u.test(prompt)) {
+  if (hasHistoricalInfluenceSemanticsV1(prompt)) {
     intents.push("editorial_ranking");
     objectives.push(objective("influence", "maximize", 0.9, null, "Rank only eligible tracks by documented influence."));
   }

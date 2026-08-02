@@ -13,6 +13,10 @@ const args = process.argv.slice(2).filter((argument) => argument !== "--");
 const requireTag = args.includes("--require-tag");
 const exactTagIndex = args.indexOf("--require-exact-tag");
 const exactTag = exactTagIndex >= 0 ? args[exactTagIndex + 1]?.trim() : null;
+const nativeStableTagIndex = args.indexOf("--require-native-stable-tag");
+const nativeStableTag = nativeStableTagIndex >= 0
+  ? args[nativeStableTagIndex + 1]?.trim()
+  : null;
 const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u;
 const isoDate = /^\d{4}-\d{2}-\d{2}$/u;
 const errors = [];
@@ -20,8 +24,20 @@ const errors = [];
 if (exactTagIndex >= 0 && (!exactTag || exactTag.startsWith("--"))) {
   errors.push("--require-exact-tag requires vX.Y.Z-rc.N");
 }
-if (requireTag && exactTagIndex >= 0) {
-  errors.push("--require-tag and --require-exact-tag are mutually exclusive");
+if (
+  nativeStableTagIndex >= 0
+  && (!nativeStableTag || nativeStableTag.startsWith("--"))
+) {
+  errors.push("--require-native-stable-tag requires vX.Y.Z");
+}
+if (
+  [requireTag, exactTagIndex >= 0, nativeStableTagIndex >= 0]
+    .filter(Boolean).length > 1
+) {
+  errors.push(
+    "--require-tag, --require-exact-tag, and --require-native-stable-tag "
+    + "are mutually exclusive",
+  );
 }
 
 function semverParts(value) {
@@ -42,13 +58,14 @@ function compareSemver(left, right) {
   return String(a[3]).localeCompare(String(b[3]));
 }
 
-if (manifest.schemaVersion !== 1) errors.push("shared/releases.json must use schemaVersion 1");
+if (manifest.schemaVersion !== 2) errors.push("shared/releases.json must use schemaVersion 2");
 if (!Array.isArray(manifest.releases) || manifest.releases.length === 0) {
   errors.push("shared/releases.json must contain at least one release");
 }
 
 const releases = Array.isArray(manifest.releases) ? manifest.releases : [];
 const versions = new Set();
+let candidateCount = 0;
 for (const [index, release] of releases.entries()) {
   const label = `releases[${index}]`;
   if (!release || typeof release !== "object") {
@@ -62,8 +79,18 @@ for (const [index, release] of releases.entries()) {
   } else {
     versions.add(release.version);
   }
-  if (typeof release.releasedAt !== "string" || !isoDate.test(release.releasedAt)
-    || Number.isNaN(Date.parse(`${release.releasedAt}T00:00:00.000Z`))) {
+  const candidate = release.status === "candidate";
+  if (candidate) candidateCount += 1;
+  if (release.status !== undefined && release.status !== "candidate") {
+    errors.push(`${label}.status must be candidate when present`);
+  }
+  if (candidate && (index !== 0 || release.releasedAt !== null)) {
+    errors.push(`${label} candidate must be first and have releasedAt null`);
+  } else if (!candidate && (
+    typeof release.releasedAt !== "string"
+    || !isoDate.test(release.releasedAt)
+    || Number.isNaN(Date.parse(`${release.releasedAt}T00:00:00.000Z`))
+  )) {
     errors.push(`${label}.releasedAt must be a valid YYYY-MM-DD date`);
   }
   if (typeof release.title !== "string" || release.title.trim().length < 3 || release.title.length > 100) {
@@ -95,20 +122,40 @@ for (const [index, release] of releases.entries()) {
     }
   }
 }
+if (candidateCount > 1) {
+  errors.push("shared/releases.json may contain at most one release candidate");
+}
 
 const currentVersion = releases[0]?.version;
 if (currentVersion !== packageMetadata.version) {
   errors.push(`package.json version ${packageMetadata.version} must match the current release ${currentVersion ?? "(missing)"}`);
 }
+if (requireTag && releases[0]?.status === "candidate") {
+  errors.push("Stable release validation requires promoting the candidate metadata to released");
+}
+if (nativeStableTagIndex >= 0 && releases[0]?.status !== "candidate") {
+  errors.push(
+    "Native stable-tag validation is reserved for an immutable candidate "
+    + "source finalized by external production evidence",
+  );
+}
 
 const requiredTag = requireTag
   ? `v${packageMetadata.version}`
-  : exactTag;
+  : exactTag ?? nativeStableTag;
 if (exactTag && !new RegExp(
   `^v${String(packageMetadata.version).replaceAll(".", "\\.")}-rc\\.[1-9]\\d*$`,
   "u",
 ).test(exactTag)) {
   errors.push(`Release-candidate tag must match v${packageMetadata.version}-rc.N`);
+}
+if (
+  nativeStableTag
+  && nativeStableTag !== `v${String(packageMetadata.version)}`
+) {
+  errors.push(
+    `Native stable tag must match v${String(packageMetadata.version)}`,
+  );
 }
 
 if (requiredTag && typeof packageMetadata.version === "string") {

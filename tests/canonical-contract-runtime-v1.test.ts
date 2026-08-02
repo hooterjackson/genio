@@ -3,6 +3,7 @@ import {
   assertCanonicalContractExecutionPolicyV1,
   canonicalEvidenceGradeForBindingV1,
   canonicalContractExecutionPolicyV1,
+  evaluateCanonicalContractTrackEvidenceStateV1,
   evaluateCanonicalContractTrackV1,
 } from "../server/canonical-contract-runtime-v1.ts";
 import {
@@ -140,6 +141,34 @@ describe("canonical contract runtime authority", () => {
     })).toMatchObject({ status: "unknown", eligible: false });
   });
 
+  test("retains observed unknown when fail-closed policy rejects selection", () => {
+    const base = draft();
+    const policy = canonicalContractExecutionPolicyV1(
+      compilePlaylistContractRevisionV1({
+        ...base,
+        clauses: base.clauses
+          .filter(({ id }) => id === "genre:reggaeton")
+          .map((clause) => ({
+            ...clause,
+            unknownPolicy: "reject" as const,
+          })),
+        trackPredicate: { op: "clause", clauseId: "genre:reggaeton" },
+      }),
+    );
+    const assessments = {
+      "genre:reggaeton": { status: "unknown" as const },
+    };
+
+    expect(evaluateCanonicalContractTrackV1({
+      policy,
+      assessments,
+    })).toMatchObject({ status: "fail", eligible: false });
+    expect(evaluateCanonicalContractTrackEvidenceStateV1({
+      policy,
+      assessments,
+    })).toMatchObject({ status: "unknown", eligible: false });
+  });
+
   test("hash-fences the complete executable projection", () => {
     const policy = canonicalContractExecutionPolicyV1(
       compilePlaylistContractRevisionV1(draft()),
@@ -156,6 +185,56 @@ describe("canonical contract runtime authority", () => {
       ...policy,
       evidenceStrengthPolicyVersion: "future_strength_policy" as never,
     })).toThrow("invalid_canonical_contract_runtime_policy");
+  });
+
+  test("projects central suitability as a positive evidence obligation without hardening membership", () => {
+    const base = draft();
+    const qualityClauseId = "quality:historical-influence";
+    const policy = canonicalContractExecutionPolicyV1(
+      compilePlaylistContractRevisionV1({
+        ...base,
+        clauses: [
+          ...base.clauses,
+          {
+            id: qualityClauseId,
+            kind: "suitability",
+            scope: "track",
+            hardness: "soft",
+            axis: "influence",
+            operator: "prefer",
+            values: ["documented historical influence"],
+            source: {
+              provenance: "prompt",
+              text: "influential",
+            },
+            evidence: {
+              required: true,
+              minimumGrade: null,
+              permittedGrades: [
+                "track_specific_editorial_assertion",
+                "independent_secondary_source",
+              ],
+            },
+            unknownPolicy: "defer",
+          },
+        ],
+        qualityPolicy: {
+          ...base.qualityPolicy,
+          centralSuitabilityClauseIds: [qualityClauseId],
+        },
+      }),
+    );
+
+    expect(policy.clauses).toContainEqual(expect.objectContaining({
+      id: qualityClauseId,
+      kind: "suitability",
+      axis: "influence",
+      operator: "require",
+      unknownPolicy: "defer",
+    }));
+    expect(JSON.stringify(policy.trackPredicate)).not.toContain(qualityClauseId);
+    expect(() => assertCanonicalContractExecutionPolicyV1(policy))
+      .not.toThrow();
   });
 
   test("fails closed below, across, or outside the evidence-grade partial order", () => {

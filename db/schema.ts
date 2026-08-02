@@ -385,7 +385,7 @@ export const guidanceQuestionSets = pgTable("guidance_question_sets", {
   check("guidance_question_sets_owner_valid", sql`num_nonnulls(${table.briefRequestId}, ${table.runId}) = 1`),
   check("guidance_question_sets_round_valid", sql`${table.guidanceRound} IN ('initial','rescue')`),
   check("guidance_question_sets_trigger_valid", sql`${table.trigger} IN ('correctness','yield_risk','nuance')`),
-  check("guidance_question_sets_checkpoint_mode_valid", sql`${table.checkpointMode} IS NULL OR ${table.checkpointMode} IN ('correctness_blocking','nuance_optional','interpretation_confirmation')`),
+  check("guidance_question_sets_checkpoint_mode_valid", sql`${table.checkpointMode} IS NULL OR ${table.checkpointMode} IN ('correctness_blocking','nuance_optional','interpretation_confirmation','execution_decision')`),
 ]);
 
 export const guidanceAnswerSets = pgTable("guidance_answer_sets", {

@@ -51,6 +51,7 @@ function phasePayload(
     PIPELINE_V3_ASSIGNMENT_ENABLED: "true",
     PIPELINE_V3_OWNER_CANARY: "true",
     PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
+    PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
     PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
     PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
     PIPELINE_V3_SIMILARITY_PERCENT: "0",
@@ -228,10 +229,33 @@ describe("signed Railway promotion phase evidence", () => {
       PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
       PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
       PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
       GUIDANCE_CONTRACT_V3_ENABLED: "false",
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
       GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED: "false",
+    });
+    const baseForEditorial = phasePayload("expand");
+    const editorialPreflight = baseForEditorial.activationPreflight as any;
+    expect(verifyPromotionPhaseEvidence(
+      signedPhase("expand", {
+        activationPreflight: {
+          ...editorialPreflight,
+          ownerCandidateRoute: {
+            ...editorialPreflight.ownerCandidateRoute,
+            groups: ["editorial_influence"],
+          },
+          activationConfiguration: {
+            ...editorialPreflight.activationConfiguration,
+            PIPELINE_V3_OWNER_CANARY_GROUPS: "editorial_influence",
+          },
+        },
+      }),
+      keys.publicKey,
+      options("expand"),
+    ).activationRollout).toMatchObject({
+      PIPELINE_V3_OWNER_CANARY_GROUPS: "editorial_influence",
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
     });
     const base = phasePayload("expand");
     expect(() => verifyPromotionPhaseEvidence(

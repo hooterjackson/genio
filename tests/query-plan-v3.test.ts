@@ -252,10 +252,11 @@ describe("query plan V3", () => {
       playlistContractRevisionId: contractRevisionId,
       playlistContractSemanticHash: contractSemanticHash,
       playlistContractCompilerVersion: contract.versions.compiler,
+      guidancePolicyVersion: "adaptive_guidance_v5",
     });
     expect(verificationQuery).toMatchObject({
       schemaVersion: 6,
-      guidancePolicyVersion: "adaptive_guidance_v4",
+      guidancePolicyVersion: "adaptive_guidance_v5",
       inputHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
       semanticHash: contractSemanticHash,
       executionHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
@@ -557,6 +558,20 @@ describe("query plan V3", () => {
     )).toBe("mood_activity_theme");
   });
 
+  test("routes compiler-derived historical influence before the broad genre cohort", () => {
+    const influence = confirmed("Infuential irish music", 25);
+    expect(influence.intents).toContain("editorial_ranking");
+    expect(influence.rankingObjectives).toContainEqual(expect.objectContaining({
+      dimension: "influence",
+    }));
+    expect(pipelineV3RolloutGroup(influence)).toBe("editorial_influence");
+
+    // A stronger execution class remains authoritative for composite work.
+    expect(pipelineV3RolloutGroup(
+      confirmed("Paulinho da Costa's 25 most influential recordings", 25),
+    )).toBe("factual_relationship");
+  });
+
   test("persists similarity seeds for worker rehydration while accepting legacy objectives without values", () => {
     const query = createQueryPlanV3(
       confirmed("100 songs like Radiohead but do not include Radiohead", 100),
@@ -700,6 +715,34 @@ describe("query plan V3", () => {
       stickyKey: "owner",
       env,
     })).toMatchObject({ assigned: false, reason: "production_evidence_required", group: "factual_relationship" });
+
+    const influence = confirmed("Infuential irish music", 25);
+    expect(assignPipelineV3({
+      plan: influence,
+      owner: true,
+      stickyKey: "owner",
+      env: {
+        ...env,
+        PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "true",
+      },
+    })).toMatchObject({
+      assigned: false,
+      group: "editorial_influence",
+    });
+    expect(assignPipelineV3({
+      plan: influence,
+      owner: true,
+      stickyKey: "owner",
+      env: {
+        ...env,
+        PIPELINE_V3_OWNER_CANARY_GROUPS: "editorial_influence",
+        PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED: "true",
+      },
+    })).toMatchObject({
+      assigned: true,
+      reason: "owner_canary",
+      group: "editorial_influence",
+    });
   });
 
   test("geographic evidence safety applies to owner canaries", () => {

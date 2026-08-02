@@ -20,8 +20,14 @@ export default function AboutPage() {
           <p>ABOUT GÊNIO</p>
           <h1 id="about-title">gênio <span>v{currentRelease.version}</span></h1>
           <div className="about-release-line">
-            <span>CURRENT RELEASE</span>
-            <time dateTime={currentRelease.releasedAt}>{formatReleaseDate(currentRelease.releasedAt)}</time>
+            <span>{currentRelease.status === "candidate"
+              ? "RELEASE CANDIDATE"
+              : "CURRENT RELEASE"}</span>
+            {currentRelease.releasedAt
+              ? <time dateTime={currentRelease.releasedAt}>
+                  {formatReleaseDate(currentRelease.releasedAt)}
+                </time>
+              : <span>PROOF PENDING</span>}
           </div>
           <p className="about-intro">Deep music research, assembled into public Apple Music playlists. Release history and the deployed API build are shown below.</p>
         </header>
@@ -42,7 +48,11 @@ export default function AboutPage() {
                       <span>{index === 0 ? "CURRENT" : "ARCHIVE"}</span>
                       <h3>v{release.version} · {release.title}</h3>
                     </div>
-                    <time dateTime={release.releasedAt}>{formatReleaseDate(release.releasedAt)}</time>
+                    {release.releasedAt
+                      ? <time dateTime={release.releasedAt}>
+                          {formatReleaseDate(release.releasedAt)}
+                        </time>
+                      : <span>RELEASE CANDIDATE · PROOF PENDING</span>}
                   </div>
                   <ul>
                     {release.notes.map((note) => <li key={note}>{note}</li>)}

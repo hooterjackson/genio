@@ -110,6 +110,7 @@ function configuration(
     PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
     PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
     PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+    PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
     PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
     PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
     PIPELINE_V3_SIMILARITY_PERCENT: "0",
@@ -1082,25 +1083,27 @@ describe("signed public cohort rollout evidence", () => {
     )).toThrow(/owner candidate route/u);
   });
 
-  test("finalization requires a fresh completed 100% rollout while prior Sites stayed live", () => {
-    const fullyRolledOut = {
-      PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
-      PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "100",
-      PIPELINE_V3_SIMILARITY_PERCENT: "100",
-      PIPELINE_V3_ARTIST_CATALOGUE_PERCENT: "100",
-      PIPELINE_V3_FIXED_CONTAINER_PERCENT: "100",
-      PIPELINE_V3_FACTUAL_PERCENT: "100",
-      PIPELINE_V3_EXHAUSTIVE_PERCENT: "100",
+  test("finalization requires the fresh completed editorial-only rollout while prior Sites stayed live", () => {
+    const editorialOnlyTarget = {
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "100",
+      PIPELINE_V3_GENRE_SCENE_PERCENT: "0",
+      PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
+      PIPELINE_V3_SIMILARITY_PERCENT: "0",
+      PIPELINE_V3_ARTIST_CATALOGUE_PERCENT: "0",
+      PIPELINE_V3_FIXED_CONTAINER_PERCENT: "0",
+      PIPELINE_V3_FACTUAL_PERCENT: "0",
+      PIPELINE_V3_EXHAUSTIVE_PERCENT: "0",
     };
     const finalApprovals = {
       PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED: "true",
     };
     const current = configuration({
-      ...fullyRolledOut,
-      PIPELINE_V3_GENRE_SCENE_PERCENT: "50",
+      ...editorialOnlyTarget,
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "50",
     }, finalApprovals);
-    const target = configuration(fullyRolledOut, finalApprovals);
+    const target = configuration(editorialOnlyTarget, finalApprovals);
     const complete = signed({
+      intentGroup: "editorial_influence",
       fromPercent: "50",
       toPercent: "100",
       current,
@@ -1127,6 +1130,7 @@ describe("signed public cohort rollout evidence", () => {
     );
     expect(verification).toMatchObject({
       operation: "advance",
+      intentGroup: "editorial_influence",
       fromPercent: "50",
       toPercent: "100",
     });
@@ -1166,16 +1170,18 @@ describe("signed public cohort rollout evidence", () => {
         expectedSitesRevision: priorSitesRevision,
         minimumSoakStartedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
       },
-    )).toThrow(/completed signed backend cohort rollout to 100%/u);
+    )).toThrow(/completed signed editorial-influence rollout to 100%/u);
     expect(() => verifyPublicRolloutFinalizationLineage(
       signed({
+        intentGroup: "editorial_influence",
         fromPercent: "50",
         toPercent: "100",
         current: configuration({
-          PIPELINE_V3_GENRE_SCENE_PERCENT: "50",
+          PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "50",
         }),
         target: configuration({
-          PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
+          PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "100",
+          PIPELINE_V3_GENRE_SCENE_PERCENT: "1",
         }),
         previousRolloutEvidenceHash: "7".repeat(64),
       }),
@@ -1196,6 +1202,6 @@ describe("signed public cohort rollout evidence", () => {
         minimumSoakStartedAt:
           new Date(Date.now() - 5 * 60_000).toISOString(),
       },
-    )).toThrow(/every governed intent cohort at 100%/u);
+    )).toThrow(/change exactly one signed intent cohort/u);
   });
 });
