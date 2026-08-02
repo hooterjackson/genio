@@ -26,8 +26,21 @@ import {
 } from "./selection-geography-policy.ts";
 import { compileFixedTrackList } from "./fixed-track-list-policy.ts";
 import { excludedReferenceArtists } from "./similarity-policy.ts";
+import {
+  hasHistoricalInfluenceSemanticsV1,
+  softEditorialDescriptorTermsV1,
+} from "./historical-influence-semantics-v1.ts";
 
 export const PIPELINE_V2_SELECTION_PLAN_VERSION = PIPELINE_POLICY_VERSION;
+/**
+ * Stable compiler-owned signal for a user-authored influence objective.
+ *
+ * Downstream guidance consumes this typed artifact, never the raw prompt. The
+ * value is deliberately not a natural-language query so it cannot be confused
+ * with model prose or silently become a hard evidence predicate.
+ */
+export const SELECTION_INFLUENCE_SCOPE_SIGNAL_V1 =
+  "semantic:historical_influence" as const;
 
 const EXHAUSTIVE_INTENT = /\b(?:every|all|complete|entire|exhaustive)\b.{0,100}\b(?:songs?|tracks?|recordings?|releases?|credits?|discograph(?:y|ies)|catalog(?:ue)?)\b/iu;
 const SIMILARITY_INTENT = /\b(?:sounds?\s+like|songs?\s+like|tracks?\s+like|similar\s+to|resembl|adjacent\s+to|in\s+the\s+(?:style|vein)\s+of|for\s+fans\s+of|artists?\s+like)\b/iu;
@@ -39,9 +52,6 @@ const VIBE_INTENT = /\bvibes?\b/iu;
 // such as "iconic", "classic", and "essential" are useful ordering signals,
 // but making them an intent rejected otherwise well-supported genre tracks
 // whenever a source did not literally describe each recording that way.
-const EDITORIAL_RANKING_INTENT = /\b(?:best|greatest|top(?:\s+\d+)?|ranked|ranking|influential|important|foundational|landmark|history\s+of|shaped)\b/iu;
-const EXPLICIT_EDITORIAL_EVIDENCE_INTENT = /\b(?:require|required|must|only)\b[^.;!?\n]{0,100}\b(?:editorial|historical|documented|cited|ranking|ranked|influence)\b|\b(?:editorial|historical|documented|cited)\b[^.;!?\n]{0,100}\bevidence\b/iu;
-const SOFT_EDITORIAL_DESCRIPTOR = /\b(?:essential|iconic|classic|definitive|representative)\b/giu;
 const ARTIST_CATALOGUE_INTENT = /\b(?:discograph|catalog(?:ue)?|songs?\s+by|tracks?\s+by|recordings?\s+by|artist\s+catalog)\b/iu;
 const GENRE_SCENE_INTENT = /\b(?:genre|subgenre|scene|jazz|techno|house|drill|funk|ambient|footwork|hip[ -]?hop|rap|r\s*(?:&|and)\s*b|rhythm\s+and\s+blues|rock|samba|bossa|disco|soul|metal|punk|reggaet[oó]n|reggae|latin[ -]?urban|dembow|classical|country|electronic)\b/iu;
 const THEME_INTENT_MENTION = /\b(?:(?:songs?|tracks?|recordings?|music)\s+about|lyrics?\s+about|themes?|themed)\b/giu;
@@ -201,6 +211,17 @@ function normalized(value: string): string {
     .replace(/\s+/gu, " ");
 }
 
+/**
+ * Resolve a general influence concept at the compiler boundary. Typo
+ * tolerance is deliberately narrow and applies only to long musical intent
+ * terms; there is no nationality, country, artist, or prompt-template rule.
+ */
+export function selectionPromptHasInfluenceScopeSignalV1(
+  prompt: string,
+): boolean {
+  return hasHistoricalInfluenceSemanticsV1(prompt);
+}
+
 const EXPLICIT_EXCLUSION_CUE = /\b(?:exclude|avoid|without|no|not|never|do\s+not|don't)\b/iu;
 const EXCLUSION_MATCH_STOPWORDS = new Set([
   "about", "and", "exclude", "include", "merely", "never", "not", "only", "recording", "recordings",
@@ -246,8 +267,7 @@ function unique(values: readonly string[]): string[] {
 }
 
 function softEditorialDescriptors(prompt: string): string[] {
-  return unique([...prompt.matchAll(SOFT_EDITORIAL_DESCRIPTOR)]
-    .map((match) => match[0].toLocaleLowerCase("en-US")));
+  return softEditorialDescriptorTermsV1(prompt);
 }
 
 /**
@@ -316,8 +336,7 @@ function intentSet(prompt: string, brief: PlaylistBrief): ResearchIntent[] {
   // similar while describing a genre survey. That is not a direct-artist
   // catalogue request and must not disable broad-playlist diversity rules.
   if (ARTIST_CATALOGUE_INTENT.test(directIntentScope)) intents.push("artist_catalogue");
-  if (EDITORIAL_RANKING_INTENT.test(directIntentScope)
-    || EXPLICIT_EDITORIAL_EVIDENCE_INTENT.test(directIntentScope)) {
+  if (hasHistoricalInfluenceSemanticsV1(directIntentScope)) {
     intents.push("editorial_ranking");
   }
   if (genreSceneIntent) intents.push("genre_scene");
@@ -597,6 +616,16 @@ function constraintsForBrief(
       "soft",
       2,
       parsed.geographyRelationship ?? null,
+    );
+  }
+  if (selectionPromptHasInfluenceScopeSignalV1(prompt)) {
+    add(
+      "influence_scope_signal",
+      "relationship",
+      "prefer",
+      [SELECTION_INFLUENCE_SCOPE_SIGNAL_V1],
+      "soft",
+      0,
     );
   }
   // Words such as "iconic" and "essential" express a curation preference,
@@ -1185,14 +1214,16 @@ function rolloutPercentage(value: string | undefined): number {
 }
 
 /**
- * Stable rollout assignment. Owner-curated runs are the first canary; public
- * traffic advances only when the explicit percentage is raised. Factual and
- * exhaustive work has a separate switch because its claim/frontier benchmark
- * must pass independently of curated genre and mood playlists.
+ * Stable rollout assignment. A server-authenticated, signed owner canary may
+ * use the explicit canary gates; ordinary owner identity is deliberately not
+ * an execution authority. Public and ordinary-owner traffic therefore share
+ * the same sticky rollout behavior. Factual and exhaustive work has a
+ * separate switch because its claim/frontier benchmark graduates
+ * independently of curated genre and mood playlists.
  */
 export function assignPipelineV2(input: {
   plan: SelectionPlan;
-  owner: boolean;
+  signedOwnerCanary: boolean;
   stickyKey: string;
   env?: NodeJS.ProcessEnv;
 }): PipelineV2Assignment {
@@ -1205,7 +1236,10 @@ export function assignPipelineV2(input: {
   // claim/frontier benchmark graduates separately from curated catalog work.
   // Both routes remain legacy control when their own gates are absent.
   if (factual) {
-    if (input.owner && env.PIPELINE_V2_FACTUAL_OWNER_CANARY === "true") {
+    if (
+      input.signedOwnerCanary
+      && env.PIPELINE_V2_FACTUAL_OWNER_CANARY === "true"
+    ) {
       return { assigned: true, cohort, percentage: 100, reason: "owner_canary" };
     }
     const percentage = rolloutPercentage(env.PIPELINE_V2_FACTUAL_PERCENT);
@@ -1217,12 +1251,13 @@ export function assignPipelineV2(input: {
       reason: assigned ? "sticky_rollout" : "legacy_control",
     };
   }
-  // Owner canaries are an explicit operational gate. Keeping this disabled by
-  // default prevents an owner request from creating a V2 job during the short
-  // interval in which pre-capability workers may still be draining a rolling
-  // deployment. Operations enables the gate only after fresh V2-capable
-  // heartbeats are the sole workers eligible for new V2 work.
-  if (input.owner && env.PIPELINE_V2_OWNER_CANARY === "true") {
+  // Signed owner canaries are an explicit operational gate. Keeping this
+  // disabled by default prevents even a signed canary from creating a V2 job
+  // while pre-capability workers may still be draining a rolling deployment.
+  if (
+    input.signedOwnerCanary
+    && env.PIPELINE_V2_OWNER_CANARY === "true"
+  ) {
     return { assigned: true, cohort, percentage: 100, reason: "owner_canary" };
   }
   const percentage = rolloutPercentage(

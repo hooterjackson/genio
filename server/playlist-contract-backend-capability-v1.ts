@@ -10,6 +10,7 @@ import {
   type PlaylistPredicateV1,
 } from "./playlist-contract-v1.ts";
 import {
+  LEGACY_PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
   PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
   PLAYLIST_CONTRACT_SHADOW_EVIDENCE_POLICY_VERSION,
 } from "./playlist-contract-shadow-bridge-v1.ts";
@@ -324,6 +325,7 @@ Readonly<BackendCapabilityDeclaration> = Object.freeze({
   contractSchemaVersions: [PLAYLIST_CONTRACT_SCHEMA_VERSION],
   compilerVersions: [
     PLAYLIST_CONTRACT_COMPILER_VERSION,
+    LEGACY_PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
     PLAYLIST_CONTRACT_SHADOW_BRIDGE_VERSION,
   ],
   ontologyVersions: [

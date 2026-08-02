@@ -109,6 +109,7 @@ describe("public V3 runtime release contract", () => {
       RELEASE_EXECUTION_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_ENABLED: "true",
       GUIDANCE_CONTRACT_V3_OWNER_CANARY: "true",
+      GUIDANCE_V5_ENABLED: "true",
       PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION: "6",
     });
     expect(result).toMatchObject({
@@ -120,7 +121,7 @@ describe("public V3 runtime release contract", () => {
       queryPlanSchemaVersion: "6",
       briefContractVersion: "3",
       guidanceContractOwnerCanaryEnabled: true,
-      guidancePolicyVersion: "adaptive_guidance_v4",
+      guidancePolicyVersion: "adaptive_guidance_v5",
       evidencePolicyVersion: "governed_evidence_v2",
     });
   });
@@ -148,6 +149,45 @@ describe("public V3 runtime release contract", () => {
       guidanceContractReggaetonCanaryEnabled: true,
       guidancePolicyVersion: "adaptive_guidance_v4",
     });
+  });
+
+  test("binds the direct exposure authority to release and semantic configuration identity", () => {
+    const environment = {
+      RELEASE_ENVIRONMENT: "production",
+      RELEASE_DEPLOYMENT_PHASE: "activate",
+      RELEASE_V254_DIRECT_EXPOSURE_PRECONDITIONS_HASH: "1".repeat(64),
+      RELEASE_V254_DIRECT_EXPOSURE_ROLLBACK_PLAN_HASH: "2".repeat(64),
+      RELEASE_V254_DIRECT_EXPOSURE_STAGE:
+        "editorial_influence:0->100:fully_exposed_unproven",
+      RELEASE_V254_DIRECT_EXPOSURE_TARGET_CONFIGURATION_HASH: "3".repeat(64),
+    };
+    const result = runtimeReleaseContract(environment);
+    expect(result).toMatchObject({
+      directExposurePreconditionsHash: "1".repeat(64),
+      directExposureRollbackPlanHash: "2".repeat(64),
+      directExposureStage:
+        "editorial_influence:0->100:fully_exposed_unproven",
+      directExposureTargetConfigurationHash: "3".repeat(64),
+      publicRolloutEvidenceHash: null,
+      publicRolloutStage: null,
+    });
+    // The signed direct-exposure tuple is checked independently by the
+    // runtime contract. It must not recursively change the semantic hash that
+    // the tuple itself binds.
+    expect(semanticExecutionConfigurationHash(environment)).toBe(
+      semanticExecutionConfigurationHash({
+        ...environment,
+        RELEASE_V254_DIRECT_EXPOSURE_PRECONDITIONS_HASH: "4".repeat(64),
+      }),
+    );
+    expect(() => runtimeReleaseContract({
+      ...environment,
+      RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH: "5".repeat(64),
+    })).toThrow(/conflict with standard rollout authority/u);
+    expect(() => runtimeReleaseContract({
+      ...environment,
+      RELEASE_V254_DIRECT_EXPOSURE_ROLLBACK_PLAN_HASH: undefined,
+    })).toThrow(/incomplete/u);
   });
 
   test("fails visibly closed to disabled rollout and validated provider defaults", () => {

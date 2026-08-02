@@ -107,6 +107,7 @@ function publicRolloutAuthority(
     PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
     PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
     PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+    PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
     PIPELINE_V3_GENRE_SCENE_PERCENT: percentage as "0" | "1" | "10" | "50" | "100",
     PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
     PIPELINE_V3_SIMILARITY_PERCENT: "0",
@@ -737,6 +738,31 @@ databaseDescribe("hosted backend integration", () => {
     expect(candidateColumns.rows.map((row) => row.column_name)).toEqual(["selection_rank"]);
   });
 
+  test("loads the independent editorial-influence rollout authority", async () => {
+    const global = {
+      schemaVersion: "genio-public-rollout-database-authority/v1",
+      intentGroup: "editorial_influence",
+    };
+    const editorial = {
+      ...global,
+      toPercent: "100",
+    };
+    await repository.setSetting(
+      "public_rollout_state:global",
+      JSON.stringify(global),
+    );
+    await repository.setSetting(
+      "public_rollout_state:editorial_influence",
+      JSON.stringify(editorial),
+    );
+
+    await expect(repository.getPublicRolloutDatabaseAuthority()).resolves
+      .toEqual({
+        global,
+        intents: { editorial_influence: editorial },
+      });
+  });
+
   test("provider blocker retries preserve one anchored 24-hour horizon", async () => {
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
     const runId = await repository.createRun("Anchored provider blocker", brief, 0, 1);
@@ -1173,7 +1199,7 @@ databaseDescribe("hosted backend integration", () => {
     });
   });
 
-  test("V2 provider outages retain a public dependency pause without a canonical contract", async () => {
+  test("V2 provider outages retain dependency wait, then quarantine an expired unresumable legacy checkpoint", async () => {
     await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
     const runId = await repository.createRun(
       "V2 provider outage without canonical contract",
@@ -1320,10 +1346,13 @@ databaseDescribe("hosted backend integration", () => {
         nextAction: "resume_revise_or_cancel",
       })],
     );
+    // This legacy V2 row has no canonical contract or typed advancing
+    // decision. Once its retry window expires, exposing "review contract"
+    // would be an actionless dead end, so the reducer must fail closed.
     await expect(repository.getRun(runId)).resolves.toMatchObject({
       resolution: {
-        state: "needs_decision",
-        nextAction: "review_contract",
+        state: "quarantined",
+        nextAction: "contact_support",
         blocker: {
           kind: "provider",
           versionHash: null,
@@ -3856,6 +3885,7 @@ databaseDescribe("hosted backend integration", () => {
         clientBucketAliases: [clientBucket],
         idempotencyKey: randomUUID(),
         briefContractVersion: 3,
+        contract3RouteAuthority: "signed_owner_canary",
         allowExecutableTrackCount: true,
       });
       await expect(repository.getBriefRequest(created.id)).resolves.toMatchObject({
@@ -3864,6 +3894,24 @@ databaseDescribe("hosted backend integration", () => {
       });
     },
   );
+
+  test("rejects an expanded Contract-3 brief without signed route authority", async () => {
+    await repository.setSetting("schema_version", DATABASE_SCHEMA_VERSION);
+    const clientBucket = `owner-expanded-unsigned-${randomUUID()}`;
+    await expect(repository.createBriefRequest({
+      prompt: "An unsigned owner playlist with 301 tracks",
+      requestedTrackCount: 301,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      briefContractVersion: 3,
+      allowExecutableTrackCount: true,
+    })).rejects.toMatchObject({
+      statusCode: 403,
+      code: "expanded_track_count_route_authority_required",
+    });
+  });
 
   test.each([1, 2] as const)(
     "rejects expanded durable admission under legacy brief contract %i",
@@ -3897,6 +3945,7 @@ databaseDescribe("hosted backend integration", () => {
         clientBucketAliases: [clientBucket],
         idempotencyKey: randomUUID(),
         briefContractVersion: 3,
+        contract3RouteAuthority: "signed_owner_canary",
         allowExecutableTrackCount: true,
       })).rejects.toMatchObject({
         statusCode: 503,
@@ -4625,8 +4674,8 @@ databaseDescribe("hosted backend integration", () => {
       [runId],
     )).rows[0]).toEqual({
       generation: 2,
-      state: "executing",
-      next_action: "none",
+      state: "quarantined",
+      next_action: "contact_support",
     });
 
     await repository.setSetting(
@@ -4636,8 +4685,8 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.getRun(runId)).resolves.toMatchObject({
       resolution: {
         generation: 2,
-        state: "executing",
-        nextAction: "none",
+        state: "quarantined",
+        nextAction: "contact_support",
       },
     });
 
@@ -4651,8 +4700,8 @@ databaseDescribe("hosted backend integration", () => {
       status: "failed_system",
       resolution: {
         generation: 2,
-        state: "executing",
-        nextAction: "none",
+        state: "quarantined",
+        nextAction: "contact_support",
       },
     });
     expect((await repository.pool.query<{ generation: number }>(
@@ -4692,7 +4741,7 @@ databaseDescribe("hosted backend integration", () => {
       repository.runPlaylistResolutionReconciler(10),
     ).resolves.toMatchObject({
       audited: 1,
-      repaired: 1,
+      repaired: 0,
       quarantined: 0,
       skipped: false,
     });
@@ -4713,13 +4762,13 @@ databaseDescribe("hosted backend integration", () => {
        WHERE resolution.run_id=$1`,
       [runId],
     )).rows[0]).toEqual({
-      generation: 3,
-      repair_count: 1,
-      queued_repairs: 1,
+      generation: 2,
+      repair_count: null,
+      queued_repairs: 0,
     });
     await expect(
       repository.drainPlaylistResolutionOutbox("resolution-test-worker", 10),
-    ).resolves.toBe(3);
+    ).resolves.toBe(2);
     expect((await repository.pool.query<{ pending: number }>(
       `SELECT count(*)::int pending
        FROM playlist_resolution_outbox
@@ -4769,8 +4818,8 @@ databaseDescribe("hosted backend integration", () => {
     await expect(repository.getRun(runId)).resolves.toMatchObject({
       resolution: {
         generation: 2,
-        state: "executing",
-        nextAction: "none",
+        state: "quarantined",
+        nextAction: "contact_support",
       },
     });
     expect((await repository.pool.query<{
@@ -4967,7 +5016,7 @@ databaseDescribe("hosted backend integration", () => {
       run_phase: "canonical_integrity_quarantine",
       resolution_state: "quarantined",
       next_action: "contact_support",
-      work_motion: "none",
+      work_motion: "stalled",
       incident_reference: expect.stringContaining("resolution-shadow:"),
       blocker_kind: "integrity",
       job_status: "failed",

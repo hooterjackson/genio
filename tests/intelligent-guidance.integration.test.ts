@@ -16,16 +16,23 @@ import {
   SMOOTH_REGGAETON_HEAT_PROMPT,
 } from "../server/adaptive-guidance-v3.ts";
 import {
+  publicGuidanceExecutionDecisionV5,
   publicGuidanceQuestionV3,
   publicGuidanceQuestionV4,
+  publicGuidanceQuestionV5,
 } from "../server/adaptive-guidance-contract-bridge.ts";
 import { guidanceCheckpointV4 } from "../server/adaptive-guidance-v4.ts";
+import { guidanceCheckpointV5 } from "../server/adaptive-guidance-v5.ts";
 import {
   AUTHENTICATED_OWNER_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
   PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
 } from "../server/playlist-count-policy.ts";
+import {
+  canonicalExecutorCapabilityForSchemaV1,
+} from "../server/playlist-contract-backend-capability-v1.ts";
 import { compilePlaylistContractShadowV1 } from "../server/playlist-contract-shadow-bridge-v1.ts";
 import { Repository } from "../server/repository.ts";
+import { semanticExecutionConfigurationHash } from "../server/runtime-release.ts";
 import { createSelectionPlanV2 } from "../server/selection-plan-v2.ts";
 import {
   createRunSpecV3,
@@ -42,11 +49,21 @@ import {
   compilePlaylistContractRevisionV1,
   type PlaylistContractRevisionV1,
 } from "../server/playlist-contract-v1.ts";
+import {
+  GUIDANCE_V5_V2_EXECUTION_AUTHORITY_CHECKPOINT,
+  GUIDANCE_V5_V2_WORKER_CONSUMPTION_CHECKPOINT,
+  verifyGuidanceV5V2WorkerConsumption,
+  type GuidanceV5V2ExecutionAuthority,
+} from "../server/guidance-v5-v2-execution.ts";
 import type {
   PlaylistBrief,
   PlaylistGuidanceQuestion,
   QueryPlanV3,
+  SelectionPlan,
 } from "../shared/types.ts";
+import type {
+  UnsignedReleaseCanaryMetadata,
+} from "../server/release-canary-metadata.ts";
 
 const databaseUrl = process.env.DATABASE_URL?.trim();
 const databaseDescribe = databaseUrl ? describe.sequential : describe.skip;
@@ -56,6 +73,22 @@ const migrationSql = readdirSync(migrationDirectory)
   .sort()
   .map((file) => readFileSync(new URL(`../postgres-migrations/${file}`, import.meta.url), "utf8"))
   .join("\n-- statement-breakpoint\n");
+
+function signedOwnerCanaryFixture(
+  operation: "brief" | "run",
+  canaryId: string,
+): UnsignedReleaseCanaryMetadata {
+  return {
+    version: "genio-release-canary/v1",
+    canaryId,
+    environment: "staging",
+    audience: "https://staging.9enio.example",
+    operation,
+    sourceRevision: "a".repeat(40),
+    issuedAt: "2026-08-01T12:00:00.000Z",
+    cacheMode: "reuse_disabled",
+  };
+}
 
 async function applySql(pool: Pool, sql: string): Promise<void> {
   const client = await pool.connect();
@@ -168,6 +201,21 @@ const drillGrimeBrief: PlaylistBrief = {
   ambiguities: [],
 };
 
+const temporalRapBrief: PlaylistBrief = {
+  title: "2010 Rap",
+  description: "A focused rap playlist associated with 2010.",
+  mode: "curated",
+  subjectEntities: ["rap", "2010"],
+  relationship: "recordings within the requested rap and time scope",
+  include: ["rap"],
+  exclude: [],
+  versionPolicy: "Prefer canonical studio recordings.",
+  evidencePolicy: "Require policy-valid genre and time evidence.",
+  orderingPolicy: "Use a coherent editorial flow.",
+  targetSize: { min: 25, max: 25 },
+  ambiguities: ["The width of the 2010 time scope is unresolved."],
+};
+
 databaseDescribe("intelligent guidance contract persistence", () => {
   const schemaName = `genio_guidance_v2_${randomUUID().replaceAll("-", "")}`;
   let adminPool: Pool;
@@ -176,6 +224,13 @@ databaseDescribe("intelligent guidance contract persistence", () => {
 
   beforeAll(async () => {
     vi.stubEnv("PIPELINE_V3_ASSIGNMENT_ENABLED", "true");
+    vi.stubEnv("PIPELINE_V3_OWNER_CANARY", "true");
+    vi.stubEnv(
+      "PIPELINE_V3_OWNER_CANARY_GROUPS",
+      "editorial_influence,genre_scene,mood_activity_theme,similarity,artist_catalogue,fixed_container,factual_relationship,exhaustive",
+    );
+    vi.stubEnv("PIPELINE_V3_OWNER_CANARY_MAX_TRACKS", "1000");
+    vi.stubEnv("PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT", "100");
     vi.stubEnv("PIPELINE_V3_GENRE_SCENE_PERCENT", "100");
     vi.stubEnv("PIPELINE_V3_MOOD_ACTIVITY_PERCENT", "100");
     vi.stubEnv("PIPELINE_V3_SIMILARITY_PERCENT", "100");
@@ -344,8 +399,276 @@ databaseDescribe("intelligent guidance contract persistence", () => {
     )).rows[0]?.brief_contract_version).toBe(2);
   }, 40_000);
 
+  test("persists a Contract-2 V5 successor and V2 worker execution authority", async () => {
+    const priorV2Percentage = process.env.PIPELINE_V2_CURATED_PERCENT;
+    vi.stubEnv("PIPELINE_V2_CURATED_PERCENT", "100");
+    try {
+      const prompt = "Infuential irish music";
+      const clientBucket = `guidance-v5-v2-irish-${randomUUID()}`;
+      const irishBrief: PlaylistBrief = {
+        title: "Influential Irish Music",
+        description: "Influential recordings by Irish artists.",
+        mode: "curated",
+        subjectEntities: ["Irish music"],
+        relationship: "influential music by Irish artists",
+        include: ["Irish artists and recordings"],
+        exclude: [],
+        versionPolicy: "Prefer canonical studio recordings.",
+        evidencePolicy: "Documented Irish origin and influence.",
+        orderingPolicy: "Use a coherent editorial flow.",
+        targetSize: { min: 25, max: 25 },
+        ambiguities: [
+          "Whether influence means Irish cultural or global impact.",
+        ],
+      };
+      const created = await repository.createBriefRequest({
+        prompt,
+        requestedTrackCount: 25,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        briefContractVersion: 2,
+      });
+      const basePlan = createSelectionPlanV2({
+        prompt,
+        brief: irishBrief,
+        storefront: "us",
+      });
+      const shadow = compilePlaylistContractShadowV1({
+        contractId: `brief:${created.id}`,
+        prompt,
+        brief: irishBrief,
+        selectionPlan: basePlan,
+        locale: "en",
+      });
+      await repository.saveBriefSelectionPlan(created.id, basePlan);
+      await repository.savePlaylistContractRevision({
+        briefRequestId: created.id,
+        expectedParentRevisionId: null,
+        contractHash: shadow.contract.semanticHash,
+        contract: structuredClone(shadow.contract) as unknown as Record<
+          string,
+          unknown
+        >,
+        compilerVersion: shadow.contract.versions.compiler,
+        ontologyVersion: shadow.contract.versions.ontology,
+        evidencePolicyVersion: shadow.contract.versions.evidencePolicy,
+        questionTemplateVersion:
+          shadow.contract.versions.questionTemplates,
+        catalogPolicyVersion: shadow.contract.versions.catalogPolicy,
+        locale: shadow.contract.locale,
+        storefront: shadow.contract.storefront,
+        answerLineageHash: sha256Hex(
+          stableStringify(shadow.contract.answerLineage),
+        ),
+      });
+      const checkpoint = guidanceCheckpointV5({
+        prompt,
+        baseContract: shadow.contract,
+        preservedTrackPredicate: shadow.preservedTrackPredicate,
+        ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+        criticalAmbiguities: createRunSpecV3({
+          prompt,
+          requestedTrackCount: 25,
+          storefront: "us",
+        }).criticalAmbiguities,
+        requestShape: "curated",
+        capabilitySnapshotHash:
+          canonicalExecutorCapabilityForSchemaV1({
+            queryPlanSchemaVersion: 6,
+          }).hash,
+        semanticConfigurationHash:
+          semanticExecutionConfigurationHash(process.env),
+      });
+      expect(checkpoint.decisions).toHaveLength(1);
+      const question = publicGuidanceQuestionV5(
+        checkpoint.decisions[0]!,
+      );
+      expect(question).toMatchObject({
+        schemaVersion: 5,
+        axis: "influence_scope",
+      });
+      await repository.saveBriefResult(created.id, {
+        status: "awaiting_answers",
+        expectedStatus: "queued",
+        brief: irishBrief,
+        questions: [question],
+        guidanceSourceHints: [],
+        guidanceTelemetry: {
+          generationMode: "generalized_axis_registry",
+          requestClassification: "broad_curated",
+          guidancePolicyVersion: "adaptive_guidance_v5",
+          questionSetHash: checkpoint.checkpointHash,
+          proposedQuestionCount: 1,
+          acceptedQuestionCount: 1,
+          webSearchCalls: 0,
+          validationIssues: [],
+        },
+        guidanceContract: {
+          questionSetHash: checkpoint.checkpointHash,
+          requestClassification: "broad_curated",
+          generationMode: "generalized_axis_registry",
+          guidancePolicyVersion: "adaptive_guidance_v5",
+          locale: "en",
+          storefront: "us",
+          targetTrackCount: 25,
+          explicitConstraintHash: sha256Hex("irish-v5-v2-explicit"),
+          rejectedQuestionReasons: [],
+          baseContractRevisionId: shadow.contract.revisionId,
+          baseContractSemanticHash: shadow.contract.semanticHash,
+          guidanceRound: "initial",
+          trigger: checkpoint.decisions[0]!.trigger,
+          axis: checkpoint.decisions[0]!.axis,
+          checkpointMode: checkpoint.mode,
+          interpretationSummary: checkpoint.interpretationSummary,
+        },
+      });
+      await expect(repository.submitBriefAnswers({
+        briefRequestId: created.id,
+        idempotencyKey: randomUUID(),
+        questionSetHash: checkpoint.checkpointHash,
+        answers: [{
+          questionId: question.id,
+          optionId: "balanced_influence",
+        }],
+      })).resolves.toEqual({ status: "finalizing", created: true });
+      await processBriefInterpretationJob(repository, {
+        briefRequestId: created.id,
+      });
+      const completedBrief = await repository.getBriefRequest(created.id);
+      expect(completedBrief).toMatchObject({
+        status: "complete",
+        briefContractVersion: 2,
+        selectionPlan: {
+          pipelineVersion: "catalog_first_v2",
+          requestedTrackCount: 25,
+          minimumQualifiedTrackCount: 25,
+        },
+      });
+      const run = await repository.createRunIdempotent({
+        prompt,
+        briefRequestId: created.id,
+        brief: completedBrief!.brief,
+        estimateUsd: 0,
+        approvedBudgetUsd: 0,
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        reuseDays: 0,
+        globalLimit: 100,
+      });
+      const persisted = (await pool.query<{
+        brief_contract_version: number;
+        active_playlist_contract_revision_id: string | null;
+        pipeline_version: string;
+        selection_plan_json: SelectionPlan;
+        authority: GuidanceV5V2ExecutionAuthority;
+      }>(
+        `SELECT run.brief_contract_version,
+                run.active_playlist_contract_revision_id,
+                run.pipeline_version,run.selection_plan_json,
+                checkpoint.state_json authority
+         FROM research_runs run
+         JOIN research_checkpoints checkpoint
+           ON checkpoint.run_id=run.id AND checkpoint.phase=$2
+         WHERE run.id=$1`,
+        [run.runId, GUIDANCE_V5_V2_EXECUTION_AUTHORITY_CHECKPOINT],
+      )).rows[0]!;
+      expect(persisted).toMatchObject({
+        brief_contract_version: 2,
+        active_playlist_contract_revision_id: null,
+        pipeline_version: "catalog_first_v2",
+        authority: {
+          kind: "execution_authority",
+          route: "catalog_first_v2",
+          selectedOptionId: "balanced_influence",
+          executionField: "rankingObjectives",
+        },
+      });
+      expect(persisted.selection_plan_json.constraints).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            axis: "evidence",
+            kind: "soft",
+            values: [
+              "balance Irish cultural impact with global influence",
+            ],
+          }),
+        ]),
+      );
+      const privateJobId = randomUUID();
+      const privateWorkerId = `worker-${randomUUID()}`;
+      const workerReceipt = verifyGuidanceV5V2WorkerConsumption({
+        authority: persisted.authority,
+        selectionPlan: persisted.selection_plan_json,
+        jobId: privateJobId,
+        workerId: privateWorkerId,
+        leaseEpoch: 1,
+        consumedAt: "2026-08-02T12:00:00.000Z",
+      });
+      await repository.saveResearchCheckpoint(
+        run.runId,
+        GUIDANCE_V5_V2_WORKER_CONSUMPTION_CHECKPOINT,
+        workerReceipt,
+      );
+      const activeBriefContract = (await pool.query<{
+        active_playlist_contract_revision_id: string;
+      }>(
+        `SELECT active_playlist_contract_revision_id
+         FROM brief_requests WHERE id=$1`,
+        [created.id],
+      )).rows[0]!.active_playlist_contract_revision_id;
+      const proof = await repository.getPublicRunExecutionProof(run.runId);
+      expect(proof).toMatchObject({
+        contractHash: workerReceipt.successorContractSemanticHash,
+        queryPlanRevisionId: null,
+        executionPlan: {
+          kind: "selection_plan_v2",
+          revisionId: null,
+          planHash: workerReceipt.selectionPlanHash,
+        },
+        workerConsumption: {
+          route: "catalog_first_v2",
+          planKind: "selection_plan_v2",
+          status: "consumed",
+          questionSetHash: workerReceipt.questionSetHash,
+          questionHash: workerReceipt.questionHash,
+          selectedOptionId: "balanced_influence",
+          axis: "influence_scope",
+          queryPlanHash: null,
+          selectionPlanHash: workerReceipt.selectionPlanHash,
+          contractSemanticHash:
+            workerReceipt.successorContractSemanticHash,
+          executionField: "rankingObjectives",
+          consumerId: workerReceipt.v2ConsumerId,
+          resultEffectHash: workerReceipt.resultEffectHash,
+          receiptHash: workerReceipt.receiptHash,
+        },
+      });
+      expect(proof?.workerConsumption).not.toHaveProperty("effectHash");
+      const serializedProof = JSON.stringify(proof);
+      for (const privateIdentity of [
+        run.runId,
+        created.id,
+        activeBriefContract,
+        privateJobId,
+        privateWorkerId,
+      ]) {
+        expect(serializedProof).not.toContain(privateIdentity);
+      }
+    } finally {
+      if (priorV2Percentage === undefined) {
+        delete process.env.PIPELINE_V2_CURATED_PERCENT;
+      } else {
+        process.env.PIPELINE_V2_CURATED_PERCENT = priorV2Percentage;
+      }
+    }
+  }, 50_000);
+
   test("atomically persists Smooth Reggaeton contract-3 guidance and fences it to protocol 10", async () => {
     const clientBucket = `guidance-v3-${randomUUID()}`;
+    const ownerCanaryId = `guidance-v3-${randomUUID()}`;
     const created = await repository.createBriefRequest({
       prompt: SMOOTH_REGGAETON_HEAT_PROMPT,
       requestedTrackCount: 50,
@@ -354,6 +677,7 @@ databaseDescribe("intelligent guidance contract persistence", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       briefContractVersion: 3,
+      releaseCanary: signedOwnerCanaryFixture("brief", ownerCanaryId),
     });
     const queued = await repository.enqueueJob({
       kind: "brief",
@@ -615,6 +939,9 @@ databaseDescribe("intelligent guidance contract persistence", () => {
           idempotencyKey: randomUUID(),
           reuseDays: 0,
           globalLimit: 100,
+          forceFreshResearch: true,
+          releaseCanary: signedOwnerCanaryFixture("run", ownerCanaryId),
+          releaseCanaryOwnerAuthorized: true,
         });
       } finally {
         if (originalStorefront === undefined) delete process.env.APPLE_STOREFRONT;
@@ -684,6 +1011,278 @@ databaseDescribe("intelligent guidance contract persistence", () => {
       pipelineVersion: authority?.spec_pipeline_version,
       policyVersion: authority?.spec_policy_version,
     })));
+  }, 50_000);
+
+  test("persists a bounded V5 correctness answer before one optional nuance round", async () => {
+    const prompt = "2010 rap";
+    const clientBucket = `guidance-v5-progressive-${randomUUID()}`;
+    const created = await repository.createBriefRequest({
+      prompt,
+      requestedTrackCount: 25,
+      model: "test-model",
+      clientBucket,
+      clientBucketAliases: [clientBucket],
+      idempotencyKey: randomUUID(),
+      briefContractVersion: 3,
+    });
+    const selectionPlan = createSelectionPlanV2({
+      prompt,
+      brief: temporalRapBrief,
+      storefront: "us",
+    });
+    const shadow = compilePlaylistContractShadowV1({
+      contractId: `brief:${created.id}`,
+      prompt,
+      brief: temporalRapBrief,
+      selectionPlan,
+      locale: "en",
+    });
+    const persistedBase = await repository.savePlaylistContractRevision({
+      briefRequestId: created.id,
+      expectedParentRevisionId: null,
+      contractHash: shadow.contract.semanticHash,
+      contract:
+        structuredClone(shadow.contract) as unknown as Record<string, unknown>,
+      compilerVersion: shadow.contract.versions.compiler,
+      ontologyVersion: shadow.contract.versions.ontology,
+      evidencePolicyVersion: shadow.contract.versions.evidencePolicy,
+      questionTemplateVersion: shadow.contract.versions.questionTemplates,
+      catalogPolicyVersion: shadow.contract.versions.catalogPolicy,
+      locale: shadow.contract.locale,
+      storefront: shadow.contract.storefront,
+      answerLineageHash: sha256Hex(
+        stableStringify(shadow.contract.answerLineage),
+      ),
+    });
+    await repository.saveBriefSelectionPlan(created.id, selectionPlan);
+    const runSpec = createRunSpecV3({
+      prompt,
+      requestedTrackCount: 25,
+      storefront: "us",
+      brief: temporalRapBrief,
+    });
+    const capabilitySnapshotHash =
+      canonicalExecutorCapabilityForSchemaV1({
+        queryPlanSchemaVersion: 6,
+      }).hash;
+    const initialCheckpoint = guidanceCheckpointV5({
+      prompt,
+      baseContract: shadow.contract,
+      preservedTrackPredicate: shadow.preservedTrackPredicate,
+      ambiguousScopeClauseIds: shadow.ambiguousScopeClauseIds,
+      criticalAmbiguities: runSpec.criticalAmbiguities,
+      requestShape: "curated",
+      capabilitySnapshotHash,
+      semanticConfigurationHash: semanticExecutionConfigurationHash(),
+    });
+    const initialQuestions = initialCheckpoint.decisions.map(
+      publicGuidanceQuestionV5,
+    );
+    expect(initialQuestions).toEqual([
+      expect.objectContaining({
+        axis: "temporal_width",
+        guidanceMode: "correctness_blocking",
+        question: "What time span should “2010” cover?",
+      }),
+    ]);
+    await repository.saveBriefResult(created.id, {
+      status: "awaiting_answers",
+      expectedStatus: "queued",
+      brief: temporalRapBrief,
+      questions: initialQuestions,
+      guidanceTelemetry: {
+        generationMode: "generalized_axis_registry",
+        requestClassification: "critical_ambiguity",
+        guidancePolicyVersion: initialCheckpoint.policyVersion,
+        questionSetHash: initialCheckpoint.checkpointHash,
+        proposedQuestionCount: initialCheckpoint.decisions.length,
+        acceptedQuestionCount: initialQuestions.length,
+        webSearchCalls: 0,
+        validationIssues: [],
+      },
+      guidanceContract: {
+        questionSetHash: initialCheckpoint.checkpointHash,
+        requestClassification: "critical_ambiguity",
+        generationMode: "generalized_axis_registry",
+        guidancePolicyVersion: initialCheckpoint.policyVersion,
+        locale: "en",
+        storefront: "us",
+        targetTrackCount: 25,
+        explicitConstraintHash: sha256Hex("greek-rap-hard-constraints"),
+        rejectedQuestionReasons: Object.entries(
+          initialCheckpoint.rejectedDecisionReasons,
+        ).map(([id, reason]) => `${id}:${reason}`),
+        baseContractRevisionId: shadow.contract.revisionId,
+        baseContractSemanticHash: shadow.contract.semanticHash,
+        guidanceRound: "initial",
+        trigger: initialCheckpoint.decisions[0]!.trigger,
+        axis: initialCheckpoint.decisions[0]!.axis,
+        checkpointMode: initialCheckpoint.mode,
+        interpretationSummary: initialCheckpoint.interpretationSummary,
+      },
+    });
+
+    const correctnessKey = randomUUID();
+    const correctnessAnswers = [{
+      questionId: initialQuestions[0]!.id,
+      optionId: "era_year_only",
+    }];
+    const nuance = await repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+      briefRequestId: created.id,
+      idempotencyKey: correctnessKey,
+      questionSetHash: initialCheckpoint.checkpointHash,
+      answers: correctnessAnswers,
+    });
+    expect(nuance).toMatchObject({
+      status: "awaiting_answers",
+      created: true,
+      questionSetHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      questions: [{
+        schemaVersion: 5,
+        axis: "relationship_scope",
+        guidanceMode: "nuance_optional",
+        question:
+          "Which kind of documented relationship should lead the playlist?",
+      }],
+    });
+    if (nuance.status !== "awaiting_answers") {
+      throw new Error("V5 correctness did not persist the nuance round");
+    }
+
+    await expect(repository.preflightBriefAnswers({
+      briefRequestId: created.id,
+      idempotencyKey: correctnessKey,
+      questionSetHash: initialCheckpoint.checkpointHash,
+      answers: correctnessAnswers,
+    })).resolves.toMatchObject({
+      status: "prior_awaiting_answers",
+      questionSetHash: nuance.questionSetHash,
+      questions: [{
+        axis: "relationship_scope",
+      }],
+    });
+
+    const nuanceAnswers = [{
+      questionId: nuance.questions[0]!.id,
+      optionId: "artist_scene_links",
+    }];
+    const nuanceKey = randomUUID();
+    await expect(repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+      briefRequestId: created.id,
+      idempotencyKey: nuanceKey,
+      questionSetHash: nuance.questionSetHash,
+      answers: nuanceAnswers,
+    })).resolves.toEqual({
+      status: "finalizing",
+      created: true,
+    });
+    await expect(repository.submitBriefAnswers({
+      customTrackCountAuthority:
+        PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+      briefRequestId: created.id,
+      idempotencyKey: nuanceKey,
+      questionSetHash: nuance.questionSetHash,
+      answers: nuanceAnswers,
+    })).resolves.toEqual({
+      status: "finalizing",
+      created: false,
+    });
+
+    const questionSets = await pool.query<{
+      id: string;
+      revision: number;
+      parent_question_set_id: string | null;
+      axis: string;
+      active: boolean;
+    }>(
+      `SELECT id,revision,parent_question_set_id,axis,active
+       FROM guidance_question_sets
+       WHERE brief_request_id=$1
+       ORDER BY revision`,
+      [created.id],
+    );
+    expect(questionSets.rows).toEqual([
+      expect.objectContaining({
+        revision: 1,
+        parent_question_set_id: null,
+        axis: "temporal_width",
+        active: false,
+      }),
+      expect.objectContaining({
+        revision: 2,
+        parent_question_set_id: questionSets.rows[0]!.id,
+        axis: "relationship_scope",
+        active: true,
+      }),
+    ]);
+    const answerSets = await pool.query<{
+      question_set_hash: string;
+      resulting_contract_revision_id: string;
+    }>(
+      `SELECT question_set_hash,resulting_contract_revision_id
+       FROM guidance_answer_sets
+       WHERE brief_request_id=$1
+       ORDER BY created_at,id`,
+      [created.id],
+    );
+    expect(answerSets.rows).toHaveLength(2);
+    expect(answerSets.rows.every(
+      ({ resulting_contract_revision_id }) => (
+        typeof resulting_contract_revision_id === "string"
+      ),
+    )).toBe(true);
+    const revisions = await pool.query<{
+      id: string;
+      revision: number;
+      parent_revision_id: string | null;
+      status: string;
+      contract_json: PlaylistContractRevisionV1;
+    }>(
+      `SELECT id,revision,parent_revision_id,status,contract_json
+       FROM playlist_contract_revisions
+       WHERE brief_request_id=$1
+       ORDER BY revision`,
+      [created.id],
+    );
+    expect(revisions.rows).toHaveLength(3);
+    expect(revisions.rows[0]).toMatchObject({
+      id: persistedBase.id,
+      revision: 1,
+      parent_revision_id: null,
+      status: "superseded",
+    });
+    expect(revisions.rows[1]).toMatchObject({
+      revision: 2,
+      parent_revision_id: persistedBase.id,
+      status: "superseded",
+      contract_json: {
+        requestedTrackCount: 25,
+        clauses: expect.arrayContaining([
+          expect.objectContaining({
+            id: "guidance:v4:temporal:era_year_only",
+            values: ["2010"],
+          }),
+        ]),
+      },
+    });
+    expect(revisions.rows[2]).toMatchObject({
+      revision: 3,
+      parent_revision_id: revisions.rows[1]!.id,
+      status: "active",
+      contract_json: {
+        requestedTrackCount: 25,
+        clauses: expect.arrayContaining([
+          expect.objectContaining({
+            id: "guidance:v5:relationship-scope:artist_scene_links",
+          }),
+        ]),
+      },
+    });
+    expect(revisions.rows[2]!.contract_json.answerLineage).toHaveLength(2);
   }, 50_000);
 
   test("persists and accepts the production-shaped rap/grime V4 public question", async () => {
@@ -2302,6 +2901,7 @@ databaseDescribe("intelligent guidance contract persistence", () => {
     "makes a confirmed %s custom count successor authoritative without erasing the submitted count",
     async (_authorityLabel, customCount, customTrackCountAuthority) => {
     const clientBucket = `guidance-v3-custom-count-${randomUUID()}`;
+    const ownerCanaryId = `guidance-v3-custom-count-${randomUUID()}`;
     const prompt = "Make 20 disco tracks.";
     const originalBrief: PlaylistBrief = {
       title: "20 Disco Tracks",
@@ -2325,6 +2925,7 @@ databaseDescribe("intelligent guidance contract persistence", () => {
       clientBucketAliases: [clientBucket],
       idempotencyKey: randomUUID(),
       briefContractVersion: 3,
+      releaseCanary: signedOwnerCanaryFixture("brief", ownerCanaryId),
     });
     const baseContract = compilePlaylistContractRevisionV1({
       contractId: `brief:${created.id}`,
@@ -2591,6 +3192,9 @@ databaseDescribe("intelligent guidance contract persistence", () => {
       autoPublish: false,
       reuseDays: 0,
       globalLimit: 100,
+      forceFreshResearch: true,
+      releaseCanary: signedOwnerCanaryFixture("run", ownerCanaryId),
+      releaseCanaryOwnerAuthorized: true,
     };
     const run = await repository.createRunIdempotent(runInput);
     const authority = (await pool.query<{
@@ -2859,6 +3463,195 @@ databaseDescribe("intelligent guidance contract persistence", () => {
       [created.runId],
     )).rows[0]?.count).toBe(1);
   }, 50_000);
+
+  test.each([
+    {
+      optionId: "execute_confirmed_contract",
+      expectedStatus: "finalizing",
+      startsResearch: true,
+    },
+    {
+      optionId: "review_interpretation",
+      expectedStatus: "review_required",
+      startsResearch: false,
+    },
+    {
+      optionId: "cancel_request",
+      expectedStatus: "cancelled",
+      startsResearch: false,
+    },
+  ] as const)(
+    "persists execution decision $optionId as $expectedStatus and deactivates its question set",
+    async ({ optionId, expectedStatus, startsResearch }) => {
+      const clientBucket = `execution-decision-${optionId}-${randomUUID()}`;
+      const created = await repository.createBriefRequest({
+        prompt: "Kind of Blue in its exact original sequence",
+        requestedTrackCount: 25,
+        model: "test-model",
+        clientBucket,
+        clientBucketAliases: [clientBucket],
+        idempotencyKey: randomUUID(),
+        briefContractVersion: 3,
+      });
+      const selectionPlan = createSelectionPlanV2({
+        prompt: "Kind of Blue in its exact original sequence",
+        brief,
+        storefront: "us",
+      });
+      const shadow = compilePlaylistContractShadowV1({
+        contractId: `brief:${created.id}`,
+        prompt: "Kind of Blue in its exact original sequence",
+        brief,
+        selectionPlan,
+        locale: "en",
+      });
+      await repository.savePlaylistContractRevision({
+        briefRequestId: created.id,
+        expectedParentRevisionId: null,
+        contractHash: shadow.contract.semanticHash,
+        contract: structuredClone(shadow.contract) as unknown as Record<string, unknown>,
+        compilerVersion: shadow.contract.versions.compiler,
+        ontologyVersion: shadow.contract.versions.ontology,
+        evidencePolicyVersion: shadow.contract.versions.evidencePolicy,
+        questionTemplateVersion: shadow.contract.versions.questionTemplates,
+        catalogPolicyVersion: shadow.contract.versions.catalogPolicy,
+        locale: shadow.contract.locale,
+        storefront: shadow.contract.storefront,
+        answerLineageHash: sha256Hex(
+          stableStringify(shadow.contract.answerLineage),
+        ),
+      });
+      const checkpoint = guidanceCheckpointV5({
+        prompt: shadow.contract.rawPrompt,
+        baseContract: shadow.contract,
+        preservedTrackPredicate: shadow.contract.trackPredicate,
+        ambiguousScopeClauseIds: [],
+        criticalAmbiguities: [],
+        requestShape: "fixed_list",
+        capabilitySnapshotHash: "a".repeat(64),
+        semanticConfigurationHash: "b".repeat(64),
+      });
+      if (!checkpoint.executionDecision) {
+        throw new Error("execution decision fixture was not generated");
+      }
+      const question = publicGuidanceExecutionDecisionV5(
+        checkpoint.executionDecision,
+      );
+      await repository.saveBriefSelectionPlan(created.id, selectionPlan);
+      await repository.saveBriefResult(created.id, {
+        status: "awaiting_answers",
+        expectedStatus: "queued",
+        brief,
+        questions: [question],
+        guidanceTelemetry: {
+          generationMode: "typed_execution_decision",
+          requestClassification: "precise",
+          guidancePolicyVersion: "adaptive_guidance_v5",
+          questionSetHash: checkpoint.checkpointHash,
+          proposedQuestionCount: 1,
+          acceptedQuestionCount: 1,
+          webSearchCalls: 0,
+          validationIssues: [],
+        },
+        guidanceContract: {
+          questionSetHash: checkpoint.checkpointHash,
+          requestClassification: "precise",
+          generationMode: "typed_execution_decision",
+          guidancePolicyVersion: "adaptive_guidance_v5",
+          locale: "en",
+          storefront: "us",
+          targetTrackCount: 25,
+          explicitConstraintHash: sha256Hex("execution-decision"),
+          rejectedQuestionReasons: [],
+          baseContractRevisionId: shadow.contract.revisionId,
+          baseContractSemanticHash: shadow.contract.semanticHash,
+          guidanceRound: "initial",
+          trigger: "nuance",
+          axis: "execution_readiness",
+          checkpointMode: "execution_decision",
+          interpretationSummary: checkpoint.interpretationSummary,
+        },
+      });
+      const idempotencyKey = `execution-decision-${randomUUID()}`;
+      const answers = [{ questionId: question.id, optionId }];
+      const submitted = await repository.submitBriefAnswers({
+        customTrackCountAuthority:
+          PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+        briefRequestId: created.id,
+        idempotencyKey,
+        questionSetHash: checkpoint.checkpointHash,
+        answers,
+      });
+      expect(submitted).toMatchObject({
+        status: expectedStatus,
+        created: true,
+        executionAction: {
+          decisionHash: checkpoint.executionDecision.decisionHash,
+          optionId,
+          kind: optionId,
+          startsResearch,
+          actionHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        },
+      });
+      const actionHash = "executionAction" in submitted
+        ? submitted.executionAction?.actionHash
+        : undefined;
+      await expect(repository.submitBriefAnswers({
+        customTrackCountAuthority:
+          PUBLIC_CUSTOM_GUIDANCE_TRACK_COUNT_AUTHORITY_V1,
+        briefRequestId: created.id,
+        idempotencyKey,
+        questionSetHash: checkpoint.checkpointHash,
+        answers,
+      })).resolves.toMatchObject({
+        status: expectedStatus,
+        created: false,
+      });
+      await expect(repository.getBriefRequest(created.id)).resolves.toMatchObject({
+        status: expectedStatus,
+        questions: [],
+        questionSetHash: null,
+        executionAction: {
+          optionId,
+          kind: optionId,
+          startsResearch,
+        },
+      });
+      const persisted = (await pool.query<{
+        active: boolean;
+        execution_delta_json: Record<string, unknown>;
+        execution_delta_hash: string;
+        idempotency_key: string;
+        job_count: number;
+      }>(
+        `SELECT question_set.active,answer_set.execution_delta_json,
+                answer_set.execution_delta_hash,answer_set.idempotency_key,
+                (SELECT count(*)::int FROM job_queue
+                 WHERE brief_request_id=$1) job_count
+         FROM guidance_answer_sets answer_set
+         JOIN guidance_question_sets question_set
+           ON question_set.id=answer_set.question_set_id
+         WHERE answer_set.brief_request_id=$1
+           AND answer_set.idempotency_key=$2`,
+        [created.id, idempotencyKey],
+      )).rows[0]!;
+      expect(persisted).toMatchObject({
+        active: false,
+        execution_delta_json: {
+          schema: "guidance_execution_decision/v1",
+          questionSetHash: checkpoint.checkpointHash,
+          decisionHash: checkpoint.executionDecision.decisionHash,
+          optionId,
+          kind: optionId,
+          startsResearch,
+        },
+        execution_delta_hash: actionHash,
+        idempotency_key: idempotencyKey,
+        job_count: 0,
+      });
+    },
+    50_000,
+  );
 
   test("aggregates provider metrics exactly once per idempotency key", async () => {
     const idempotencyKey = `provider-metric-${randomUUID()}`;

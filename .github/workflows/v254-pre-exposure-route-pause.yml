@@ -1,0 +1,273 @@
+name: v254 pre-exposure route pause
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Exact merged v2.5.4 SHA already promoted
+        required: true
+        type: string
+      release_version:
+        description: Exact v2.5.4 image version
+        required: true
+        type: string
+      phase:
+        description: Audited paused pre-exposure route authority phase
+        required: true
+        type: choice
+        options:
+          - owner_gate
+          - public_canary
+      backend_promotion_run_id:
+        description: Successful exact-image native schema20 promotion run
+        required: true
+        type: string
+      prior_authority_run_id:
+        description: Prior successful pause run, or 0 for owner_gate
+        required: true
+        default: "0"
+        type: string
+      prior_authority_artifact:
+        description: Prior pause artifact name, or none for owner_gate
+        required: true
+        default: none
+        type: string
+      proof_run_id:
+        description: Exact-SHA owner Apple proof run, or 0 for owner_gate
+        required: true
+        default: "0"
+        type: string
+      proof_artifact:
+        description: Owner Apple gate artifact, or none for owner_gate
+        required: true
+        default: none
+        type: string
+      proof_file:
+        description: Owner Apple gate JSON filename, or none for owner_gate
+        required: true
+        default: none
+        type: string
+
+concurrency:
+  group: v254-pre-exposure-route-pause
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  pause:
+    name: exact-artifact paused ${{ inputs.phase }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_PROJECT_ID: 7e7a44ee-3e54-453c-9120-3cb1f33db76e
+      RAILWAY_INTERACTIVE_SERVICE_ID: 3affc435-074d-4f6f-806f-1c2b552a8b17
+      RAILWAY_DEEP_SERVICE_ID: a3469457-f56e-4871-8a10-5ea6c052640c
+      RAILWAY_API_SERVICE_ID: 11ba75aa-2495-4f28-bbde-64c43efbe731
+      RELEASE_GATE_PRODUCER_KEY_ID: ${{ vars.RELEASE_GATE_PRODUCER_KEY_ID }}
+      RELEASE_GATE_PRODUCER_KEY_SHA256: ${{ vars.RELEASE_GATE_PRODUCER_KEY_SHA256 }}
+    steps:
+      - name: Validate exact paused authority selectors
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          PHASE: ${{ inputs.phase }}
+          BACKEND_RUN_ID: ${{ inputs.backend_promotion_run_id }}
+          PRIOR_RUN_ID: ${{ inputs.prior_authority_run_id }}
+          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
+          PRIOR_ARTIFACT: ${{ inputs.prior_authority_artifact }}
+          PROOF_ARTIFACT: ${{ inputs.proof_artifact }}
+          PROOF_FILE: ${{ inputs.proof_file }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$BACKEND_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PRIOR_RUN_ID" == "0" || "$PRIOR_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PROOF_RUN_ID" == "0" || "$PROOF_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          test -n "$RAILWAY_TOKEN"
+          if [[ "$PHASE" == "owner_gate" ]]; then
+            test "$PRIOR_RUN_ID" = "0"
+            test "$PRIOR_ARTIFACT" = "none"
+            test "$PROOF_RUN_ID" = "0"
+            test "$PROOF_ARTIFACT" = "none"
+            test "$PROOF_FILE" = "none"
+          else
+            test "$PHASE" = "public_canary"
+            test "$PRIOR_RUN_ID" != "0"
+            test "$PRIOR_ARTIFACT" = "v254-pre-exposure-route-pause-owner_gate-$SOURCE_REVISION"
+            test "$PROOF_RUN_ID" != "0"
+            test "$PROOF_ARTIFACT" = "v254-owner-apple-gate-$SOURCE_REVISION"
+            test "$PROOF_FILE" = "production-affected-regression.gate.json"
+            [[ "$RELEASE_GATE_PRODUCER_KEY_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,159}$ ]]
+            [[ "$RELEASE_GATE_PRODUCER_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require exact merged source
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$SOURCE_REVISION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$SOURCE_REVISION" "origin/$DEFAULT_BRANCH"
+
+      - name: Require proof-producing runs for the exact SHA
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          BACKEND_RUN_ID: ${{ inputs.backend_promotion_run_id }}
+          PRIOR_RUN_ID: ${{ inputs.prior_authority_run_id }}
+          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
+          PHASE: ${{ inputs.phase }}
+        run: |
+          set -euo pipefail
+          for RUN_ID in "$BACKEND_RUN_ID" "$PRIOR_RUN_ID" "$PROOF_RUN_ID"; do
+            if [[ "$RUN_ID" == "0" ]]; then continue; fi
+            RUN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")"
+            test "$(jq -r '.event' <<<"$RUN")" = "workflow_dispatch"
+            test "$(jq -r '.status' <<<"$RUN")" = "completed"
+            test "$(jq -r '.conclusion' <<<"$RUN")" = "success"
+            test "$(jq -r '.head_sha' <<<"$RUN")" = "$SOURCE_REVISION"
+          done
+          BACKEND="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BACKEND_RUN_ID")"
+          test "$(jq -r '.path' <<<"$BACKEND")" = ".github/workflows/native-schema20-release.yml"
+          if [[ "$PRIOR_RUN_ID" != "0" ]]; then
+            PRIOR="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PRIOR_RUN_ID")"
+            test "$(jq -r '.path' <<<"$PRIOR")" = ".github/workflows/v254-pre-exposure-route-pause.yml"
+          fi
+          if [[ "$PROOF_RUN_ID" != "0" ]]; then
+            test "$PHASE" = "public_canary"
+            PROOF="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PROOF_RUN_ID")"
+            test "$(jq -r '.path' <<<"$PROOF")" = ".github/workflows/v254-owner-apple-gate.yml"
+          fi
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-schema20-promotion-${{ inputs.source_revision }}
+          path: ${{ runner.temp }}/backend
+          run-id: ${{ inputs.backend_promotion_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download prior paused authority receipt
+        if: inputs.prior_authority_run_id != '0'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.prior_authority_artifact }}
+          path: ${{ runner.temp }}/prior
+          run-id: ${{ inputs.prior_authority_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact owner Apple proof
+        if: inputs.proof_run_id != '0'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.proof_artifact }}
+          path: ${{ runner.temp }}/proof
+          run-id: ${{ inputs.proof_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Materialize and pin the proof producer verification key
+        if: inputs.proof_run_id != '0'
+        env:
+          RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64"
+          umask 077
+          printf '%s' "$RELEASE_GATE_PRODUCER_PUBLIC_KEY_BASE64" | base64 --decode \
+            > "$RUNNER_TEMP/release-gate-producer-public-key.pem"
+          OBSERVED_KEY_SHA256="$(node -e 'const c=require("node:crypto"),f=require("node:fs"); const k=c.createPublicKey(f.readFileSync(process.argv[1])); if(k.asymmetricKeyType!=="ed25519") throw new Error("proof producer key must be Ed25519"); process.stdout.write(c.createHash("sha256").update(k.export({format:"der",type:"spki"})).digest("hex"));' "$RUNNER_TEMP/release-gate-producer-public-key.pem")"
+          test "$OBSERVED_KEY_SHA256" = "$RELEASE_GATE_PRODUCER_KEY_SHA256"
+
+      - name: Install exact lockfile and pinned Railway CLI
+        run: |
+          pnpm install --frozen-lockfile
+          npm install --global @railway/cli@4.65.0
+          test "$(railway --version)" = "railway 4.65.0"
+
+      - name: Dry-run then apply the identical paused authority plan
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          PHASE: ${{ inputs.phase }}
+          PRIOR_RUN_ID: ${{ inputs.prior_authority_run_id }}
+          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
+          PROOF_FILE: ${{ inputs.proof_file }}
+        run: |
+          set -euo pipefail
+          COMMON=(
+            --phase "$PHASE"
+            --rollback-target owner_gate
+            --promotion-receipt "$RUNNER_TEMP/backend/native-schema20-promotion.json"
+            --source-revision "$SOURCE_REVISION"
+            --version "$RELEASE_VERSION"
+            --project-id "$RAILWAY_PROJECT_ID"
+            --environment production
+            --interactive-service "$RAILWAY_INTERACTIVE_SERVICE_ID"
+            --deep-service "$RAILWAY_DEEP_SERVICE_ID"
+            --api-service "$RAILWAY_API_SERVICE_ID"
+            --origin https://9enio.com
+            --deployment-timeout-seconds 600
+            --poll-interval-seconds 10
+          )
+          if [[ "$PRIOR_RUN_ID" != "0" ]]; then
+            COMMON+=(--prior-authority-receipt "$RUNNER_TEMP/prior/v254-editorial-route-authority.json")
+          fi
+          if [[ "$PROOF_RUN_ID" != "0" ]]; then
+            test "$PHASE" = "public_canary"
+            COMMON+=(--proof-artifact "$RUNNER_TEMP/proof/$PROOF_FILE")
+            COMMON+=(
+              --proof-attestation "$RUNNER_TEMP/proof/production-affected-regression.attestation.json"
+              --producer-verification-key "$RUNNER_TEMP/release-gate-producer-public-key.pem"
+              --producer-key-id "$RELEASE_GATE_PRODUCER_KEY_ID"
+              --producer-key-sha256 "$RELEASE_GATE_PRODUCER_KEY_SHA256"
+            )
+          fi
+          pnpm release:v254:route-control -- dry-run "${COMMON[@]}" \
+            --output "$RUNNER_TEMP/v254-pre-exposure-route-pause-plan.json"
+          APPROVAL_HASH="$(jq -er '.approvalHash | select(test("^[0-9a-f]{64}$"))' \
+            "$RUNNER_TEMP/v254-pre-exposure-route-pause-plan.json")"
+          pnpm release:v254:route-control -- apply "${COMMON[@]}" \
+            --approval-hash "$APPROVAL_HASH" \
+            --output "$RUNNER_TEMP/v254-editorial-route-authority.json"
+          jq -e --arg phase "$PHASE" --arg approval "$APPROVAL_HASH" \
+            '.schemaVersion == "genio-v254-editorial-route-authority/v1"
+             and .phase == $phase and .approvalHash == $approval
+             and .database.hardSwitchDisabled == false
+             and .database.globalPublicPause == true
+             and .database.intentPublicPause == true
+             and (.imageDigest | test("^sha256:[0-9a-f]{64}$"))' \
+            "$RUNNER_TEMP/v254-editorial-route-authority.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: v254-pre-exposure-route-pause-${{ inputs.phase }}-${{ inputs.source_revision }}
+          path: |
+            ${{ runner.temp }}/v254-pre-exposure-route-pause-plan.json
+            ${{ runner.temp }}/v254-editorial-route-authority.json
+          if-no-files-found: error
+          retention-days: 30

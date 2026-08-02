@@ -35,5 +35,16 @@ describe("exact SHA image workflow", () => {
     expect(workflow).toContain("IMAGE_DIGEST=\"${IMAGE_REFERENCE##*@}\"");
     expect(workflow).toContain("image_reference=$IMAGE_REFERENCE");
     expect(workflow).toContain("image_digest=$IMAGE_DIGEST");
+    expect(workflow).toContain("candidate_tag:");
+    expect(workflow).toContain(
+      "scripts/native-v254-candidate-evidence.ts",
+    );
+    expect(workflow).toContain("native-v254-candidate-evidence.json");
+    expect(workflow).toContain(
+      'test "$(git cat-file -t "$TAG_OBJECT")" = "tag"',
+    );
+    expect(workflow).toContain(
+      'test "$(git rev-parse "$TAG_OBJECT^{}")" = "$SOURCE_REVISION"',
+    );
   });
 });

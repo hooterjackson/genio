@@ -101,26 +101,44 @@ export function canonicalContractExecutionPolicyV1(
   contract.playlistConstraints.forEach(({ predicate }) => (
     predicateClauseIds(copyPredicate(predicate), referenced)
   ));
+  const centralSuitabilityClauseIds = new Set(
+    contract.qualityPolicy.centralSuitabilityClauseIds,
+  );
+  centralSuitabilityClauseIds.forEach((id) => referenced.add(id));
   const clauses: CanonicalPlaylistContractClauseV1[] = contract.clauses
     .filter((clause) => referenced.has(clause.id))
     .map((clause) => {
-      if (clause.scope !== "track"
-        || clause.hardness !== "hard"
-        || ![
+      const centralSuitability = centralSuitabilityClauseIds.has(clause.id);
+      const validCentralSuitability = centralSuitability
+        && clause.scope === "track"
+        && clause.hardness === "soft"
+        && clause.kind === "suitability"
+        && clause.operator === "prefer";
+      const validHardTrackClause = !centralSuitability
+        && clause.scope === "track"
+        && clause.hardness === "hard"
+        && [
           "membership",
           "factual_relationship",
           "suitability",
           "exclusion",
           "catalog_version",
         ].includes(clause.kind)
-        || !["require", "exclude"].includes(clause.operator)) {
+        && ["require", "exclude"].includes(clause.operator);
+      if (!validCentralSuitability && !validHardTrackClause) {
         throw new Error(`unsupported_canonical_runtime_clause:${clause.id}`);
       }
       return {
         id: clause.id,
         kind: clause.kind as CanonicalPlaylistContractClauseV1["kind"],
         axis: clause.axis,
-        operator: clause.operator as CanonicalPlaylistContractClauseV1["operator"],
+        // Central suitability remains outside `trackPredicate`; projecting its
+        // positive preference as a runtime requirement lets evidence coverage
+        // and quality-floor evaluation share the exact clause obligation
+        // without turning it into hard per-track membership.
+        operator: centralSuitability
+          ? "require" as const
+          : clause.operator as CanonicalPlaylistContractClauseV1["operator"],
         values: [...clause.values, ...clause.concepts.flatMap((concept) => {
           if (concept.status !== "resolved" || !concept.selectedConceptId) return [];
           const selected = concept.candidates.find(
@@ -355,6 +373,7 @@ function clauseStatus(
   assessment: CanonicalPlaylistContractClauseAssessmentV1 | undefined,
   evidencePolicyVersion: string,
   evidenceStrengthPolicyVersion: string,
+  applyUnknownPolicy = true,
 ): CanonicalPlaylistContractTriStateV1 {
   const observed = assessment?.status;
   const raw: CanonicalPlaylistContractTriStateV1 = observed === "pass"
@@ -380,6 +399,7 @@ function clauseStatus(
     if (supported === "fail") return "pass";
   }
   if (supported !== "unknown") return supported;
+  if (!applyUnknownPolicy) return "unknown";
   return clause.unknownPolicy === "reject"
     ? "fail"
     : clause.unknownPolicy === "allow"
@@ -430,6 +450,35 @@ export function evaluateCanonicalContractTrackV1(input: {
       input.assessments[id],
       input.policy.evidencePolicyVersion,
       input.policy.evidenceStrengthPolicyVersion,
+    );
+    clauseStatuses[id] = evaluated;
+    return evaluated;
+  });
+  return { status, eligible: status === "pass", clauseStatuses };
+}
+
+/**
+ * Evaluate what the evidence actually established without converting an
+ * unknown through the contract's selection policy. Selection may still fail
+ * closed on unknown, but persistence and coverage auditing must retain the
+ * difference between "not proven" and a factual negative.
+ */
+export function evaluateCanonicalContractTrackEvidenceStateV1(input: {
+  policy: CanonicalPlaylistContractExecutionPolicyV1;
+  assessments: Readonly<Record<string, CanonicalPlaylistContractClauseAssessmentV1>>;
+}): CanonicalContractTrackEvaluationV1 {
+  assertCanonicalContractExecutionPolicyV1(input.policy);
+  const clauses = new Map(input.policy.clauses.map((clause) => [clause.id, clause]));
+  const clauseStatuses: Record<string, CanonicalPlaylistContractTriStateV1> = {};
+  const status = evaluatePredicate(input.policy.trackPredicate, (id) => {
+    const clause = clauses.get(id);
+    if (!clause) throw new Error("unknown_canonical_contract_runtime_clause");
+    const evaluated = clauseStatuses[id] ?? clauseStatus(
+      clause,
+      input.assessments[id],
+      input.policy.evidencePolicyVersion,
+      input.policy.evidenceStrengthPolicyVersion,
+      false,
     );
     clauseStatuses[id] = evaluated;
     return evaluated;

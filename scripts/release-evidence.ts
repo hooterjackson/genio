@@ -344,7 +344,7 @@ const REQUIRED_RUNTIME_CONTRACT = Object.freeze({
   queryPlanSchemaVersion: "6",
 });
 const REQUIRED_RUNTIME_POLICY_VERSIONS = Object.freeze({
-  guidance: "adaptive_guidance_v4",
+  guidance: "adaptive_guidance_v5",
   evidence: "governed_evidence_v2",
 });
 
@@ -771,7 +771,7 @@ export function validateRuntimeSnapshot(
     );
     if (
       typeof publicRollout.stage !== "string"
-      || !/^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u
+      || !/^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u
         .test(publicRollout.stage)
     ) {
       throw new Error(
@@ -1576,7 +1576,7 @@ export function validateReleaseEvidencePayload(value: unknown): ReleaseEvidenceP
       );
       if (
         typeof publicRollout.stage !== "string"
-        || !/^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u
+        || !/^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u
           .test(publicRollout.stage)
       ) {
         throw new Error(

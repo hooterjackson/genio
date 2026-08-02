@@ -28,6 +28,7 @@ import {
 } from "./worker-protocol.ts";
 import { ADAPTIVE_GUIDANCE_POLICY_VERSION } from "./adaptive-guidance-v3.ts";
 import { ADAPTIVE_GUIDANCE_POLICY_VERSION_V4 } from "./adaptive-guidance-v4.ts";
+import { ADAPTIVE_GUIDANCE_POLICY_VERSION_V5 } from "./adaptive-guidance-v5.ts";
 import { PLAYLIST_CONTRACT_EVIDENCE_POLICY_VERSION } from "./playlist-contract-v1.ts";
 import {
   capabilityPepperRotationStatus,
@@ -76,6 +77,10 @@ export interface RuntimeReleaseContract {
   factualFeasibilityApproved: boolean;
   publicRolloutEvidenceHash: string | null;
   publicRolloutStage: string | null;
+  directExposurePreconditionsHash: string | null;
+  directExposureRollbackPlanHash: string | null;
+  directExposureStage: string | null;
+  directExposureTargetConfigurationHash: string | null;
   schemaVersion: string;
   schemaMinimum: string;
   schemaMaximum: string;
@@ -193,6 +198,7 @@ export const SEMANTIC_EXECUTION_CONFIGURATION_REVIEWED_EXCLUSIONS_V1 =
       "PIPELINE_V2_CURATED_PERCENT",
       "PIPELINE_V2_FACTUAL_PERCENT",
       "PIPELINE_V2_SIMILARITY_PERCENT",
+      "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
       "PIPELINE_V3_ARTIST_CATALOGUE_PERCENT",
       "PIPELINE_V3_EXHAUSTIVE_PERCENT",
       "PIPELINE_V3_FACTUAL_PERCENT",
@@ -214,6 +220,14 @@ export const SEMANTIC_EXECUTION_CONFIGURATION_REVIEWED_EXCLUSIONS_V1 =
       "RELEASE_PUBLIC_ROLLOUT_STAGE",
       "RELEASE_PUBLIC_ROLLOUT_TO_PERCENT",
       "RELEASE_VERIFIED_CANDIDATE_EVIDENCE_HASH",
+      // These values fence one signed 0 -> 100 exposure and its rollback.
+      // They are validated as an all-or-none tuple below, but cannot be inputs
+      // to the semantic configuration hash that the signed preconditions bind:
+      // doing so would make that hash recursively depend on itself.
+      "RELEASE_V254_DIRECT_EXPOSURE_PRECONDITIONS_HASH",
+      "RELEASE_V254_DIRECT_EXPOSURE_ROLLBACK_PLAN_HASH",
+      "RELEASE_V254_DIRECT_EXPOSURE_STAGE",
+      "RELEASE_V254_DIRECT_EXPOSURE_TARGET_CONFIGURATION_HASH",
     ] as const),
     credentials: Object.freeze([
       "APPLE_KEY_ID",
@@ -320,6 +334,43 @@ export const SERVER_ENVIRONMENT_READ_REVIEWED_EXCLUSIONS_V1 =
  */
 export const SERVER_DYNAMIC_ENVIRONMENT_READ_SOURCES_V1 = Object.freeze([
   Object.freeze({
+    site: "public-rollout-assignment.ts:environment[key]",
+    occurrences: 1,
+    keys: Object.freeze([
+      "PIPELINE_V2_OWNER_CANARY",
+      "PIPELINE_V2_CURATED_PERCENT",
+      "PIPELINE_V2_SIMILARITY_PERCENT",
+      "PIPELINE_V2_FACTUAL_OWNER_CANARY",
+      "PIPELINE_V2_FACTUAL_PERCENT",
+      "PIPELINE_V3_ASSIGNMENT_ENABLED",
+      "PIPELINE_V3_OWNER_CANARY",
+      "PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED",
+      "PIPELINE_V3_OWNER_CANARY_GROUPS",
+      "PIPELINE_V3_OWNER_CANARY_MAX_TRACKS",
+      "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
+      "PIPELINE_V3_GENRE_SCENE_PERCENT",
+      "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
+      "PIPELINE_V3_SIMILARITY_PERCENT",
+      "PIPELINE_V3_ARTIST_CATALOGUE_PERCENT",
+      "PIPELINE_V3_FIXED_CONTAINER_PERCENT",
+      "PIPELINE_V3_FACTUAL_PERCENT",
+      "PIPELINE_V3_EXHAUSTIVE_PERCENT",
+      "PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED",
+      "PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED",
+      "PIPELINE_V3_GEOGRAPHIC_SCOPE_EVIDENCE_APPROVED",
+      "PIPELINE_V3_FACTUAL_FEASIBILITY_APPROVED",
+      "RELEASE_EXPECTED_DATABASE_CAPABILITY_VERSION",
+      "RELEASE_EXPECTED_MANIFEST_CANARY_GUARDS_VERSION",
+      "RELEASE_EXPECTED_CANONICAL_EXECUTION_HARDENING_VERSION",
+      "RELEASE_EXPECTED_PROOF_ARCHITECTURE_VERSION",
+      "PIPELINE_V3_PROOF_ARCHITECTURE_MODE",
+      "PIPELINE_V3_QUERY_PLAN_SCHEMA_VERSION",
+      "GUIDANCE_CONTRACT_V3_ENABLED",
+      "GUIDANCE_CONTRACT_V3_OWNER_CANARY",
+      "GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED",
+    ] as const),
+  }),
+  Object.freeze({
     site: "cost-config.ts:environment[primary]",
     occurrences: 2,
     keys: Object.freeze([
@@ -424,6 +475,7 @@ export const SERVER_DYNAMIC_ENVIRONMENT_READ_SOURCES_V1 = Object.freeze([
     site: "query-plan-v3.ts:env[pipelineV3RolloutVariable(group)]",
     occurrences: 1,
     keys: Object.freeze([
+      "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
       "PIPELINE_V3_ARTIST_CATALOGUE_PERCENT",
       "PIPELINE_V3_EXHAUSTIVE_PERCENT",
       "PIPELINE_V3_FACTUAL_PERCENT",
@@ -575,6 +627,10 @@ export const API_RELEASE_CONFIGURATION_ENV_KEYS = Object.freeze([
   "RELEASE_PUBLIC_ROLLOUT_FROM_PERCENT",
   "RELEASE_PUBLIC_ROLLOUT_TO_PERCENT",
   "RELEASE_PREVIOUS_PUBLIC_ROLLOUT_EVIDENCE_HASH",
+  "RELEASE_V254_DIRECT_EXPOSURE_PRECONDITIONS_HASH",
+  "RELEASE_V254_DIRECT_EXPOSURE_ROLLBACK_PLAN_HASH",
+  "RELEASE_V254_DIRECT_EXPOSURE_STAGE",
+  "RELEASE_V254_DIRECT_EXPOSURE_TARGET_CONFIGURATION_HASH",
   "QA_STAGING_CONTROL_HASH",
   "REQUIRE_WORKER_HEARTBEAT",
   "CAPABILITY_SESSION_TTL_DAYS",
@@ -628,6 +684,7 @@ export const API_RELEASE_CONFIGURATION_ENV_KEYS = Object.freeze([
   "PIPELINE_V3_OWNER_CANARY",
   "PIPELINE_V3_OWNER_CANARY_GROUPS",
   "PIPELINE_V3_OWNER_CANARY_MAX_TRACKS",
+  "PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT",
   "PIPELINE_V3_GENRE_SCENE_PERCENT",
   "PIPELINE_V3_MOOD_ACTIVITY_PERCENT",
   "PIPELINE_V3_SIMILARITY_PERCENT",
@@ -711,6 +768,43 @@ export function runtimeReleaseContract(
     queryPlanV3EmissionSchemaVersion(environment);
   const ownerAllowlistVersion = releaseOwnerAllowlistVersion(environment);
   const capabilityPepper = capabilityPepperRotationStatus(environment);
+  const directExposurePreconditionsHash =
+    environment.RELEASE_V254_DIRECT_EXPOSURE_PRECONDITIONS_HASH?.trim() ?? "";
+  const directExposureRollbackPlanHash =
+    environment.RELEASE_V254_DIRECT_EXPOSURE_ROLLBACK_PLAN_HASH?.trim()
+      ?? "";
+  const directExposureStage =
+    environment.RELEASE_V254_DIRECT_EXPOSURE_STAGE?.trim() ?? "";
+  const directExposureTargetConfigurationHash =
+    environment.RELEASE_V254_DIRECT_EXPOSURE_TARGET_CONFIGURATION_HASH?.trim()
+      ?? "";
+  const directExposureMarkers = [
+    directExposurePreconditionsHash,
+    directExposureRollbackPlanHash,
+    directExposureStage,
+    directExposureTargetConfigurationHash,
+  ];
+  if (
+    directExposureMarkers.some(Boolean)
+    && (
+      directExposureMarkers.some((value) => !value)
+      || !/^[0-9a-f]{64}$/u.test(directExposurePreconditionsHash)
+      || !/^[0-9a-f]{64}$/u.test(directExposureRollbackPlanHash)
+      || directExposureStage
+        !== "editorial_influence:0->100:fully_exposed_unproven"
+      || !/^[0-9a-f]{64}$/u.test(directExposureTargetConfigurationHash)
+      || [
+        environment.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH,
+        environment.RELEASE_PUBLIC_ROLLOUT_ROLLBACK_WARRANT_HASH,
+        environment.RELEASE_PUBLIC_ROLLOUT_INTENT_CANARY_HASH,
+        environment.RELEASE_PUBLIC_ROLLOUT_STAGE,
+      ].some((value) => (value?.trim() ?? "") !== "")
+    )
+  ) {
+    throw new Error(
+      "direct exposure runtime markers are incomplete or conflict with standard rollout authority",
+    );
+  }
   return Object.freeze({
     pipelineVersion: "corpus_first_v3",
     semanticExecutionConfigurationHash:
@@ -740,11 +834,17 @@ export function runtimeReleaseContract(
         ? environment.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_HASH!.trim()
         : null,
     publicRolloutStage:
-      /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u.test(
+      /^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->(?:0|1|10|50|100)$/u.test(
         environment.RELEASE_PUBLIC_ROLLOUT_STAGE?.trim() ?? "",
       )
         ? environment.RELEASE_PUBLIC_ROLLOUT_STAGE!.trim()
         : null,
+    directExposurePreconditionsHash: directExposurePreconditionsHash || null,
+    directExposureRollbackPlanHash:
+      directExposureRollbackPlanHash || null,
+    directExposureStage: directExposureStage || null,
+    directExposureTargetConfigurationHash:
+      directExposureTargetConfigurationHash || null,
     schemaVersion: DATABASE_SCHEMA_VERSION,
     schemaMinimum: DATABASE_SCHEMA_SUPPORT.minimum,
     schemaMaximum: DATABASE_SCHEMA_SUPPORT.maximum,
@@ -770,7 +870,9 @@ export function runtimeReleaseContract(
     guidanceContractReggaetonCanaryEnabled:
       canonicalActivationConfigured
       && environment.GUIDANCE_CONTRACT_V3_REGGAETON_ENABLED === "true",
-    guidancePolicyVersion: canonicalContractActive
+    guidancePolicyVersion: environment.GUIDANCE_V5_ENABLED === "true"
+      ? ADAPTIVE_GUIDANCE_POLICY_VERSION_V5
+      : canonicalContractActive
       ? emittedQueryPlanSchemaVersion === 6
         ? ADAPTIVE_GUIDANCE_POLICY_VERSION_V4
         : ADAPTIVE_GUIDANCE_POLICY_VERSION

@@ -55,11 +55,19 @@ type WorkingIndicatorProps = {
   motion: PlaylistWorkMotion;
   phaseLabel: string;
   sourceCount?: number;
+  /** Authoritative deduplicated lead count when provider observations exceed it. */
+  sourceCountOverride?: number | null;
+  /** Cumulative provider observations, displayed separately from unique leads. */
+  observationCount?: number | null;
   candidateCount?: number;
   unresolvedCount?: number;
   targetCount?: number | null;
   reserveCount?: number | null;
   candidateStageCounts?: CandidateStageCounts;
+  /** Authoritative evidence-qualified count when catalog facts outlive a gate. */
+  qualifiedCountOverride?: number | null;
+  /** Authoritative Apple-playable count observed before evidence rejection. */
+  appleReadyCountOverride?: number | null;
   frontier?: WorkingFrontierItem[];
   createdAt?: string;
   updatedAt?: string;
@@ -170,11 +178,15 @@ export function WorkingIndicator({
   motion,
   phaseLabel,
   sourceCount,
+  sourceCountOverride,
+  observationCount,
   candidateCount,
   unresolvedCount,
   targetCount,
   reserveCount,
   candidateStageCounts,
+  qualifiedCountOverride,
+  appleReadyCountOverride,
   frontier = [],
   createdAt,
   updatedAt,
@@ -200,16 +212,26 @@ export function WorkingIndicator({
   const elapsedSeconds = now !== null && Number.isFinite(created)
     ? Math.floor((now - created) / 1000)
     : null;
-  const qualifiedCount = cumulativeCandidateCount(candidateStageCounts, "scope_qualified");
+  const derivedQualifiedCount = cumulativeCandidateCount(
+    candidateStageCounts,
+    "scope_qualified",
+  );
+  const qualifiedCount = typeof qualifiedCountOverride === "number"
+    ? safeCount(qualifiedCountOverride)
+    : derivedQualifiedCount;
   const playableCount = cumulativeCandidateCount(candidateStageCounts, "playable");
   const selectedCount = cumulativeCandidateCount(candidateStageCounts, "selected");
-  const sourceTotal = progress?.sourceSummary.total ?? sourceCount;
-  const appleReadyCount = playableCount === null && !progress
-    ? null
-    : Math.max(
-      safeCount(playableCount),
-      safeCount(progress?.matchSummary.accepted),
-    );
+  const sourceTotal = typeof sourceCountOverride === "number"
+    ? safeCount(sourceCountOverride)
+    : progress?.sourceSummary.total ?? sourceCount;
+  const appleReadyCount = typeof appleReadyCountOverride === "number"
+    ? safeCount(appleReadyCountOverride)
+    : playableCount === null && !progress
+      ? null
+      : Math.max(
+        safeCount(playableCount),
+        safeCount(progress?.matchSummary.accepted),
+      );
   const readyForTarget = Math.max(
     safeCount(appleReadyCount),
     safeCount(selectedCount),
@@ -303,6 +325,12 @@ export function WorkingIndicator({
           <span><small>QUALIFIED</small><strong>{displayCount(qualifiedCount)}</strong></span>
           <span><small>APPLE READY</small><strong>{displayCount(appleReadyCount)}</strong></span>
           <span><small>SOURCES</small><strong>{displayCount(sourceTotal)}</strong></span>
+          {typeof observationCount === "number" && (
+            <span>
+              <small>OBSERVATIONS</small>
+              <strong>{displayCount(observationCount)}</strong>
+            </span>
+          )}
           <span><small>OPEN GAPS</small><strong>{displayCount(unresolvedCount)}</strong></span>
         </div>
       )}

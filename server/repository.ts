@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
 import type { Pool, PoolClient } from "pg";
 import {
   createDatabase,
@@ -9,7 +8,6 @@ import {
   type DatabaseHandle,
   type DatabaseSchemaSupport,
 } from "../db/index.ts";
-import { settings } from "../db/schema.ts";
 import {
   assertAttemptOutputDeterministicV1,
   assertPartialPublicationConsentBindingV1,
@@ -27,6 +25,7 @@ import {
 } from "./schema20-proof-architecture.ts";
 import type {
   AlternateCatalogIdentity,
+  BriefGuidanceExecutionActionView,
   CandidateStage,
   CandidateStageEvent,
   CatalogDiscoveredCandidateInput,
@@ -58,7 +57,10 @@ import type {
   RunProgressRecentSource,
   RunProgressView,
   RunGuidanceActionView,
+  RunEvidenceCoverageView,
+  RunExecutionRouteReceiptView,
   RunNextAction,
+  RunRepairReplayActionView,
   RunResolutionView,
   RunWorkMotion,
   RunStatus,
@@ -80,6 +82,8 @@ import {
   queryPlanV3EmissionSchemaVersion,
   queryPlanV3Hash,
   VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION,
+  type CanonicalQueryPlanGuidancePolicyVersion,
+  type PipelineV3Assignment,
 } from "./query-plan-v3.ts";
 import {
   createRunSpecV3,
@@ -99,6 +103,18 @@ import {
   v3RetrievalStageKey,
   type PipelineV3WriteFence,
 } from "./pipeline-v3-worker-execution.ts";
+import {
+  assertGuidanceWorkerConsumptionReceiptV5,
+  createGuidanceWorkerExecutionAuthorityV5,
+  guidanceWorkerConsumptionCheckpointKeyV5,
+  GUIDANCE_V5_EXECUTION_AUTHORITY_CHECKPOINT,
+  type GuidanceWorkerConsumptionReceiptV5,
+} from "./guidance-worker-consumption-v5.ts";
+import {
+  assertGuidanceV5V2WorkerConsumptionReceipt,
+  GUIDANCE_V5_V2_WORKER_CONSUMPTION_CHECKPOINT,
+  type GuidanceV5V2WorkerConsumptionReceipt,
+} from "./guidance-v5-v2-execution.ts";
 import type {
   CatalogProviderBlockerV2,
   CatalogProviderJobAuthorityV2,
@@ -155,6 +171,8 @@ import type {
   CandidateQualificationV3,
   DiscoveryBatchV3,
   DiscoveryRequestV3,
+  EvidenceAcquisitionAttemptV3,
+  EvidenceAcquisitionObservationV3,
   EvidenceEligibilityAttestationV3,
   EvidenceBindingReferenceV3,
   QualificationRequestV3,
@@ -218,22 +236,45 @@ import {
 import {
   ACTIVE_COMPUTE_EXTENSION_MS_V1,
   MAX_ACTIVE_COMPUTE_EXTENSIONS_V1,
+  advancingAdaptiveRunDecisionActionV1,
   publicAdaptiveRunDecisionV1,
 } from "./adaptive-run-decision-v1.ts";
-import { evaluateCanonicalContractTrackV1 } from "./canonical-contract-runtime-v1.ts";
+import {
+  evaluateCanonicalContractTrackEvidenceStateV1,
+  evaluateCanonicalContractTrackV1,
+} from "./canonical-contract-runtime-v1.ts";
+import {
+  centralQualityVerificationLeavesV1,
+  verificationLeavesV1,
+} from "./verification-expression-v1.ts";
 import {
   assertPublicRolloutAssignmentDatabaseAuthorityV1,
   assertPublicRolloutExecutionEligibilityV1,
   assertPublicRolloutExecutionGroupV1,
   parsePublicRolloutAssignmentV1,
+  publicRolloutAssignmentAuthoritySettingKeyV1,
+  V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION,
   type PublicRolloutDatabaseAuthorityV1,
   type PersistedPublicRolloutAssignmentV1,
+  type V254DirectExposureDatabaseAuthorityV1,
 } from "./public-rollout-assignment.ts";
 import {
+  compileGuidanceExecutionActionV5,
   compileGuidanceRoundPatchV3,
+  guidanceExecutionDecisionV5FromPublicQuestion,
   guidanceDecisionV3FromPublicQuestion,
   publicGuidanceQuestionV3,
+  publicGuidanceQuestionV5,
 } from "./adaptive-guidance-contract-bridge.ts";
+import {
+  ADAPTIVE_GUIDANCE_POLICY_VERSION_V5,
+  guidanceCheckpointV5,
+} from "./adaptive-guidance-v5.ts";
+import {
+  createGuidanceV5V2ExecutionAuthority,
+  GUIDANCE_V5_V2_EXECUTION_AUTHORITY_CHECKPOINT,
+  projectGuidanceV5SuccessorToSelectionPlanV2,
+} from "./guidance-v5-v2-execution.ts";
 import {
   createGuidanceDecisionV3,
   customGuidanceConfirmationDecisionV3,
@@ -384,6 +425,49 @@ import { runtimeReleaseContract } from "./runtime-release.ts";
 import type { UnsignedReleaseCanaryMetadata } from "./release-canary-metadata.ts";
 import { persistReleaseCanaryMarker } from "./release-canary-persistence.ts";
 import {
+  createExecutionRouteReceiptV1,
+  EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+  EXECUTION_ROUTE_RECEIPT_VERSION_V1,
+  parseExecutionRouteReceiptV1,
+  type ExecutionRouteReceiptV1,
+} from "./execution-route-receipt-v1.ts";
+import {
+  LEGACY_EXECUTION_ROUTE_DRAIN_PHASE_V1,
+  legacyExecutionRouteDrainAuthorizesJobV1,
+} from "./legacy-execution-route-drain-v1.ts";
+import {
+  createSemanticCollapseDatabaseFactsV2,
+  type SemanticCollapseDatabaseFactsV2,
+} from "./semantic-collapse-coverage-v2.ts";
+import {
+  createLegacyRepairAuthorityConsumptionV1,
+  createLegacyRepairRunAdmissionV1,
+  decideLegacyRepairAuthorityUseV1,
+  LEGACY_REPAIR_AUTHORITY_PHASE_V1,
+  LEGACY_REPAIR_CONSUMPTION_PHASE_V1,
+  LEGACY_REPAIR_RUN_ADMISSION_PHASE_V1,
+  parseLegacyRepairAuthorityConsumptionV1,
+  parseLegacyRepairAuthorityV1,
+  parseLegacyRepairRunAdmissionV1,
+  repairReplayPauseDecisionV1,
+  validateLegacyRepairAuthorityFenceV1,
+  type LegacyRepairAuthorityConsumptionV1,
+  type LegacyRepairAuthorityV1,
+  type ObservedLegacyRepairFenceV1,
+} from "./legacy-repair-authority-v1.ts";
+import {
+  createTechnicalRepairReplayConsumptionV1,
+  createTechnicalRepairRunAdmissionV1,
+  decideTechnicalRepairReplayUseV1,
+  parseTechnicalRepairReplayConsumptionV1,
+  parseTechnicalRepairRunAdmissionV1,
+  technicalRepairReplayAvailabilityV1,
+  TECHNICAL_REPAIR_REPLAY_CONSUMPTION_PHASE_V1,
+  TECHNICAL_REPAIR_REPLAY_CONSUMPTION_VERSION_V1,
+  TECHNICAL_REPAIR_RUN_ADMISSION_PHASE_V1,
+  type TechnicalRepairReplayConsumptionV1,
+} from "./technical-repair-replay-v1.ts";
+import {
   deriveGuidancePreferences,
   guidanceOrderingPolicy,
   safeCustomGuidanceText,
@@ -394,6 +478,7 @@ import {
   assignPipelineV2,
   createSelectionPlanV2,
   pipelineRolloutStickyKey,
+  pipelineV2RolloutGroup,
   pipelineV2Route,
 } from "./selection-plan-v2.ts";
 import {
@@ -485,6 +570,31 @@ const FEEDBACK_STORAGE_LIMIT_BYTES = Math.max(
 );
 const AUTOMATIC_FAILURE_DIAGNOSTIC_LIMIT_BYTES = 128 * 1024;
 const CAPABILITY_HASH = /^[a-f0-9]{64}$/u;
+const PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_PHASE_V1 =
+  "v3:evidence-acquisition:v1";
+const PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_VERSION_V1 =
+  "pipeline_v3_evidence_acquisition_ledger_v1";
+
+interface PipelineV3EvidenceAcquisitionReceiptV1 {
+  receiptHash: string;
+  contractRevisionId: string;
+  queryPlanRevisionId: string;
+  queryPlanHash: string;
+  executionAttemptId: string;
+  strategyId: string;
+  strategyRound: number;
+  obligationIds: string[];
+  producerFamily: EvidenceAcquisitionAttemptV3["producerFamily"];
+  dependencyRootId: EvidenceAcquisitionAttemptV3["dependencyRootId"];
+  strategyDeltaProofHash: string;
+  automaticRescueOrdinal: 1 | 2;
+  operation: EvidenceAcquisitionObservationV3["operation"];
+  attemptedAt: string;
+  outcome: EvidenceAcquisitionObservationV3["outcome"];
+  failureClass: string | null;
+  retryAfterUntil: string | null;
+  completedAt: string | null;
+}
 
 const PRIVATE_DIAGNOSTIC_KEY = /(authorization|bearer|bucket|cookie|credential|email|header|key|password|provider.?body|raw.?response|secret|stack|token)/iu;
 
@@ -749,6 +859,10 @@ function pipelineCohortLeaseAllowedSql(jobAlias: "candidate" | "job_queue" | "jo
         WHEN plan.plan_json->'engines' ? 'fixed_container' THEN 'fixed_container'
         WHEN plan.plan_json->'engines' ? 'artist_catalogue' THEN 'artist_catalogue'
         WHEN plan.plan_json->'engines' ? 'similarity' THEN 'similarity'
+        WHEN (
+          plan.plan_json->'rankingObjectives' @> '[{"kind":"influence"}]'::jsonb
+          OR plan.plan_json->'rankingObjectives' @> '[{"dimension":"influence"}]'::jsonb
+        ) THEN 'editorial_influence'
         WHEN (plan.plan_json->'engines'->>0)='mood_activity_theme'
           THEN 'mood_activity_theme'
         ELSE 'genre_scene'
@@ -1070,9 +1184,523 @@ export function canonicalExecutorReleaseIdentityV1(
   };
 }
 
+function canonicalQueryPlanGuidancePolicyVersionV1(
+  value: string | null | undefined,
+): CanonicalQueryPlanGuidancePolicyVersion {
+  return value === "adaptive_guidance_v5"
+    ? "adaptive_guidance_v5"
+    : "adaptive_guidance_v4";
+}
+
+function queryPlanCapabilitySnapshotHashV1(plan: QueryPlanV3): string {
+  return plan.executorCapabilityHash ?? sha256Hex(stableStringify({
+    kind: "legacy_query_plan_capability_snapshot_v1",
+    schemaVersion: plan.schemaVersion,
+    pipelineVersion: plan.pipelineVersion,
+    policyVersion: plan.policyVersion,
+    engine: plan.engine,
+    engines: plan.engines,
+  }));
+}
+
+function releaseCanaryExecutionAuthorityHashV1(
+  metadata: UnsignedReleaseCanaryMetadata,
+): string {
+  return sha256Hex(stableStringify({
+    kind: "authenticated_release_canary_owner_v1",
+    metadata,
+  }));
+}
+
+function legacyControlExecutionAuthorityHashV1(input: {
+  briefHash: string;
+  runSpecHash: string;
+  contractVersion: 1 | 2 | 3;
+  executionRoute: string;
+}): string {
+  return sha256Hex(stableStringify({
+    kind: "legacy_control_execution_v1",
+    ...input,
+  }));
+}
+
+function executionRouteReceiptMismatch(): never {
+  throw new HttpError(
+    409,
+    "The executable route no longer matches its immutable admission receipt",
+    "execution_route_receipt_mismatch",
+  );
+}
+
+interface ExecutionRouteContinuationRuntimeBindingV1 {
+  activeQueryPlanRevisionId: string;
+  activeQueryPlanRevision: number;
+  activeSelectionPlanId: string;
+  activeGraphSnapshotId: string;
+  activeEngine: string;
+  activeParentRevisionId: string | null;
+  parentQueryPlanRevisionId: string | null;
+  parentQueryPlanRevision: number | null;
+  parentSelectionPlanId: string | null;
+  parentGraphSnapshotId: string | null;
+  parentEngine: string | null;
+  parentQueryPlanStatus: string | null;
+  parentQueryPlanHash: string | null;
+  parentQueryPlan: QueryPlanV3 | null;
+  continuationCheckpoint: unknown | null;
+  continuationJob: {
+    id: string;
+    runId: string | null;
+    kind: string;
+    pipelineVersion: string;
+    queryPlanRevisionId: string | null;
+    stageKey: string;
+    payload: unknown;
+  } | null;
+}
+
+interface ExecutionRouteContinuationDatabaseRowV1 {
+  query_plan_revision_id: string | null;
+  query_plan_revision: number | null;
+  query_plan_selection_plan_id: string | null;
+  query_plan_graph_snapshot_id: string | null;
+  query_plan_engine: string | null;
+  query_plan_parent_revision_id: string | null;
+  parent_query_plan_revision_id: string | null;
+  parent_query_plan_revision: number | null;
+  parent_query_plan_selection_plan_id: string | null;
+  parent_query_plan_graph_snapshot_id: string | null;
+  parent_query_plan_engine: string | null;
+  parent_query_plan_status: string | null;
+  parent_query_plan_hash: string | null;
+  parent_query_plan_json: unknown | null;
+  continuation_checkpoint: unknown | null;
+  continuation_job_id: string | null;
+  continuation_job_run_id: string | null;
+  continuation_job_kind: string | null;
+  continuation_job_pipeline_version: string | null;
+  continuation_job_query_plan_revision_id: string | null;
+  continuation_job_stage_key: string | null;
+  continuation_job_payload: unknown | null;
+}
+
+function executionRouteContinuationRuntimeBindingV1(
+  row: ExecutionRouteContinuationDatabaseRowV1,
+): ExecutionRouteContinuationRuntimeBindingV1 | null {
+  if (row.query_plan_revision_id === null
+    || row.query_plan_revision === null
+    || row.query_plan_selection_plan_id === null
+    || row.query_plan_graph_snapshot_id === null
+    || row.query_plan_engine === null) return null;
+  return {
+    activeQueryPlanRevisionId: row.query_plan_revision_id,
+    activeQueryPlanRevision: Number(row.query_plan_revision),
+    activeSelectionPlanId: row.query_plan_selection_plan_id,
+    activeGraphSnapshotId: row.query_plan_graph_snapshot_id,
+    activeEngine: row.query_plan_engine,
+    activeParentRevisionId: row.query_plan_parent_revision_id,
+    parentQueryPlanRevisionId: row.parent_query_plan_revision_id,
+    parentQueryPlanRevision: row.parent_query_plan_revision === null
+      ? null
+      : Number(row.parent_query_plan_revision),
+    parentSelectionPlanId: row.parent_query_plan_selection_plan_id,
+    parentGraphSnapshotId: row.parent_query_plan_graph_snapshot_id,
+    parentEngine: row.parent_query_plan_engine,
+    parentQueryPlanStatus: row.parent_query_plan_status,
+    parentQueryPlanHash: row.parent_query_plan_hash,
+    parentQueryPlan: isQueryPlanV3(row.parent_query_plan_json)
+      ? row.parent_query_plan_json
+      : null,
+    continuationCheckpoint: row.continuation_checkpoint,
+    continuationJob: row.continuation_job_id !== null
+      && row.continuation_job_kind !== null
+      && row.continuation_job_pipeline_version !== null
+      && row.continuation_job_stage_key !== null
+      ? {
+          id: row.continuation_job_id,
+          runId: row.continuation_job_run_id,
+          kind: row.continuation_job_kind,
+          pipelineVersion: row.continuation_job_pipeline_version,
+          queryPlanRevisionId:
+            row.continuation_job_query_plan_revision_id,
+          stageKey: row.continuation_job_stage_key,
+          payload: row.continuation_job_payload,
+        }
+      : null,
+  };
+}
+
+function executionRouteObjectRecordV1(
+  value: unknown,
+): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+/**
+ * A bounded continuation creates one immutable successor query plan, but it
+ * does not replace the run's original admission receipt. Authorize that
+ * successor only when the database parent, the user-consumed continuation
+ * checkpoint, and the exact queued job form one complete chain back to the
+ * receipt-bound plan. A hash copied into the successor JSON is not authority.
+ */
+function executionRouteReceiptAuthorizesContinuationV1(input: {
+  receipt: ExecutionRouteReceiptV1;
+  runId: string;
+  queryPlan: QueryPlanV3;
+  persistedQueryPlanHash: string;
+  binding: ExecutionRouteContinuationRuntimeBindingV1 | null;
+}): boolean {
+  const binding = input.binding;
+  const continuation = input.queryPlan.continuation;
+  if (!binding || !continuation || !binding.parentQueryPlan) return false;
+  const checkpoint = executionRouteObjectRecordV1(
+    binding.continuationCheckpoint,
+  );
+  const jobPayload = executionRouteObjectRecordV1(
+    binding.continuationJob?.payload,
+  );
+  if (!checkpoint || !jobPayload || !binding.continuationJob) return false;
+  if (binding.parentQueryPlanHash === null
+    || binding.parentQueryPlanRevision === null
+    || binding.parentQueryPlanRevisionId === null
+    || binding.parentSelectionPlanId === null
+    || binding.parentGraphSnapshotId === null
+    || binding.parentEngine === null) return false;
+
+  const parentPlan = binding.parentQueryPlan;
+  if (parentPlan.continuation !== undefined
+    || queryPlanV3Hash(parentPlan) !== binding.parentQueryPlanHash
+    || queryPlanV3Hash(input.queryPlan) !== input.persistedQueryPlanHash) {
+    return false;
+  }
+  const sourceStageKey =
+    `v3-retrieval:active:${binding.parentQueryPlanHash.slice(0, 48)}`;
+  const successorStageKey =
+    `v3-retrieval:active:${input.persistedQueryPlanHash.slice(0, 48)}`;
+  const successorBase = structuredClone(input.queryPlan);
+  delete successorBase.continuation;
+  const checkpointStrategyIds = Array.isArray(checkpoint.strategyIds)
+    ? checkpoint.strategyIds
+    : null;
+
+  return input.receipt.queryPlanHash === binding.parentQueryPlanHash
+    && input.receipt.queryPlanSchema === parentPlan.schemaVersion
+    && input.receipt.capabilitySnapshotHash
+      === queryPlanCapabilitySnapshotHashV1(parentPlan)
+    && binding.activeParentRevisionId === binding.parentQueryPlanRevisionId
+    && binding.parentQueryPlanRevisionId
+      === continuation.sourceQueryPlanRevisionId
+    && binding.parentQueryPlanStatus === "superseded"
+    && binding.activeQueryPlanRevision === binding.parentQueryPlanRevision + 1
+    && binding.activeSelectionPlanId === binding.parentSelectionPlanId
+    && binding.activeGraphSnapshotId === binding.parentGraphSnapshotId
+    && binding.activeEngine === binding.parentEngine
+    && stableStringify(successorBase) === stableStringify(parentPlan)
+    && continuation.sourceQueryPlanHash === binding.parentQueryPlanHash
+    && continuation.sourceStageKey === sourceStageKey
+    && checkpoint.sourceQueryPlanRevisionId
+      === continuation.sourceQueryPlanRevisionId
+    && checkpoint.sourceQueryPlanHash === continuation.sourceQueryPlanHash
+    && checkpoint.sourceStageKey === continuation.sourceStageKey
+    && checkpoint.outcomeHash === continuation.sourceOutcomeHash
+    && checkpoint.outcomeVersion === continuation.sourceOutcomeVersion
+    && checkpoint.successorQueryPlanRevisionId
+      === binding.activeQueryPlanRevisionId
+    && checkpoint.successorQueryPlanHash === input.persistedQueryPlanHash
+    && checkpoint.successorStageKey === successorStageKey
+    && checkpointStrategyIds !== null
+    && stableStringify(checkpointStrategyIds)
+      === stableStringify(continuation.strategyIds)
+    && checkpoint.jobId === binding.continuationJob.id
+    && binding.continuationJob.runId === input.runId
+    && binding.continuationJob.kind === "research"
+    && binding.continuationJob.pipelineVersion === "corpus_first_v3"
+    && binding.continuationJob.queryPlanRevisionId
+      === binding.activeQueryPlanRevisionId
+    && binding.continuationJob.stageKey === successorStageKey
+    && jobPayload.runId === input.runId
+    && jobPayload.phase === "v3_continuing_research"
+    && jobPayload.v3ExecutionMode === "active"
+    && jobPayload.stageExecutionKey === successorStageKey
+    && jobPayload.continuationOutcomeHash
+      === continuation.sourceOutcomeHash;
+}
+
+function assertExecutionRouteReceiptRuntimeBindingV1(input: {
+  value: unknown;
+  required: boolean;
+  runId: string;
+  briefRequestId: string | null;
+  briefSelectionPipelineVersion: string | null;
+  rootLineageId: string | null;
+  contractVersion: 1 | 2 | 3;
+  executionRoute: string;
+  queryPlan: QueryPlanV3 | null;
+  persistedQueryPlanHash: string | null;
+  publicRolloutAssignment: PersistedPublicRolloutAssignmentV1 | null;
+  releaseCanaryMarkerPresent: boolean;
+  legacyRepairRunAdmission: unknown | null;
+  technicalRepairRunAdmission: unknown | null;
+  continuationBinding?: ExecutionRouteContinuationRuntimeBindingV1 | null;
+}): ExecutionRouteReceiptV1 | null {
+  if (input.value === null || input.value === undefined) {
+    if (input.required) executionRouteReceiptMismatch();
+    return null;
+  }
+  const receipt = parseExecutionRouteReceiptV1(input.value);
+  if (!receipt) executionRouteReceiptMismatch();
+  const expectedBriefId = input.briefRequestId ?? `run:${input.runId}`;
+  const expectedRootLineageId = input.rootLineageId ?? expectedBriefId;
+  const signedCanaryTraffic =
+    receipt.trafficClass === "owner_canary"
+    || receipt.trafficClass === "synthetic";
+  if (signedCanaryTraffic && !input.releaseCanaryMarkerPresent) {
+    executionRouteReceiptMismatch();
+  }
+  const compatibilityDrain =
+    input.contractVersion !== 3
+    && receipt.guidanceVersion !== "adaptive_guidance_v5";
+  if (compatibilityDrain) {
+    // Directly-created Contract-1/2 runs predate route admission authority.
+    // Their persisted parser/executor route may be upgraded by the legacy
+    // bridge after run creation, and existing executor-release fencing remains
+    // authoritative for those jobs. Validate the immutable receipt itself and
+    // its lineage, but do not reinterpret it as a new-route admission fence.
+    if (
+      receipt.briefId !== expectedBriefId
+      || receipt.rootLineageId !== expectedRootLineageId
+      || receipt.contractVersion !== input.contractVersion
+      || receipt.assignmentAuthority.kind !== "legacy_control"
+      || !["legacy_v1", "catalog_first_v2", "corpus_first_v3"].includes(
+        receipt.executionRoute,
+      )
+      || !["legacy_v1", "catalog_first_v2", "corpus_first_v3"].includes(
+        input.executionRoute,
+      )
+    ) {
+      executionRouteReceiptMismatch();
+    }
+    return receipt;
+  }
+  const release = canonicalExecutorReleaseIdentityV1();
+  if (
+    receipt.briefId !== expectedBriefId
+    || receipt.rootLineageId !== expectedRootLineageId
+    || receipt.contractVersion !== input.contractVersion
+    || receipt.executionRoute !== input.executionRoute
+    || (
+      input.briefSelectionPipelineVersion !== null
+      && receipt.briefSelectionPipelineVersion
+        !== input.briefSelectionPipelineVersion
+    )
+    || receipt.releaseRevision !== release.executorRevision
+    || receipt.executorConfigurationHash
+      !== release.semanticExecutionConfigurationHash
+  ) {
+    executionRouteReceiptMismatch();
+  }
+  if (input.executionRoute === "corpus_first_v3") {
+    const queryPlan = input.queryPlan;
+    if (!queryPlan) {
+      executionRouteReceiptMismatch();
+    }
+    // Contract-1/2 V3 rows are compatibility fixtures and historical drains.
+    // Their active plan can be upgraded by the pre-Contract-3 activation
+    // bridge, so the legacy control receipt records admission identity without
+    // pretending to be Contract-3 execution authority.
+    if (input.contractVersion === 3) {
+      const persistedQueryPlanHash = input.persistedQueryPlanHash;
+      const planHashValid = persistedQueryPlanHash !== null
+        && persistedQueryPlanHash === queryPlanV3Hash(queryPlan);
+      const directPlanBinding = planHashValid
+        && receipt.queryPlanSchema === queryPlan.schemaVersion
+        && receipt.queryPlanHash === persistedQueryPlanHash
+        && receipt.capabilitySnapshotHash
+          === queryPlanCapabilitySnapshotHashV1(queryPlan);
+      const continuationPlanBinding = planHashValid
+        && executionRouteReceiptAuthorizesContinuationV1({
+          receipt,
+          runId: input.runId,
+          queryPlan,
+          persistedQueryPlanHash,
+          binding: input.continuationBinding ?? null,
+        });
+      if ((!directPlanBinding && !continuationPlanBinding)
+        || receipt.guidanceVersion !== (
+          queryPlan.guidancePolicyVersion ?? "legacy_guidance_v1"
+        )) {
+        executionRouteReceiptMismatch();
+      }
+    }
+    if (
+      input.contractVersion === 3
+      && (
+        receipt.assignmentAuthority.kind === "signed_public_rollout"
+        || receipt.assignmentAuthority.kind
+          === "signed_public_direct_exposure"
+      )
+    ) {
+      if (
+        input.publicRolloutAssignment?.assigned !== true
+        || receipt.assignmentAuthority.receiptHash
+          !== input.publicRolloutAssignment.assignmentHash
+        || receipt.assignmentAuthority.intentGroup
+          !== input.publicRolloutAssignment.intentGroup
+      ) {
+        executionRouteReceiptMismatch();
+      }
+    } else if (
+      input.contractVersion === 3
+      && receipt.assignmentAuthority.kind
+        === "authenticated_legacy_repair"
+    ) {
+      const legacyAdmission = parseLegacyRepairRunAdmissionV1(
+        input.legacyRepairRunAdmission,
+      );
+      const technicalAdmission = parseTechnicalRepairRunAdmissionV1(
+        input.technicalRepairRunAdmission,
+      );
+      const admissionCount =
+        (legacyAdmission ? 1 : 0) + (technicalAdmission ? 1 : 0);
+      if (
+        admissionCount !== 1
+        || input.publicRolloutAssignment !== null
+        || input.releaseCanaryMarkerPresent
+      ) {
+        executionRouteReceiptMismatch();
+      }
+      if (legacyAdmission && (
+        legacyAdmission.successorBriefRequestId !== expectedBriefId
+        || legacyAdmission.authority.authorityHash
+          !== receipt.assignmentAuthority.receiptHash
+        || legacyAdmission.authority.targetIntentGroup
+          !== receipt.assignmentAuthority.intentGroup
+        || legacyAdmission.authority.targetExecutionRoute
+          !== receipt.executionRoute
+        || legacyAdmission.authority.targetGuidanceVersion
+          !== receipt.guidanceVersion
+        || legacyAdmission.authority.repairReleaseRevision
+          !== receipt.releaseRevision
+        || legacyAdmission.authority.repairExecutorSemanticConfigurationHash
+          !== receipt.executorConfigurationHash
+      )) {
+        executionRouteReceiptMismatch();
+      }
+      if (technicalAdmission && (
+        technicalAdmission.successorBriefRequestId !== expectedBriefId
+        || technicalAdmission.admittedRunId !== input.runId
+        || technicalAdmission.consumptionHash
+          !== receipt.assignmentAuthority.receiptHash
+        || technicalAdmission.targetIntentGroup
+          !== receipt.assignmentAuthority.intentGroup
+        || technicalAdmission.targetExecutionRoute
+          !== receipt.executionRoute
+        || technicalAdmission.targetGuidanceVersion
+          !== receipt.guidanceVersion
+        || technicalAdmission.repairReleaseRevision
+          !== receipt.releaseRevision
+        || technicalAdmission.repairExecutorConfigurationHash
+          !== receipt.executorConfigurationHash
+      )) {
+        executionRouteReceiptMismatch();
+      }
+    } else if (
+      input.contractVersion === 3
+      &&
+      receipt.assignmentAuthority.kind === "signed_owner_canary"
+      && !input.releaseCanaryMarkerPresent
+    ) {
+      executionRouteReceiptMismatch();
+    }
+  } else if (
+    receipt.queryPlanSchema !== null
+    || receipt.queryPlanHash !== null
+    || receipt.capabilitySnapshotHash !== null
+    || receipt.assignmentAuthority.kind === "signed_public_rollout"
+    || receipt.assignmentAuthority.kind === "signed_public_direct_exposure"
+  ) {
+    executionRouteReceiptMismatch();
+  }
+  if (
+    (receipt.trafficClass === "owner_canary"
+      || receipt.trafficClass === "synthetic")
+    && !input.releaseCanaryMarkerPresent
+  ) {
+    executionRouteReceiptMismatch();
+  }
+  return receipt;
+}
+
 function deterministicUuid(value: unknown): string {
   const hex = sha256Hex(stableStringify(value));
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+const REPAIR_REPLAY_PHASES_V1 = new Set([
+  "canonical_integrity_quarantine",
+  "capability_evidence_coverage_audit",
+  "evidence_verification_unknown",
+  "v254_evidence_persistence_quarantined",
+]);
+
+/**
+ * Deliberately narrow. A repair replay is for an implementation/capability
+ * defect that has been repaired, never for scarcity, user semantics, budget,
+ * cancellation, or an unhealthy provider.
+ */
+export function canonicalRepairReplayEligibilityV1(input: {
+  resolutionState: string;
+  runStatus: string;
+  runPhase: string;
+  blockerKind: string | null;
+  reasonCode: string | null;
+  contractVersion: number;
+  contractStatus: string;
+  publicAssignmentActive: boolean;
+  hasPublishedReconciliation: boolean;
+}): { eligible: true } | { eligible: false; reasonCode: string } {
+  if (input.resolutionState !== "quarantined"
+    || !["quarantined", "failed_integrity"].includes(input.runStatus)) {
+    return { eligible: false, reasonCode: "repair_replay_not_quarantined" };
+  }
+  if (input.contractVersion !== 3 || input.contractStatus !== "active") {
+    return { eligible: false, reasonCode: "repair_replay_contract_ineligible" };
+  }
+  if (!input.publicAssignmentActive) {
+    return {
+      eligible: false,
+      reasonCode: "repair_replay_assignment_ineligible",
+    };
+  }
+  if (input.hasPublishedReconciliation) {
+    return { eligible: false, reasonCode: "repair_replay_already_published" };
+  }
+  const reason = (input.reasonCode ?? "").toLowerCase();
+  const technicalReason = /(?:capabilit|evidence|identity|attestation|qualification|binding|manifest|publication_reconciliation|query_plan|integrity)/u
+    .test(reason);
+  if (!REPAIR_REPLAY_PHASES_V1.has(input.runPhase)
+    && !technicalReason) {
+    return { eligible: false, reasonCode: "repair_replay_incident_ineligible" };
+  }
+  if (/(?:scarcity|frontier|budget|provider|cancel|user|ambigu|scope)/u
+    .test(reason)) {
+    return { eligible: false, reasonCode: "repair_replay_incident_ineligible" };
+  }
+  const trustedTechnicalPhase = REPAIR_REPLAY_PHASES_V1.has(input.runPhase);
+  if (
+    input.blockerKind !== null
+    && !["integrity", "publication_reconciliation"].includes(
+      input.blockerKind,
+    )
+  ) {
+    return { eligible: false, reasonCode: "repair_replay_blocker_ineligible" };
+  }
+  if (input.blockerKind === null && !trustedTechnicalPhase) {
+    return { eligible: false, reasonCode: "repair_replay_blocker_ineligible" };
+  }
+  return { eligible: true };
 }
 
 function minimumWorkerProtocolForActiveProofArchitecture(
@@ -2179,6 +2807,38 @@ function pipelineV3LeadIdentityHash(candidate: Pick<
   });
 }
 
+/**
+ * One provider-returned candidate is one discovery observation even when its
+ * normalized musical identity has already been seen. The receipt deliberately
+ * includes the fenced attempt and the stable position within the provider
+ * batch: replaying the same database write is idempotent, while a later
+ * provider retry remains an independently observed event.
+ */
+function pipelineV3DiscoveryObservationReceiptHash(input: {
+  queryPlanHash: string;
+  executionAttemptId: string;
+  request: Pick<
+    DiscoveryRequestV3,
+    "strategy" | "strategyRound" | "cursor"
+  >;
+  candidate: RawTrackCandidateV3;
+  batchIndex: number;
+}): string {
+  return sha256Hex(stableStringify({
+    kind: "pipeline_v3_discovery_observation_v1",
+    queryPlanHash: input.queryPlanHash,
+    executionAttemptId: input.executionAttemptId,
+    strategyId: input.request.strategy.id,
+    strategyRound: input.request.strategyRound,
+    cursor: input.request.cursor,
+    batchIndex: input.batchIndex,
+    candidateId: input.candidate.id,
+    identityHintHash: pipelineV3LeadIdentityHash(input.candidate),
+    sourceObservationIds: [...new Set(input.candidate.sourceObservationIds)]
+      .sort(),
+  }));
+}
+
 function pipelineV3QualificationStableIdentityHash(
   candidate: RawTrackCandidateV3,
   qualification: CandidateQualificationV3,
@@ -2189,6 +2849,35 @@ function pipelineV3QualificationStableIdentityHash(
         recordingFamilyKey: qualification.catalog.recordingFamilyKey,
       }))
     : pipelineV3LeadIdentityHash(candidate);
+}
+
+function pipelineV3CandidateCanonicalKey(input: {
+  runId: string;
+  sourceCandidateId: string;
+  recordingFamilyKey: string | null;
+  stableIdentityHash: string;
+}): string {
+  return `v3:${sha256Hex(stableStringify({
+    runId: input.runId,
+    sourceCandidateId: input.sourceCandidateId,
+    familyKey: input.recordingFamilyKey
+      ?? `unresolved:${input.stableIdentityHash}`,
+  }))}`;
+}
+
+function pipelineV3CandidateDatabaseId(input: {
+  runId: string;
+  sourceCandidateId: string;
+  recordingFamilyKey: string | null;
+  stableIdentityHash: string;
+}): string {
+  return deterministicUuid({
+    runId: input.runId,
+    pipelineVersion: "corpus_first_v3",
+    candidateId: input.sourceCandidateId,
+    familyKey: input.recordingFamilyKey
+      ?? `unresolved:${input.stableIdentityHash}`,
+  });
 }
 
 function pipelineV3CanonicalPredicateProjection(
@@ -2208,6 +2897,11 @@ function pipelineV3CanonicalPredicateProjection(
     eligible: boolean;
     clauseStatuses: Record<string, "pass" | "fail" | "unknown">;
   };
+  observedEvaluation: {
+    status: "pass" | "fail" | "unknown";
+    eligible: boolean;
+    clauseStatuses: Record<string, "pass" | "fail" | "unknown">;
+  };
   evidenceIntegrity: {
     passed: boolean;
     missingRequiredClauseIds: string[];
@@ -2223,6 +2917,10 @@ function pipelineV3CanonicalPredicateProjection(
     return assessment ? [[clause.id, structuredClone(assessment)]] : [];
   }));
   const evaluation = evaluateCanonicalContractTrackV1({
+    policy,
+    assessments: boundedAssessments,
+  });
+  const observedEvaluation = evaluateCanonicalContractTrackEvidenceStateV1({
     policy,
     assessments: boundedAssessments,
   });
@@ -2264,6 +2962,11 @@ function pipelineV3CanonicalPredicateProjection(
       status: evaluation.status,
       eligible: evaluation.eligible,
       clauseStatuses: { ...evaluation.clauseStatuses },
+    },
+    observedEvaluation: {
+      status: observedEvaluation.status,
+      eligible: observedEvaluation.eligible,
+      clauseStatuses: { ...observedEvaluation.clauseStatuses },
     },
     evidenceIntegrity: {
       passed:
@@ -2320,15 +3023,7 @@ function pipelineV3QualificationDecision(
     && Boolean(qualification.catalog.recordingFamilyKey);
   if (passed) return "qualified";
   const decisiveMembershipFailure = canonical
-    ? canonical.evaluation.status === "fail"
-      || !canonical.evidenceIntegrity.passed
-      || !canonicalRequiredEvidenceIntegrityV3({
-        policy: queryPlan.canonicalContractPolicy!,
-        assessments: qualification.canonicalClauseAssessments,
-        bindingIds: qualification.evidence.bindingIds,
-        bindings: qualification.evidence.bindings,
-        storefront: queryPlan.storefront,
-      }).passed
+    ? canonical.observedEvaluation.status === "fail"
     : !qualification.scope.passed
       || !qualification.hardConstraints.passed
       || !qualification.evidence.passed
@@ -2336,11 +3031,17 @@ function pipelineV3QualificationDecision(
       || (qualification.evidence.passed && attestedBindings.length === 0);
   const decisiveFailure = decisiveMembershipFailure
     || (canonical === null && !qualification.version.compatible)
-    || qualification.catalog.lookupAttempted === true
-    || qualification.catalog.storefrontPlayable === false;
-  // A passing OR/NOT canonical tree is authoritative for schema 4. Legacy
-  // flattened booleans are retained below as observations only and cannot
-  // turn that pass into a rejection.
+    || (
+      canonical === null
+      &&
+      qualification.catalog.lookupAttempted === true
+      && qualification.catalog.storefrontPlayable === false
+    );
+  // The canonical tri-state tree is authoritative for schema 4+. A missing
+  // Apple identity/storefront observation remains unknown when the bound
+  // catalog obligations are unknown; the legacy flattened boolean may only
+  // decide legacy plans. This is the catalog analogue of the version rule
+  // above and prevents "not observed" from becoming a musical failure.
   void queryPlan;
   return decisiveFailure ? "failed" : "unknown";
 }
@@ -3479,6 +4180,7 @@ interface ManifestScopeBindingProof {
 
 interface PersistedPipelineV3EvidenceBindingRow {
   candidate_id: string;
+  candidate_artist: string;
   source_url: string;
   provenance_root: string;
   binding_kind: string;
@@ -3621,6 +4323,10 @@ function persistedPipelineV3EvidenceBinding(
   };
   return evidenceBindingIsAttestedForSelectionV3(binding, {
       requireHostedEvidenceSnapshot: true,
+      ...(binding.eligibilityAttestation?.kind
+        === "approved_exact_artist_scope_source"
+        ? { requiredArtistName: row.candidate_artist }
+        : {}),
     })
     ? binding
     : null;
@@ -4162,6 +4868,72 @@ export interface CanonicalRunSuccessorResult {
   status: "queued" | "awaiting_budget" | "needs_decision";
 }
 
+export interface ReplayCanonicalRunAfterRepairInput {
+  runId: string;
+  sourceAccessId: string;
+  capabilitySessionId: string;
+  expectedGeneration: number;
+  expectedIncidentReference: string;
+  expectedContractRevisionId: string;
+  expectedContractSemanticHash: string;
+  idempotencyKey: string;
+}
+
+export interface ReplayCanonicalRunAfterRepairResult {
+  briefRequestId: string;
+  created: boolean;
+  status: "queued" | "awaiting_answers" | "complete" | "failed";
+  successorKind: "v5_1_planning_successor";
+  resultReuse: false;
+  autoPublication: false;
+}
+
+interface AuthenticatedLegacyRepairSourceV1 {
+  authority: LegacyRepairAuthorityV1;
+  sourceRunId: string;
+  sourceAccessId: string;
+  sourceBriefRequestId: string;
+  prompt: string;
+  requestedTrackCount: number | null;
+  model: string;
+  clientBucket: string;
+  existingConsumptions: unknown[];
+  globalResearchPaused: boolean;
+  publicAssignmentPaused: boolean;
+  hardRouteDisabled: boolean;
+}
+
+interface AuthenticatedTechnicalRepairSourceV1 {
+  sourceRunId: string;
+  sourceAccessId: string;
+  sourceBriefRequestId: string;
+  prompt: string;
+  requestedTrackCount: number | null;
+  model: string;
+  clientBucket: string;
+  resolutionGeneration: number;
+  incidentReference: string;
+  contractRevisionId: string;
+  contractSemanticHash: string;
+  routeReceipt: ExecutionRouteReceiptV1;
+  existingConsumptions: TechnicalRepairReplayConsumptionV1[];
+  globalResearchPaused: boolean;
+  publicAssignmentPaused: boolean;
+  hardRouteDisabled: boolean;
+}
+
+interface AuthenticatedTechnicalRepairAdmissionV1 {
+  consumption: TechnicalRepairReplayConsumptionV1;
+  sourceRunId: string;
+  sourceRouteReceipt: ExecutionRouteReceiptV1;
+}
+
+interface AuthenticatedLegacyRepairAdmissionV1 {
+  authority: LegacyRepairAuthorityV1;
+  consumption: LegacyRepairAuthorityConsumptionV1;
+  sourceRunId: string;
+}
+
 export interface PlaylistGuidanceHistoryItem {
   answerSetId: string;
   questionSetHash: string;
@@ -4177,6 +4949,7 @@ export interface PlaylistGuidanceHistoryItem {
       label: string;
       description: string;
       recommended: boolean;
+      recommendationReason?: string;
     }>;
   };
   selectedOptionIds: string[];
@@ -4342,6 +5115,86 @@ function throwCustomGuidanceCompilationHttpError(error: unknown): never {
       ? "invalid_track_count"
       : "custom_guidance_not_compilable",
   );
+}
+
+const GUIDANCE_EXECUTION_DECISION_DELTA_SCHEMA_V1 =
+  "guidance_execution_decision/v1";
+
+function compileBriefGuidanceExecutionActionV5(
+  questions: readonly PlaylistGuidanceQuestion[],
+  answers: readonly PlaylistGuidanceAnswer[],
+): BriefGuidanceExecutionActionView | null {
+  const executionQuestions = questions.filter(
+    (question) => question.guidanceMode === "execution_decision",
+  );
+  if (executionQuestions.length === 0) return null;
+  if (questions.length !== 1
+    || executionQuestions.length !== 1
+    || answers.length !== 1
+    || typeof answers[0]?.optionId !== "string") {
+    throw new HttpError(
+      409,
+      "The execution decision is stale or invalid",
+      "stale_guidance_question_set",
+    );
+  }
+  try {
+    const decision = guidanceExecutionDecisionV5FromPublicQuestion(
+      executionQuestions[0]!,
+    );
+    return compileGuidanceExecutionActionV5(decision, {
+      decisionHash: decision.decisionHash,
+      optionId: answers[0].optionId,
+    });
+  } catch {
+    throw new HttpError(
+      409,
+      "The execution decision is stale or invalid",
+      "stale_guidance_question_set",
+    );
+  }
+}
+
+function persistedBriefGuidanceExecutionActionV5(
+  value: unknown,
+): BriefGuidanceExecutionActionView | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (record.schema !== GUIDANCE_EXECUTION_DECISION_DELTA_SCHEMA_V1
+    || typeof record.decisionHash !== "string"
+    || typeof record.optionId !== "string"
+    || ![
+      "execute_confirmed_contract",
+      "review_interpretation",
+      "cancel_request",
+    ].includes(String(record.kind))
+    || typeof record.startsResearch !== "boolean"
+    || typeof record.actionHash !== "string") {
+    return null;
+  }
+  const kind = record.kind as BriefGuidanceExecutionActionView["kind"];
+  if (record.startsResearch !== (kind === "execute_confirmed_contract")) {
+    return null;
+  }
+  const body = {
+    decisionHash: record.decisionHash,
+    optionId: record.optionId,
+    kind,
+    startsResearch: record.startsResearch,
+  };
+  if (sha256Hex(stableStringify(body)) !== record.actionHash) return null;
+  return {
+    ...body,
+    actionHash: record.actionHash,
+  };
+}
+
+function briefStatusForGuidanceExecutionActionV5(
+  action: BriefGuidanceExecutionActionView,
+): "finalizing" | "review_required" | "cancelled" {
+  if (action.kind === "execute_confirmed_contract") return "finalizing";
+  if (action.kind === "review_interpretation") return "review_required";
+  return "cancelled";
 }
 
 function normalizedGuidanceAnswers(
@@ -4951,6 +5804,763 @@ export class Repository {
     } finally {
       client.release();
     }
+  }
+
+  private async loadAuthenticatedLegacyRepairSourceV1(
+    client: PoolClient | Pool,
+    input: {
+      sourceRunId: string;
+      sourceAccessId?: string | null;
+      capabilitySessionId?: string | null;
+      validationInstant?: string;
+    },
+  ): Promise<AuthenticatedLegacyRepairSourceV1> {
+    const result = await client.query<{
+      authority_json: unknown;
+      source_run_id: string;
+      source_access_id: string;
+      source_brief_request_id: string;
+      prompt: string;
+      requested_track_count: number | null;
+      contract_requested_track_count: string | number | null;
+      model: string;
+      client_bucket: string;
+      resolution_generation: number;
+      resolution_state: string;
+      incident_reference: string | null;
+      run_status: string;
+      run_phase: string;
+      source_execution_route: string;
+      contract_revision_id: string;
+      contract_status: string;
+      contract_hash: string;
+      query_plan_revision_id: string;
+      query_plan_hash: string;
+      query_plan_schema: string | number | null;
+      source_job_revision: string | null;
+      source_job_semantic_configuration_hash: string | null;
+      source_public_assignment_present: boolean;
+      source_route_receipt_present: boolean;
+      source_release_canary_marker_present: boolean;
+      containment_receipt_hash: string | null;
+      active_executable_job_count: number;
+      apple_side_effect_count: number;
+      has_published_reconciliation: boolean;
+      existing_consumptions: unknown;
+      global_research_paused: boolean;
+      public_assignment_paused: boolean;
+      hard_route_disabled: boolean;
+    }>(
+      `SELECT authority.state_json authority_json,
+              run.id source_run_id,access.id source_access_id,
+              brief.id source_brief_request_id,brief.prompt,
+              brief.requested_track_count,
+              contract.contract_json->>'requestedTrackCount'
+                contract_requested_track_count,
+              brief.model,access.client_bucket,
+              resolution.generation resolution_generation,
+              resolution.state resolution_state,
+              resolution.incident_reference,
+              run.status run_status,run.phase run_phase,
+              run.pipeline_version source_execution_route,
+              contract.id contract_revision_id,
+              contract.status contract_status,
+              contract.contract_hash,
+              plan.id query_plan_revision_id,
+              plan.plan_hash query_plan_hash,
+              plan.plan_json->>'schemaVersion' query_plan_schema,
+              source_job.required_executor_revision source_job_revision,
+              source_job.required_executor_semantic_configuration_hash
+                source_job_semantic_configuration_hash,
+              (brief.public_rollout_assignment_json IS NOT NULL)
+                source_public_assignment_present,
+              EXISTS(
+                SELECT 1 FROM research_checkpoints route
+                WHERE route.run_id=run.id
+                  AND route.phase=$5
+              ) source_route_receipt_present,
+              EXISTS(
+                SELECT 1 FROM release_canary_markers marker
+                WHERE marker.run_id=run.id
+                   OR marker.brief_request_id=brief.id
+              ) source_release_canary_marker_present,
+              resolution.state_json->>'containmentReceiptHash'
+                containment_receipt_hash,
+              (
+                SELECT count(*)::int FROM job_queue active_job
+                WHERE active_job.run_id=run.id
+                  AND active_job.status IN ('queued','leased')
+              ) active_executable_job_count,
+              (
+                (
+                  SELECT count(*)::int
+                  FROM playlist_publication_reconciliations reconciliation
+                  WHERE reconciliation.run_id=run.id
+                    AND (
+                      reconciliation.apple_playlist_id IS NOT NULL
+                      OR reconciliation.appended_count>0
+                    )
+                )
+                +
+                (
+                  SELECT count(*)::int FROM publication_volumes volume
+                  JOIN manifests manifest
+                    ON manifest.id=volume.manifest_id
+                  WHERE manifest.run_id=run.id
+                    AND (
+                      volume.apple_playlist_id IS NOT NULL
+                      OR volume.apple_share_url IS NOT NULL
+                      OR volume.appended_count>0
+                    )
+                )
+              ) apple_side_effect_count,
+              EXISTS(
+                SELECT 1
+                FROM playlist_publication_reconciliations reconciliation
+                WHERE reconciliation.run_id=run.id
+                  AND reconciliation.state='complete'
+              ) has_published_reconciliation,
+              COALESCE((
+                SELECT jsonb_agg(
+                  consumption.state_json ORDER BY consumption.updated_at
+                )
+                FROM research_checkpoints consumption
+                WHERE consumption.run_id=run.id
+                  AND consumption.phase=$5
+              ),'[]'::jsonb) existing_consumptions,
+              COALESCE((
+                SELECT value='true' FROM settings
+                WHERE key='research_paused'
+              ),false) global_research_paused,
+              COALESCE((
+                SELECT value='true' FROM settings
+                WHERE key='pipeline_v3_public_assignment_paused'
+              ),false) public_assignment_paused,
+              EXISTS(
+                SELECT 1 FROM pipeline_cohort_kill_switches hard_switch
+                WHERE hard_switch.route=
+                    authority.state_json->>'targetExecutionRoute'
+                  AND hard_switch.disabled
+                  AND (
+                    hard_switch.intent_group IS NULL
+                    OR hard_switch.intent_group=
+                      authority.state_json->>'targetIntentGroup'
+                  )
+              ) hard_route_disabled
+       FROM research_checkpoints authority
+       JOIN research_runs run ON run.id=authority.run_id
+       JOIN run_accesses access
+         ON access.run_id=run.id
+        AND access.id::text=authority.state_json->>'sourceAccessId'
+       JOIN brief_requests brief
+         ON brief.id=access.brief_request_id
+        AND brief.id::text=authority.state_json->>'sourceBriefRequestId'
+       JOIN playlist_run_resolutions resolution
+         ON resolution.run_id=run.id
+       JOIN playlist_contract_revisions contract
+         ON contract.id=run.active_playlist_contract_revision_id
+        AND contract.id::text=
+          authority.state_json->>'sourceContractRevisionId'
+       JOIN run_active_query_plans active_plan ON active_plan.run_id=run.id
+       JOIN query_plan_revisions plan
+         ON plan.id=active_plan.query_plan_revision_id
+        AND plan.id::text=
+          authority.state_json->>'sourceQueryPlanRevisionId'
+       LEFT JOIN LATERAL (
+         SELECT job.required_executor_revision,
+                job.required_executor_semantic_configuration_hash
+         FROM job_queue job
+         WHERE job.run_id=run.id
+           AND job.query_plan_revision_id=plan.id
+           AND job.required_executor_revision=
+             authority.state_json->>'sourceReleaseRevision'
+           AND job.required_executor_semantic_configuration_hash=
+             authority.state_json
+               ->>'sourceExecutorSemanticConfigurationHash'
+         ORDER BY job.created_at,job.id
+         LIMIT 1
+       ) source_job ON true
+       WHERE authority.run_id=$1
+         AND authority.phase=$4
+         AND ($2::uuid IS NULL OR access.id=$2)
+         AND (
+           $3::uuid IS NULL
+           OR EXISTS(
+             SELECT 1
+             FROM capability_session_accesses session_access
+             JOIN capability_sessions session
+               ON session.id=session_access.session_id
+             WHERE session_access.session_id=$3
+               AND session_access.run_id=run.id
+               AND session_access.access_id=access.id
+               AND session.revoked_at IS NULL
+               AND session.expires_at>now()
+           )
+         )
+         AND access.deleted_at IS NULL AND access.expires_at>now()
+         AND run.deleted_at IS NULL`,
+      [
+        input.sourceRunId,
+        input.sourceAccessId ?? null,
+        input.capabilitySessionId ?? null,
+        LEGACY_REPAIR_AUTHORITY_PHASE_V1,
+        EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+        LEGACY_REPAIR_CONSUMPTION_PHASE_V1,
+      ],
+    );
+    if (result.rowCount !== 1 || !result.rows[0]) {
+      throw new HttpError(
+        409,
+        "Authenticated repair authority is unavailable",
+        "legacy_repair_authority_missing",
+      );
+    }
+    const row = result.rows[0];
+    const authority = parseLegacyRepairAuthorityV1(row.authority_json);
+    if (!authority) {
+      throw new HttpError(
+        409,
+        "Authenticated repair authority failed integrity validation",
+        "legacy_repair_authority_invalid",
+      );
+    }
+    const release = canonicalExecutorReleaseIdentityV1();
+    const observed: ObservedLegacyRepairFenceV1 = {
+      sourceRunId: row.source_run_id,
+      sourceAccessId: row.source_access_id,
+      sourceBriefRequestId: row.source_brief_request_id,
+      sourceResolutionGeneration: Number(row.resolution_generation),
+      sourceResolutionState: row.resolution_state,
+      sourceRunStatus: row.run_status,
+      sourceRunPhase: row.run_phase,
+      incidentReference: row.incident_reference ?? "",
+      sourceContractRevisionId: row.contract_revision_id,
+      sourceContractSemanticHash: row.contract_hash,
+      sourceContractStatus: row.contract_status,
+      sourceQueryPlanRevisionId: row.query_plan_revision_id,
+      sourceQueryPlanHash: row.query_plan_hash,
+      sourceQueryPlanSchema: Number(row.query_plan_schema),
+      sourceExecutionRoute: row.source_execution_route,
+      sourceReleaseRevision: row.source_job_revision ?? "",
+      sourceExecutorSemanticConfigurationHash:
+        row.source_job_semantic_configuration_hash ?? "",
+      sourcePublicAssignmentPresent:
+        row.source_public_assignment_present,
+      sourceRouteReceiptPresent: row.source_route_receipt_present,
+      sourceReleaseCanaryMarkerPresent:
+        row.source_release_canary_marker_present,
+      containmentReceiptHash: row.containment_receipt_hash ?? "",
+      activeRepairReleaseRevision: release.executorRevision,
+      activeRepairExecutorSemanticConfigurationHash:
+        release.semanticExecutionConfigurationHash,
+      activeExecutableJobCount: Number(row.active_executable_job_count),
+      appleSideEffectCount: Number(row.apple_side_effect_count),
+      hasPublishedReconciliation: row.has_published_reconciliation,
+    };
+    const fence = validateLegacyRepairAuthorityFenceV1({
+      authority,
+      observed,
+      now: input.validationInstant ?? new Date().toISOString(),
+    });
+    if (!fence.eligible) {
+      throw new HttpError(
+        409,
+        "Authenticated repair authority no longer matches its source",
+        fence.reasonCode,
+      );
+    }
+    const consumptions = Array.isArray(row.existing_consumptions)
+      ? row.existing_consumptions
+      : [];
+    const requestedTrackCount = row.requested_track_count == null
+      ? Number(row.contract_requested_track_count)
+      : Number(row.requested_track_count);
+    return {
+      authority,
+      sourceRunId: row.source_run_id,
+      sourceAccessId: row.source_access_id,
+      sourceBriefRequestId: row.source_brief_request_id,
+      prompt: row.prompt,
+      requestedTrackCount: Number.isSafeInteger(requestedTrackCount)
+        ? requestedTrackCount
+        : null,
+      model: row.model,
+      clientBucket: row.client_bucket,
+      existingConsumptions: consumptions,
+      globalResearchPaused: row.global_research_paused,
+      publicAssignmentPaused: row.public_assignment_paused,
+      hardRouteDisabled: row.hard_route_disabled,
+    };
+  }
+
+  /**
+   * Loads a current Contract-3 technical quarantine from the same immutable
+   * authorities that admitted its execution. Unlike the one-off legacy Irish
+   * recovery, this path never needs an operator to fabricate historical
+   * assignment: the persisted route receipt is already the admission proof.
+   */
+  private async loadAuthenticatedTechnicalRepairSourceV1(
+    client: PoolClient | Pool,
+    input: {
+      sourceRunId: string;
+      sourceAccessId?: string | null;
+      capabilitySessionId?: string | null;
+    },
+  ): Promise<AuthenticatedTechnicalRepairSourceV1> {
+    const result = await client.query<{
+      source_run_id: string;
+      source_access_id: string;
+      source_brief_request_id: string;
+      prompt: string;
+      requested_track_count: number | null;
+      contract_requested_track_count: string | number | null;
+      model: string;
+      client_bucket: string;
+      resolution_generation: number;
+      resolution_state: string;
+      incident_reference: string | null;
+      run_status: string;
+      run_phase: string;
+      source_execution_route: string;
+      brief_contract_version: number;
+      contract_revision_id: string;
+      contract_status: string;
+      contract_hash: string;
+      contract_json: PlaylistContractRevisionV1;
+      contract_root_lineage_id: string | null;
+      query_plan_hash: string;
+      query_plan_schema: string | number | null;
+      blocker_kind: string | null;
+      blocker_reason_code: string | null;
+      route_receipt: unknown | null;
+      active_executable_job_count: number;
+      apple_side_effect_count: number;
+      has_published_reconciliation: boolean;
+      existing_consumptions: unknown;
+      global_research_paused: boolean;
+      public_assignment_paused: boolean;
+      hard_route_disabled: boolean;
+    }>(
+      `SELECT run.id source_run_id,access.id source_access_id,
+              brief.id source_brief_request_id,brief.prompt,
+              brief.requested_track_count,
+              contract.contract_json->>'requestedTrackCount'
+                contract_requested_track_count,
+              brief.model,access.client_bucket,
+              resolution.generation resolution_generation,
+              resolution.state resolution_state,
+              resolution.incident_reference,
+              run.status run_status,run.phase run_phase,
+              run.pipeline_version source_execution_route,
+              run.brief_contract_version,
+              contract.id contract_revision_id,
+              contract.status contract_status,
+              contract.contract_hash,
+              contract.contract_json,
+              contract.contract_json->>'contractId'
+                contract_root_lineage_id,
+              plan.plan_hash query_plan_hash,
+              plan.plan_json->>'schemaVersion' query_plan_schema,
+              blocker.blocker_kind,
+              blocker.state_json->>'reasonCode' blocker_reason_code,
+              route.state_json route_receipt,
+              (
+                SELECT count(*)::int FROM job_queue active_job
+                WHERE active_job.run_id=run.id
+                  AND active_job.status IN ('queued','leased')
+              ) active_executable_job_count,
+              (
+                (
+                  SELECT count(*)::int
+                  FROM playlist_publication_reconciliations reconciliation
+                  WHERE reconciliation.run_id=run.id
+                    AND (
+                      reconciliation.apple_playlist_id IS NOT NULL
+                      OR reconciliation.appended_count>0
+                    )
+                )
+                +
+                (
+                  SELECT count(*)::int FROM publication_volumes volume
+                  JOIN manifests manifest
+                    ON manifest.id=volume.manifest_id
+                  WHERE manifest.run_id=run.id
+                    AND (
+                      volume.apple_playlist_id IS NOT NULL
+                      OR volume.apple_share_url IS NOT NULL
+                      OR volume.appended_count>0
+                    )
+                )
+              ) apple_side_effect_count,
+              EXISTS(
+                SELECT 1
+                FROM playlist_publication_reconciliations reconciliation
+                WHERE reconciliation.run_id=run.id
+                  AND reconciliation.state='complete'
+              ) has_published_reconciliation,
+              COALESCE((
+                SELECT jsonb_agg(
+                  consumption.state_json ORDER BY consumption.updated_at
+                )
+                FROM research_checkpoints consumption
+                WHERE consumption.run_id=run.id
+                  AND consumption.phase=$5
+              ),'[]'::jsonb) existing_consumptions,
+              COALESCE((
+                SELECT value='true' FROM settings
+                WHERE key='research_paused'
+              ),false) global_research_paused,
+              COALESCE((
+                SELECT bool_or(value='true') FROM settings
+                WHERE key=ANY(ARRAY[
+                  'pipeline_v3_public_assignment_paused',
+                  'pipeline_v3_public_assignment_paused:' ||
+                    (route.state_json
+                      #>> '{assignmentAuthority,intentGroup}')
+                ]::text[])
+              ),false) public_assignment_paused,
+              EXISTS(
+                SELECT 1 FROM pipeline_cohort_kill_switches hard_switch
+                WHERE hard_switch.route=run.pipeline_version
+                  AND hard_switch.disabled
+                  AND (
+                    hard_switch.intent_group IS NULL
+                    OR hard_switch.intent_group=
+                      route.state_json
+                        #>> '{assignmentAuthority,intentGroup}'
+                  )
+              ) hard_route_disabled
+       FROM research_runs run
+       JOIN LATERAL (
+         SELECT candidate_access.id,candidate_access.brief_request_id,
+                candidate_access.client_bucket
+         FROM run_accesses candidate_access
+         WHERE candidate_access.run_id=run.id
+           AND ($2::uuid IS NULL OR candidate_access.id=$2)
+           AND candidate_access.brief_request_id IS NOT NULL
+           AND candidate_access.deleted_at IS NULL
+           AND candidate_access.expires_at>now()
+         ORDER BY candidate_access.created_at,candidate_access.id
+         LIMIT 1
+       ) access ON true
+       JOIN brief_requests brief ON brief.id=access.brief_request_id
+       JOIN playlist_run_resolutions resolution ON resolution.run_id=run.id
+       JOIN playlist_contract_revisions contract
+         ON contract.id=run.active_playlist_contract_revision_id
+       JOIN run_active_query_plans active ON active.run_id=run.id
+       JOIN query_plan_revisions plan
+         ON plan.id=active.query_plan_revision_id
+       JOIN research_checkpoints route
+         ON route.run_id=run.id AND route.phase=$4
+       LEFT JOIN playlist_run_blockers blocker
+         ON blocker.id=resolution.blocker_id
+       WHERE run.id=$1
+         AND (
+           $3::uuid IS NULL
+           OR EXISTS(
+             SELECT 1
+             FROM capability_session_accesses session_access
+             JOIN capability_sessions session
+               ON session.id=session_access.session_id
+             WHERE session_access.session_id=$3
+               AND session_access.run_id=run.id
+               AND session_access.access_id=access.id
+               AND session.revoked_at IS NULL
+               AND session.expires_at>now()
+           )
+         )
+         AND run.deleted_at IS NULL`,
+      [
+        input.sourceRunId,
+        input.sourceAccessId ?? null,
+        input.capabilitySessionId ?? null,
+        EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+        TECHNICAL_REPAIR_REPLAY_CONSUMPTION_PHASE_V1,
+      ],
+    );
+    if (result.rowCount !== 1 || !result.rows[0]) {
+      throw new HttpError(
+        409,
+        "Technical repair replay is unavailable",
+        "technical_repair_source_missing",
+      );
+    }
+    const row = result.rows[0];
+    try {
+      assertPlaylistContractIntegrityV1(row.contract_json);
+    } catch {
+      throw new HttpError(
+        409,
+        "The quarantined contract failed integrity validation",
+        "technical_repair_contract_integrity",
+      );
+    }
+    const routeReceipt = parseExecutionRouteReceiptV1(row.route_receipt);
+    const assignmentAuthenticated = routeReceipt?.assignmentAuthority.kind
+      === "signed_public_rollout"
+      || routeReceipt?.assignmentAuthority.kind
+        === "signed_public_direct_exposure"
+      || routeReceipt?.assignmentAuthority.kind === "signed_owner_canary";
+    const queryPlanSchema = Number(row.query_plan_schema);
+    const routeMatches =
+      routeReceipt !== null
+      && assignmentAuthenticated
+      && routeReceipt.briefId === row.source_brief_request_id
+      && routeReceipt.rootLineageId === row.contract_root_lineage_id
+      && routeReceipt.contractVersion === 3
+      && routeReceipt.executionRoute === row.source_execution_route
+      && routeReceipt.queryPlanHash === row.query_plan_hash
+      && routeReceipt.queryPlanSchema === queryPlanSchema
+      && row.contract_json.semanticHash === row.contract_hash;
+    if (!routeMatches || !routeReceipt) {
+      throw new HttpError(
+        409,
+        "The quarantined run has no valid execution admission receipt",
+        "technical_repair_route_receipt_invalid",
+      );
+    }
+    const eligibility = canonicalRepairReplayEligibilityV1({
+      resolutionState: row.resolution_state,
+      runStatus: row.run_status,
+      runPhase: row.run_phase,
+      blockerKind: row.blocker_kind,
+      reasonCode: row.blocker_reason_code,
+      contractVersion: Number(row.brief_contract_version),
+      contractStatus: row.contract_status,
+      publicAssignmentActive: true,
+      hasPublishedReconciliation: row.has_published_reconciliation,
+    });
+    if (!eligibility.eligible
+      || Number(row.active_executable_job_count) !== 0
+      || Number(row.apple_side_effect_count) !== 0) {
+      throw new HttpError(
+        409,
+        "This quarantine cannot be replayed safely",
+        eligibility.eligible
+          ? Number(row.active_executable_job_count) !== 0
+            ? "technical_repair_work_still_active"
+            : "technical_repair_apple_side_effect"
+          : eligibility.reasonCode,
+      );
+    }
+    const rawConsumptions = Array.isArray(row.existing_consumptions)
+      ? row.existing_consumptions
+      : [];
+    const existingConsumptions = rawConsumptions.map(
+      parseTechnicalRepairReplayConsumptionV1,
+    );
+    if (existingConsumptions.some((value) => value === null)) {
+      throw new HttpError(
+        409,
+        "Technical repair replay history failed integrity validation",
+        "technical_repair_consumption_integrity",
+      );
+    }
+    const requestedTrackCount = row.requested_track_count == null
+      ? Number(row.contract_requested_track_count)
+      : Number(row.requested_track_count);
+    return {
+      sourceRunId: row.source_run_id,
+      sourceAccessId: row.source_access_id,
+      sourceBriefRequestId: row.source_brief_request_id,
+      prompt: row.prompt,
+      requestedTrackCount: Number.isSafeInteger(requestedTrackCount)
+        ? requestedTrackCount
+        : null,
+      model: row.model,
+      clientBucket: row.client_bucket,
+      resolutionGeneration: Number(row.resolution_generation),
+      incidentReference: row.incident_reference ?? "",
+      contractRevisionId: row.contract_revision_id,
+      contractSemanticHash: row.contract_hash,
+      routeReceipt,
+      existingConsumptions:
+        existingConsumptions as TechnicalRepairReplayConsumptionV1[],
+      globalResearchPaused: row.global_research_paused,
+      publicAssignmentPaused: row.public_assignment_paused,
+      hardRouteDisabled: row.hard_route_disabled,
+    };
+  }
+
+  private async loadAuthenticatedLegacyRepairAdmissionV1(
+    client: PoolClient | Pool,
+    briefRequestId: string,
+  ): Promise<AuthenticatedLegacyRepairAdmissionV1 | null> {
+    const linked = await client.query<{
+      source_run_id: string;
+      consumption_json: unknown;
+    }>(
+      `SELECT consumption.run_id source_run_id,
+              consumption.state_json consumption_json
+       FROM research_checkpoints consumption
+       WHERE consumption.phase=$2
+         AND consumption.state_json->>'successorBriefRequestId'=$1
+       ORDER BY consumption.updated_at,consumption.run_id`,
+      [briefRequestId, LEGACY_REPAIR_CONSUMPTION_PHASE_V1],
+    );
+    if (linked.rowCount === 0) return null;
+    if (linked.rowCount !== 1 || !linked.rows[0]) {
+      throw new HttpError(
+        409,
+        "The repair successor has conflicting source authority",
+        "legacy_repair_consumption_integrity",
+      );
+    }
+    const consumption = parseLegacyRepairAuthorityConsumptionV1(
+      linked.rows[0].consumption_json,
+    );
+    if (!consumption
+      || consumption.successorBriefRequestId !== briefRequestId) {
+      throw new HttpError(
+        409,
+        "The repair successor consumption receipt is invalid",
+        "legacy_repair_consumption_integrity",
+      );
+    }
+    const source = await this.loadAuthenticatedLegacyRepairSourceV1(
+      client,
+      {
+        sourceRunId: linked.rows[0].source_run_id,
+        validationInstant: consumption.consumedAt,
+      },
+    );
+    const pause = repairReplayPauseDecisionV1({
+      authorityKind: "authenticated_legacy_repair",
+      globalResearchPaused: source.globalResearchPaused,
+      publicAssignmentPaused: source.publicAssignmentPaused,
+      hardRouteDisabled: source.hardRouteDisabled,
+    });
+    if (!pause.allowed) {
+      throw new HttpError(
+        503,
+        "The authenticated repair route is currently paused",
+        pause.reasonCode,
+      );
+    }
+    const decision = decideLegacyRepairAuthorityUseV1({
+      authority: source.authority,
+      existingConsumptions: source.existingConsumptions,
+      requestHash: consumption.requestHash,
+      idempotencyKeyHash: consumption.idempotencyKeyHash,
+    });
+    if (
+      decision.kind !== "return_existing"
+      || decision.successorBriefRequestId !== briefRequestId
+      || consumption.authorityHash !== source.authority.authorityHash
+    ) {
+      throw new HttpError(
+        409,
+        "The repair successor is not bound to its one-use authority",
+        "legacy_repair_consumption_integrity",
+      );
+    }
+    return {
+      authority: source.authority,
+      consumption,
+      sourceRunId: source.sourceRunId,
+    };
+  }
+
+  private async loadAuthenticatedTechnicalRepairAdmissionV1(
+    client: PoolClient | Pool,
+    briefRequestId: string,
+  ): Promise<AuthenticatedTechnicalRepairAdmissionV1 | null> {
+    const linked = await client.query<{
+      source_run_id: string;
+      consumption_json: unknown;
+    }>(
+      `SELECT consumption.run_id source_run_id,
+              consumption.state_json consumption_json
+       FROM research_checkpoints consumption
+       WHERE consumption.phase=$2
+         AND consumption.state_json->>'successorBriefRequestId'=$1
+       ORDER BY consumption.updated_at,consumption.run_id`,
+      [briefRequestId, TECHNICAL_REPAIR_REPLAY_CONSUMPTION_PHASE_V1],
+    );
+    if (linked.rowCount === 0) return null;
+    if (linked.rowCount !== 1 || !linked.rows[0]) {
+      throw new HttpError(
+        409,
+        "The technical repair successor has conflicting source authority",
+        "technical_repair_consumption_integrity",
+      );
+    }
+    const consumption = parseTechnicalRepairReplayConsumptionV1(
+      linked.rows[0].consumption_json,
+    );
+    if (!consumption
+      || consumption.successorBriefRequestId !== briefRequestId
+      || consumption.sourceRunId !== linked.rows[0].source_run_id) {
+      throw new HttpError(
+        409,
+        "The technical repair successor receipt is invalid",
+        "technical_repair_consumption_integrity",
+      );
+    }
+    const source = await this.loadAuthenticatedTechnicalRepairSourceV1(
+      client,
+      { sourceRunId: linked.rows[0].source_run_id },
+    );
+    const assignmentKind =
+      source.routeReceipt.assignmentAuthority.kind;
+    if (assignmentKind !== "signed_public_rollout"
+      && assignmentKind !== "signed_public_direct_exposure"
+      && assignmentKind !== "signed_owner_canary") {
+      throw new HttpError(
+        409,
+        "The technical repair source has no authenticated route authority",
+        "technical_repair_route_receipt_invalid",
+      );
+    }
+    if (source.globalResearchPaused
+      || source.hardRouteDisabled
+      || (
+        source.publicAssignmentPaused
+        && (
+          assignmentKind === "signed_public_rollout"
+          || assignmentKind === "signed_public_direct_exposure"
+        )
+      )) {
+      throw new HttpError(
+        503,
+        "The authenticated technical repair route is currently paused",
+        "repair_replay_route_disabled",
+      );
+    }
+    const activeRelease = canonicalExecutorReleaseIdentityV1();
+    if (source.routeReceipt.releaseRevision
+        === activeRelease.executorRevision
+      && source.routeReceipt.executorConfigurationHash
+        === activeRelease.semanticExecutionConfigurationHash) {
+      throw new HttpError(
+        409,
+        "The technical repair has not changed execution behavior",
+        "technical_repair_pending",
+      );
+    }
+    const decision = decideTechnicalRepairReplayUseV1({
+      existingConsumptions: source.existingConsumptions,
+      requestHash: consumption.requestHash,
+      idempotencyKeyHash: consumption.idempotencyKeyHash,
+      sourceResolutionGeneration: source.resolutionGeneration,
+      incidentReference: source.incidentReference,
+      sourceContractRevisionId: source.contractRevisionId,
+      sourceContractSemanticHash: source.contractSemanticHash,
+      sourceRouteReceiptHash: source.routeReceipt.receiptHash,
+    });
+    if (decision.kind !== "return_existing"
+      || decision.successorBriefRequestId !== briefRequestId) {
+      throw new HttpError(
+        409,
+        "The technical repair successor is not bound to its one-use receipt",
+        "technical_repair_consumption_integrity",
+      );
+    }
+    return {
+      consumption,
+      sourceRunId: source.sourceRunId,
+      sourceRouteReceipt: source.routeReceipt,
+    };
   }
 
   /**
@@ -7410,6 +9020,7 @@ export class Repository {
   ): Promise<{
     contractRevisionId: string;
     executionAttemptId: string;
+    queryPlanRevisionId: string;
   }> {
     await this.assertPipelineV3WriteFence(client, input.runId, input.fence);
     const fence = input.fence;
@@ -7493,7 +9104,444 @@ export class Repository {
     return {
       contractRevisionId: row.active_playlist_contract_revision_id,
       executionAttemptId: row.execution_attempt_id,
+      queryPlanRevisionId: row.query_plan_id,
     };
+  }
+
+  private async persistPipelineV3EvidenceAcquisitionReceipt(
+    client: PoolClient,
+    input: {
+      runId: string;
+      queryPlan: QueryPlanV3;
+      request: DiscoveryRequestV3 | QualificationRequestV3;
+      observation: EvidenceAcquisitionObservationV3;
+    },
+    authority: {
+      contractRevisionId: string;
+      executionAttemptId: string;
+      queryPlanRevisionId: string;
+    },
+  ): Promise<void> {
+    const directive = input.request.evidenceEnrichment;
+    if (!directive
+      || !input.request.evidenceAcquisitionAttemptedAt
+      || input.request.evidenceAcquisitionAttemptedAt
+        !== input.observation.attemptedAt
+      || !Number.isFinite(Date.parse(input.observation.attemptedAt))
+      || !["discover", "qualify"].includes(input.observation.operation)
+      || ![
+        "in_flight",
+        "success",
+        "provider_failure",
+        "circuit_open",
+      ].includes(input.observation.outcome)
+      || (
+        input.observation.retryAfterUntil !== undefined
+        && input.observation.retryAfterUntil !== null
+        && !Number.isFinite(Date.parse(
+          input.observation.retryAfterUntil,
+        ))
+      )
+      || !CAPABILITY_HASH.test(directive.strategyDeltaProofHash)
+      || ![1, 2].includes(directive.automaticRescueOrdinal)
+      || !directive.producerFamily.trim()
+      || !directive.dependencyRootId.trim()
+      || directive.deficitObligationIds.length === 0
+      || new Set(directive.deficitObligationIds).size
+        !== directive.deficitObligationIds.length
+      || ![
+        ...input.request.strategy.discoveryDependencyIds,
+        ...input.request.strategy.qualificationDependencyIds,
+      ].includes(directive.dependencyRootId)) {
+      throw new CanonicalExecutionIntegrityError(
+        "pipeline_v3_evidence_acquisition_receipt_invalid",
+      );
+    }
+    const leaves = [
+      ...(input.queryPlan.verificationExpression
+        ? verificationLeavesV1(input.queryPlan.verificationExpression)
+        : []),
+      ...(input.queryPlan.canonicalContractPolicy
+        ? centralQualityVerificationLeavesV1({
+            policy: input.queryPlan.canonicalContractPolicy,
+            qualityPolicy: input.queryPlan.playlistQualityPolicy,
+          })
+        : []),
+    ];
+    if (directive.deficitObligationIds.some((obligationId) => (
+      !leaves.some((leaf) => (
+        leaf.obligationId === obligationId
+        && leaf.capableProducerFamilies.includes(
+          directive.producerFamily as never,
+        )
+      ))
+    ))) {
+      throw new CanonicalExecutionIntegrityError(
+        "pipeline_v3_evidence_acquisition_obligation_invalid",
+      );
+    }
+    const strategyRound = Math.max(
+      1,
+      Math.floor(Number(input.request.strategyRound ?? 1)),
+    );
+    if (!Number.isSafeInteger(strategyRound)) {
+      throw new CanonicalExecutionIntegrityError(
+        "pipeline_v3_evidence_acquisition_round_invalid",
+      );
+    }
+    const queryPlanHash = queryPlanV3Hash(input.queryPlan);
+    const receiptIdentity = {
+      version: PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_VERSION_V1,
+      runId: input.runId,
+      contractRevisionId: authority.contractRevisionId,
+      queryPlanRevisionId: authority.queryPlanRevisionId,
+      queryPlanHash,
+      executionAttemptId: authority.executionAttemptId,
+      strategyId: input.request.strategy.id,
+      strategyRound,
+      operation: input.observation.operation,
+      obligationIds: [...directive.deficitObligationIds].sort(),
+      producerFamily: directive.producerFamily as
+        EvidenceAcquisitionAttemptV3["producerFamily"],
+      dependencyRootId: directive.dependencyRootId as
+        EvidenceAcquisitionAttemptV3["dependencyRootId"],
+      strategyDeltaProofHash: directive.strategyDeltaProofHash,
+      automaticRescueOrdinal: directive.automaticRescueOrdinal,
+    };
+    const receiptHash = sha256Hex(stableStringify(receiptIdentity));
+    const current = await client.query<{ state_json: unknown }>(
+      `SELECT state_json
+       FROM research_checkpoints
+       WHERE run_id=$1 AND phase=$2
+       FOR UPDATE`,
+      [input.runId, PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_PHASE_V1],
+    );
+    const state = current.rows[0]?.state_json;
+    let receipts: PipelineV3EvidenceAcquisitionReceiptV1[] = [];
+    if (state !== undefined) {
+      if (!state || typeof state !== "object" || Array.isArray(state)
+        || (state as Record<string, unknown>).version
+          !== PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_VERSION_V1
+        || !Array.isArray((state as Record<string, unknown>).receipts)) {
+        throw new CanonicalExecutionIntegrityError(
+          "pipeline_v3_evidence_acquisition_ledger_invalid",
+        );
+      }
+      receipts = structuredClone(
+        (state as { receipts: PipelineV3EvidenceAcquisitionReceiptV1[] })
+          .receipts,
+      );
+    }
+    const existingIndex = receipts.findIndex(
+      (receipt) => receipt.receiptHash === receiptHash,
+    );
+    const completedAt = input.observation.outcome === "in_flight"
+      ? null
+      : new Date().toISOString();
+    const next: PipelineV3EvidenceAcquisitionReceiptV1 = {
+      ...receiptIdentity,
+      receiptHash,
+      attemptedAt: input.observation.attemptedAt,
+      outcome: input.observation.outcome,
+      failureClass: input.observation.failureClass ?? null,
+      retryAfterUntil: input.observation.retryAfterUntil ?? null,
+      completedAt,
+    };
+    if (existingIndex >= 0) {
+      const existing = receipts[existingIndex]!;
+      if (existing.attemptedAt !== next.attemptedAt
+        || existing.contractRevisionId !== next.contractRevisionId
+        || existing.queryPlanRevisionId !== next.queryPlanRevisionId
+        || existing.queryPlanHash !== next.queryPlanHash
+        || existing.executionAttemptId !== next.executionAttemptId
+        || existing.operation !== next.operation
+        || stableStringify(existing.obligationIds)
+          !== stableStringify(next.obligationIds)
+        || existing.producerFamily !== next.producerFamily
+        || existing.dependencyRootId !== next.dependencyRootId
+        || existing.strategyDeltaProofHash
+          !== next.strategyDeltaProofHash
+        || existing.automaticRescueOrdinal
+          !== next.automaticRescueOrdinal) {
+        throw new CanonicalExecutionIntegrityError(
+          "pipeline_v3_evidence_acquisition_receipt_conflict",
+        );
+      }
+      if (existing.outcome === "in_flight") {
+        receipts[existingIndex] = next;
+      } else if (
+        next.outcome !== "in_flight"
+        && (
+          existing.outcome !== next.outcome
+          || existing.failureClass !== next.failureClass
+          || existing.retryAfterUntil !== next.retryAfterUntil
+        )
+      ) {
+        throw new CanonicalExecutionIntegrityError(
+          "pipeline_v3_evidence_acquisition_outcome_conflict",
+        );
+      }
+    } else {
+      if (receipts.length >= 128) {
+        throw new CanonicalExecutionIntegrityError(
+          "pipeline_v3_evidence_acquisition_ledger_capacity",
+        );
+      }
+      receipts.push(next);
+    }
+    const payload = {
+      version: PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_VERSION_V1,
+      receipts: receipts.sort((left, right) => (
+        left.attemptedAt.localeCompare(right.attemptedAt)
+        || left.receiptHash.localeCompare(right.receiptHash)
+      )),
+    };
+    await client.query(
+      `INSERT INTO research_checkpoints(run_id,phase,state_json)
+       VALUES($1,$2,$3::jsonb)
+       ON CONFLICT(run_id,phase) DO UPDATE
+       SET state_json=EXCLUDED.state_json,updated_at=now()`,
+      [
+        input.runId,
+        PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_PHASE_V1,
+        JSON.stringify(payload),
+      ],
+    );
+  }
+
+  async persistPipelineV3EvidenceAcquisitionAttempt(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    request: DiscoveryRequestV3 | QualificationRequestV3;
+    observation: EvidenceAcquisitionObservationV3;
+    fence: PipelineV3WriteFence;
+  }): Promise<void> {
+    await this.transaction(async (client) => {
+      const authority = await this.assertPipelineV3RecoveryPersistenceFence(
+        client,
+        input,
+      );
+      await this.persistPipelineV3EvidenceAcquisitionReceipt(
+        client,
+        input,
+        authority,
+      );
+    });
+  }
+
+  private async persistPipelineV3CandidateEvidenceBindings(
+    client: PoolClient,
+    input: {
+      runId: string;
+      queryPlan: QueryPlanV3;
+      request: QualificationRequestV3;
+      candidate: RawTrackCandidateV3;
+      candidateId: string;
+      qualification: CandidateQualificationV3;
+    },
+  ): Promise<void> {
+    const canonicalPolicy = input.queryPlan.canonicalContractPolicy;
+    if (!canonicalPolicy) return;
+    const resolvedArtist = input.qualification.catalog.artistName?.trim()
+      || input.candidate.artist.trim();
+    const bindings = attestedEvidenceBindingsForSelectionV3(
+      input.qualification.evidence.bindingIds,
+      input.qualification.evidence.bindings,
+      {
+        requireHostedEvidenceSnapshot: true,
+        storefront: input.queryPlan.storefront,
+        requiredArtistName: resolvedArtist,
+      },
+    );
+    const canonicalClauses = canonicalPolicy.clauses ?? [];
+    const positivePredicates = evidenceMembershipPredicatesV3(
+      input.request.plan,
+    );
+    for (const binding of bindings) {
+      const directlyProvenCanonicalPredicates = canonicalClauses.filter(
+        (clause) => clause.axis !== "evidence"
+          && input.qualification.canonicalClauseAssessments?.[clause.id]
+            ?.evidenceIds?.includes(binding.id),
+      );
+      const citedByEvidencePolicy = canonicalClauses.some(
+        (clause) => clause.axis === "evidence"
+          && input.qualification.canonicalClauseAssessments?.[clause.id]
+            ?.evidenceIds?.includes(binding.id),
+      );
+      const explicitPredicateIds = new Set(
+        binding.predicateIds ?? binding.supportedPredicateIds ?? [],
+      );
+      const evidencePolicySourcePredicates = citedByEvidencePolicy
+        ? canonicalClauses.filter(
+            (clause) => clause.axis !== "evidence"
+              && explicitPredicateIds.has(clause.id),
+          )
+        : [];
+      const canonicalPredicates = [
+        ...new Map([
+          ...directlyProvenCanonicalPredicates,
+          ...evidencePolicySourcePredicates,
+        ].map((clause) => [clause.id, clause])).values(),
+      ];
+      if (canonicalPredicates.length === 0) {
+        if (citedByEvidencePolicy) {
+          throw new CanonicalExecutionIntegrityError(
+            "pipeline_v3_evidence_predicate_missing",
+          );
+        }
+        continue;
+      }
+      const normalizedUrl = assertPublicHttpsUrl(binding.url!).toString();
+      const proposedSourceRecordId = deterministicUuid({
+        runId: input.runId,
+        url: normalizedUrl,
+      });
+      const source = await client.query<{ id: string }>(
+        `INSERT INTO source_records(
+           id,run_id,url,title,source_class,provenance_root,note)
+         VALUES($1,$2,$3,$4,'web',$5,$6)
+         ON CONFLICT(run_id,url) DO UPDATE SET
+           title=EXCLUDED.title,
+           note=EXCLUDED.note
+         WHERE source_records.source_class='web'
+           AND source_records.provenance_root=EXCLUDED.provenance_root
+         RETURNING id`,
+        [
+          proposedSourceRecordId,
+          input.runId,
+          normalizedUrl,
+          `${resolvedArtist} — ${
+            input.qualification.catalog.trackName?.trim()
+              || input.candidate.title.trim()
+          }`.slice(0, 240),
+          binding.provenanceRoot.slice(0, 240),
+          compactEvidenceNote(
+            `Pipeline V3 exact candidate evidence (${binding.kind}).`,
+          ),
+        ],
+      );
+      const sourceRecordId = source.rows[0]?.id;
+      if (!sourceRecordId) {
+        throw new CanonicalExecutionIntegrityError(
+          "pipeline_v3_evidence_source_identity_conflict",
+        );
+      }
+      const explicitBindingPredicateIds =
+        binding.predicateIds ?? binding.supportedPredicateIds;
+      const sourcePredicateIds = binding.hostedEvidenceSnapshot
+        ? [...binding.hostedEvidenceSnapshot.predicateIds]
+        : [...new Set(explicitBindingPredicateIds ?? [])].sort();
+      const supportedPredicates = positivePredicates.filter((predicate) => (
+        explicitBindingPredicateIds?.includes(predicate.id)
+      ));
+      const persistedPredicates = canonicalPredicates.length > 0
+        ? canonicalPredicates
+        : supportedPredicates;
+      for (const predicate of persistedPredicates) {
+        const scopeAxis = predicate.axis.slice(0, 48);
+        const scopeValue = predicate.values.join(" | ").slice(0, 240);
+        const relationship = predicate.operator.slice(0, 240);
+        const bindingId = deterministicUuid({
+          runId: input.runId,
+          candidateId: input.candidateId,
+          sourceRecordId,
+          sourceBindingId: binding.id,
+          predicateId: predicate.id,
+        });
+        const provenancePath = [
+          {
+            kind: "evidence_eligibility_attestation",
+            attestation: binding.eligibilityAttestation,
+          },
+          {
+            kind: "evidence_source_governance",
+            governance: binding.governance,
+          },
+          ...(binding.hostedEvidenceSnapshot ? [{
+            kind: "hosted_web_evidence_snapshot",
+            snapshot: binding.hostedEvidenceSnapshot,
+          }] : []),
+          {
+            kind: "pipeline_v3_binding",
+            id: binding.id,
+            label: binding.provenanceRoot,
+            predicateIds: [predicate.id],
+            sourcePredicateIds,
+          },
+          ...input.candidate.sourceObservationIds.map((id) => ({
+            kind: "source_observation",
+            id,
+          })),
+        ];
+        const inserted = await client.query<{ id: string }>(
+          `INSERT INTO track_scope_bindings(
+             id,run_id,candidate_id,source_record_id,source_url,
+             research_container_id,citation_attestation_id,binding_kind,
+             eligibility,scope_axis,scope_value,relationship,confidence,
+             provenance_path_json,note,pipeline_version,policy_version)
+           VALUES($1,$2,$3,$4,$5,NULL,NULL,$6,'qualifying',$7,$8,$9,$10,
+             $11::jsonb,$12,'corpus_first_v3',
+             'corpus_first_v3_policy_v1')
+           ON CONFLICT(id) DO NOTHING
+           RETURNING id`,
+          [
+            bindingId,
+            input.runId,
+            input.candidateId,
+            sourceRecordId,
+            normalizedUrl,
+            binding.kind.slice(0, 64),
+            scopeAxis,
+            scopeValue,
+            relationship,
+            Math.max(0, Math.min(1, binding.strength)),
+            JSON.stringify(provenancePath),
+            compactEvidenceNote(
+              `Qualified ${predicate.id} by ${binding.kind}; `
+                + `source rank ${binding.sourceRank}.`,
+            ),
+          ],
+        );
+        if (inserted.rows[0]?.id !== bindingId) {
+          const existing = await client.query<{
+            candidate_id: string;
+            source_record_id: string | null;
+            source_url: string | null;
+            binding_kind: string;
+            eligibility: string;
+            scope_axis: string;
+            scope_value: string;
+            relationship: string;
+            pipeline_version: string;
+            policy_version: string;
+          }>(
+            `SELECT candidate_id,source_record_id,source_url,binding_kind,
+                    eligibility,scope_axis,scope_value,relationship,
+                    pipeline_version,policy_version
+             FROM track_scope_bindings
+             WHERE id=$1 AND run_id=$2
+             FOR SHARE`,
+            [bindingId, input.runId],
+          );
+          const row = existing.rows[0];
+          if (!row
+            || row.candidate_id !== input.candidateId
+            || row.source_record_id !== sourceRecordId
+            || row.source_url !== normalizedUrl
+            || row.binding_kind !== binding.kind.slice(0, 64)
+            || row.eligibility !== "qualifying"
+            || row.scope_axis !== scopeAxis
+            || row.scope_value !== scopeValue
+            || row.relationship !== relationship
+            || row.pipeline_version !== "corpus_first_v3"
+            || row.policy_version !== "corpus_first_v3_policy_v1") {
+            throw new CanonicalExecutionIntegrityError(
+              "pipeline_v3_evidence_binding_identity_conflict",
+            );
+          }
+        }
+      }
+    }
   }
 
   async persistPipelineV3DiscoveryBatch(input: {
@@ -7534,6 +9582,25 @@ export class Repository {
         client,
         input,
       );
+      if (input.request.evidenceEnrichment) {
+        await this.persistPipelineV3EvidenceAcquisitionReceipt(
+          client,
+          {
+            ...input,
+            observation: {
+              operation: "discover",
+              attemptedAt:
+                input.request.evidenceAcquisitionAttemptedAt ?? "",
+              outcome: input.batch.providerCircuitOpen === true
+                ? "circuit_open"
+                : "success",
+              failureClass: null,
+              retryAfterUntil: null,
+            },
+          },
+          authority,
+        );
+      }
       const dependencyKey = input.request.strategy.discoveryDependencyIds
         .join("+")
         .slice(0, 120) || "orchestration_local";
@@ -7551,7 +9618,8 @@ export class Repository {
         && Number.isFinite(Date.parse(input.batch.provenance.sourceFreshUntil))
         ? new Date(input.batch.provenance.sourceFreshUntil)
         : null;
-      for (const candidate of input.batch.candidates) {
+      const queryPlanHash = queryPlanV3Hash(input.queryPlan);
+      for (const [batchIndex, candidate] of input.batch.candidates.entries()) {
         if (!candidate.id?.trim()
           || !candidate.artist?.trim()
           || !candidate.title?.trim()
@@ -7564,6 +9632,14 @@ export class Repository {
           );
         }
         const identityHintHash = pipelineV3LeadIdentityHash(candidate);
+        const observationReceiptHash =
+          pipelineV3DiscoveryObservationReceiptHash({
+            queryPlanHash,
+            executionAttemptId: authority.executionAttemptId,
+            request: input.request,
+            candidate,
+            batchIndex,
+          });
         const leadId = deterministicUuid({
           kind: "playlist_discovery_lead",
           runId: input.runId,
@@ -7584,6 +9660,14 @@ export class Repository {
             .map((value) => value.slice(0, 240))
             .slice(0, 64),
           strategyRound: input.request.strategyRound,
+          queryPlanHash,
+          executionAttemptId: authority.executionAttemptId,
+          observationReceiptHashes: [observationReceiptHash],
+          observationProvenance: [{
+            receiptHash: observationReceiptHash,
+            queryPlanHash,
+            executionAttemptId: authority.executionAttemptId,
+          }],
         };
         await client.query(
           supportsSourceDiversity
@@ -7597,12 +9681,52 @@ export class Repository {
            ON CONFLICT(
              run_id,contract_revision_id,provider,strategy_id,identity_hint_hash
            ) DO UPDATE SET
-             execution_attempt_id=EXCLUDED.execution_attempt_id,
              dependency_ids=EXCLUDED.dependency_ids,
              provenance_roots=EXCLUDED.provenance_roots,
              cache_origin=EXCLUDED.cache_origin,
              source_fresh_until=EXCLUDED.source_fresh_until,
-             lead_json=EXCLUDED.lead_json,
+             lead_json=playlist_discovery_leads.lead_json || jsonb_build_object(
+               'observationReceiptHashes',
+               CASE
+                 WHEN COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationReceiptHashes',
+                   '[]'::jsonb
+                 ) @> (EXCLUDED.lead_json->'observationReceiptHashes')
+                 THEN COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationReceiptHashes',
+                   '[]'::jsonb
+                 )
+                 ELSE COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationReceiptHashes',
+                   '[]'::jsonb
+                 ) || (EXCLUDED.lead_json->'observationReceiptHashes')
+               END,
+               'observationProvenance',
+               CASE
+                 WHEN COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationProvenance',
+                   '[]'::jsonb
+                 ) @> (EXCLUDED.lead_json->'observationProvenance')
+                 THEN COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationProvenance',
+                   '[]'::jsonb
+                 )
+                 ELSE COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationProvenance',
+                   '[]'::jsonb
+                 ) || (EXCLUDED.lead_json->'observationProvenance')
+               END,
+               'lastObservedQueryPlanHash',
+               EXCLUDED.lead_json->'queryPlanHash',
+               'lastObservedExecutionAttemptId',
+               EXCLUDED.lead_json->'executionAttemptId'
+             ),
              updated_at=now()
            WHERE playlist_discovery_leads.evidence_eligible=false`
             : `INSERT INTO playlist_discovery_leads(
@@ -7613,8 +9737,48 @@ export class Repository {
            ON CONFLICT(
              run_id,contract_revision_id,provider,strategy_id,identity_hint_hash
            ) DO UPDATE SET
-             execution_attempt_id=EXCLUDED.execution_attempt_id,
-             lead_json=EXCLUDED.lead_json,
+             lead_json=playlist_discovery_leads.lead_json || jsonb_build_object(
+               'observationReceiptHashes',
+               CASE
+                 WHEN COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationReceiptHashes',
+                   '[]'::jsonb
+                 ) @> (EXCLUDED.lead_json->'observationReceiptHashes')
+                 THEN COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationReceiptHashes',
+                   '[]'::jsonb
+                 )
+                 ELSE COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationReceiptHashes',
+                   '[]'::jsonb
+                 ) || (EXCLUDED.lead_json->'observationReceiptHashes')
+               END,
+               'observationProvenance',
+               CASE
+                 WHEN COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationProvenance',
+                   '[]'::jsonb
+                 ) @> (EXCLUDED.lead_json->'observationProvenance')
+                 THEN COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationProvenance',
+                   '[]'::jsonb
+                 )
+                 ELSE COALESCE(
+                   playlist_discovery_leads.lead_json
+                     ->'observationProvenance',
+                   '[]'::jsonb
+                 ) || (EXCLUDED.lead_json->'observationProvenance')
+               END,
+               'lastObservedQueryPlanHash',
+               EXCLUDED.lead_json->'queryPlanHash',
+               'lastObservedExecutionAttemptId',
+               EXCLUDED.lead_json->'executionAttemptId'
+             ),
              updated_at=now()
            WHERE playlist_discovery_leads.evidence_eligible=false`,
           supportsSourceDiversity ? [
@@ -7689,6 +9853,23 @@ export class Repository {
         client,
         input,
       );
+      if (input.request.evidenceEnrichment) {
+        await this.persistPipelineV3EvidenceAcquisitionReceipt(
+          client,
+          {
+            ...input,
+            observation: {
+              operation: "qualify",
+              attemptedAt:
+                input.request.evidenceAcquisitionAttemptedAt ?? "",
+              outcome: "success",
+              failureClass: null,
+              retryAfterUntil: null,
+            },
+          },
+          authority,
+        );
+      }
       const supportsSourceDiversity = await this.getSetting(
         CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_SETTING,
       ) === CANONICAL_EXECUTION_HARDENING_DATABASE_CAPABILITY_VERSION;
@@ -7733,17 +9914,242 @@ export class Repository {
             sourceFreshUntil: lead.rows[0].source_fresh_until ?? null,
           } : undefined,
         );
-        await client.query(
+        const recordingFamilyKey =
+          qualification.catalog.recordingFamilyKey?.trim() || null;
+        const appleSongId =
+          qualification.catalog.appleSongId?.trim() || null;
+        const resolvedArtist = qualification.catalog.artistName?.trim()
+          || candidate.artist.trim();
+        const resolvedTitle = qualification.catalog.trackName?.trim()
+          || candidate.title.trim();
+        const resolvedAlbum = qualification.catalog.albumName === null
+          ? null
+          : qualification.catalog.albumName?.trim()
+            || candidate.album?.trim()
+            || null;
+        let familyId: string | null = null;
+        if (recordingFamilyKey) {
+          const proposedFamilyId = deterministicUuid({
+            runId: input.runId,
+            pipelineVersion: "corpus_first_v3",
+            familyKey: recordingFamilyKey,
+          });
+          const family = await client.query<{ id: string }>(
+            `INSERT INTO recording_families(
+               id,run_id,family_key,canonical_artist,canonical_title,
+               version_class,metadata_json,pipeline_version,policy_version)
+             VALUES($1,$2,$3,$4,$5,'canonical',$6::jsonb,
+               'corpus_first_v3','corpus_first_v3_policy_v1')
+             ON CONFLICT(run_id,family_key) DO UPDATE SET
+               metadata_json=CASE
+                 WHEN NULLIF(
+                        recording_families.metadata_json->>'album',
+                        ''
+                      ) IS NULL
+                   AND NULLIF(EXCLUDED.metadata_json->>'album','') IS NOT NULL
+                 THEN recording_families.metadata_json
+                      || jsonb_build_object(
+                           'album',
+                           EXCLUDED.metadata_json->>'album'
+                         )
+                 ELSE recording_families.metadata_json
+               END,
+               updated_at=recording_families.updated_at
+             WHERE recording_families.canonical_artist
+                     =EXCLUDED.canonical_artist
+               AND recording_families.canonical_title
+                     =EXCLUDED.canonical_title
+               AND (
+                 NULLIF(
+                   recording_families.metadata_json->>'album',
+                   ''
+                 ) IS NULL
+                 OR NULLIF(EXCLUDED.metadata_json->>'album','') IS NULL
+                 OR recording_families.metadata_json->>'album'
+                      =EXCLUDED.metadata_json->>'album'
+               )
+               AND recording_families.pipeline_version
+                     =EXCLUDED.pipeline_version
+               AND recording_families.policy_version
+                     =EXCLUDED.policy_version
+             RETURNING id`,
+            [
+              proposedFamilyId,
+              input.runId,
+              recordingFamilyKey,
+              resolvedArtist.slice(0, 240),
+              resolvedTitle.slice(0, 240),
+              JSON.stringify({
+                album: resolvedAlbum,
+                sourceRank: qualification.sourceRank,
+              }),
+            ],
+          );
+          familyId = family.rows[0]?.id ?? null;
+          if (!familyId) {
+            throw new Error(
+              "Pipeline V3 recording-family upsert did not return an identifier",
+            );
+          }
+        }
+        const candidateIdentity = {
+          runId: input.runId,
+          sourceCandidateId: candidate.id,
+          recordingFamilyKey,
+          stableIdentityHash: projection.stableIdentityHash,
+        };
+        const candidateOutcome = projection.decision === "qualified"
+          ? "accepted"
+          : projection.decision === "unknown"
+            ? "review"
+            : "unsupported";
+        const materializedCandidate = await client.query<{ id: string }>(
+          `INSERT INTO track_candidates(
+             id,run_id,canonical_key,duplicate_cluster_key,artist,title,album,
+             outcome,recording_family_id,candidate_stage,pipeline_version,
+             policy_version)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'discovered',
+             'corpus_first_v3','corpus_first_v3_policy_v1')
+           ON CONFLICT(run_id,canonical_key) DO UPDATE SET
+             recording_family_id=COALESCE(
+               track_candidates.recording_family_id,
+               EXCLUDED.recording_family_id
+             ),
+             outcome=CASE
+               WHEN track_candidates.outcome='accepted'
+                 OR EXCLUDED.outcome='accepted' THEN 'accepted'
+               WHEN track_candidates.outcome='review'
+                 OR EXCLUDED.outcome='review' THEN 'review'
+               ELSE EXCLUDED.outcome
+             END
+           WHERE track_candidates.artist=EXCLUDED.artist
+             AND track_candidates.title=EXCLUDED.title
+             AND COALESCE(track_candidates.album,'')
+                   =COALESCE(EXCLUDED.album,'')
+             AND (
+               track_candidates.recording_family_id IS NULL
+               OR track_candidates.recording_family_id
+                    =EXCLUDED.recording_family_id
+             )
+             AND track_candidates.pipeline_version
+                   =EXCLUDED.pipeline_version
+             AND track_candidates.policy_version=EXCLUDED.policy_version
+           RETURNING id`,
+          [
+            pipelineV3CandidateDatabaseId(candidateIdentity),
+            input.runId,
+            pipelineV3CandidateCanonicalKey(candidateIdentity),
+            recordingFamilyKey?.slice(0, 500) ?? null,
+            resolvedArtist.slice(0, 240),
+            resolvedTitle.slice(0, 240),
+            resolvedAlbum?.slice(0, 240) ?? null,
+            candidateOutcome,
+            familyId,
+          ],
+        );
+        const candidateId = materializedCandidate.rows[0]?.id;
+        if (!candidateId) {
+          throw new Error(
+            "Pipeline V3 candidate upsert did not return an identifier",
+          );
+        }
+        if (familyId) {
+          const familyCandidate = await client.query<{ candidate_id: string }>(
+            `INSERT INTO recording_family_candidates(
+               recording_family_id,candidate_id,relationship)
+             VALUES($1,$2,'qualification_observation')
+             ON CONFLICT(candidate_id) DO UPDATE SET
+               relationship=EXCLUDED.relationship
+             WHERE recording_family_candidates.recording_family_id
+                     =EXCLUDED.recording_family_id
+             RETURNING candidate_id`,
+            [familyId, candidateId],
+          );
+          if (familyCandidate.rows[0]?.candidate_id !== candidateId) {
+            throw new CanonicalExecutionIntegrityError(
+              "pipeline_v3_recording_family_candidate_identity_conflict",
+            );
+          }
+        }
+        if (familyId && appleSongId) {
+          const proposedCatalogIdentityId = deterministicUuid({
+            familyId,
+            provider: "apple",
+            storefront: input.request.plan.storefront,
+            catalogId: appleSongId,
+          });
+          const catalogIdentity = await client.query<{ id: string }>(
+            `INSERT INTO recording_catalog_identities(
+               id,recording_family_id,provider,storefront,catalog_id,
+               is_preferred,identity_confidence,artist,title,album,
+               metadata_json)
+             VALUES($1,$2,'apple',$3,$4,false,$5,$6,$7,$8,$9::jsonb)
+             ON CONFLICT(
+               recording_family_id,provider,storefront,catalog_id
+             ) DO UPDATE SET
+               identity_confidence=GREATEST(
+                 recording_catalog_identities.identity_confidence,
+                 EXCLUDED.identity_confidence
+               ),
+               updated_at=now()
+             WHERE recording_catalog_identities.artist=EXCLUDED.artist
+               AND recording_catalog_identities.title=EXCLUDED.title
+               AND COALESCE(recording_catalog_identities.album,'')
+                     =COALESCE(EXCLUDED.album,'')
+             RETURNING id`,
+            [
+              proposedCatalogIdentityId,
+              familyId,
+              input.request.plan.storefront,
+              appleSongId.slice(0, 160),
+              Math.max(0, Math.min(1, qualification.catalog.confidence)),
+              resolvedArtist.slice(0, 240),
+              resolvedTitle.slice(0, 240),
+              resolvedAlbum?.slice(0, 240) ?? null,
+              JSON.stringify({
+                storefrontPlayable:
+                  qualification.catalog.storefrontPlayable,
+                versionCompatible: qualification.version.compatible,
+                releaseYear: qualification.catalog.releaseYear ?? null,
+                compatibleReleaseYears:
+                  qualification.catalog.compatibleReleaseYears ?? [],
+              }),
+            ],
+          );
+          if (!catalogIdentity.rows[0]?.id) {
+            throw new Error(
+              "Pipeline V3 catalog-identity upsert did not return an identifier",
+            );
+          }
+        }
+        await this.persistPipelineV3CandidateEvidenceBindings(
+          client,
+          {
+            runId: input.runId,
+            queryPlan: input.queryPlan,
+            request: input.request,
+            candidate,
+            candidateId,
+            qualification,
+          },
+        );
+        const persistedQualification = await client.query<{
+          candidate_id: string | null;
+        }>(
           `INSERT INTO playlist_qualification_records(
              id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
              stable_identity_hash,storefront,predicate_results_json,
              evidence_record_ids_json,quality_result_json,catalog_result_json,
              decision,qualification_hash)
-           VALUES($1,$2,$3,$4,NULL,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,
-             $10::jsonb,$11,$12)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,
+             $11::jsonb,$12,$13)
            ON CONFLICT(
              run_id,contract_revision_id,stable_identity_hash,qualification_hash
-           ) DO NOTHING`,
+           ) DO UPDATE SET
+             candidate_id=playlist_qualification_records.candidate_id
+           WHERE playlist_qualification_records.candidate_id
+                   =EXCLUDED.candidate_id
+           RETURNING candidate_id`,
           [
             deterministicUuid({
               kind: "playlist_qualification_record",
@@ -7755,6 +10161,7 @@ export class Repository {
             input.runId,
             authority.contractRevisionId,
             lead.rows[0].id,
+            candidateId,
             projection.stableIdentityHash,
             input.request.plan.storefront,
             JSON.stringify(projection.predicateResults),
@@ -7765,17 +10172,419 @@ export class Repository {
             projection.qualificationHash,
           ],
         );
+        if (!persistedQualification.rows[0]) {
+          const conflicting = await client.query<{
+            candidate_id: string | null;
+          }>(
+            `SELECT candidate_id
+             FROM playlist_qualification_records
+             WHERE run_id=$1 AND contract_revision_id=$2
+               AND stable_identity_hash=$3 AND qualification_hash=$4
+             FOR SHARE`,
+            [
+              input.runId,
+              authority.contractRevisionId,
+              projection.stableIdentityHash,
+              projection.qualificationHash,
+            ],
+          );
+          if (conflicting.rows[0]?.candidate_id === null) {
+            throw new HttpError(
+              409,
+              "Legacy unbound qualification requires a linked successor",
+              "pipeline_v3_legacy_unbound_qualification_requires_successor",
+            );
+          }
+        }
+        if (persistedQualification.rows[0]?.candidate_id !== candidateId) {
+          throw new CanonicalExecutionIntegrityError(
+            "pipeline_v3_qualification_candidate_binding_conflict",
+          );
+        }
         await client.query(
           `UPDATE playlist_discovery_leads
-           SET status=$2,execution_attempt_id=$3,updated_at=now()
+           SET status=CASE
+                 WHEN status IN ('qualified','rejected','revoked')
+                 THEN status
+                 ELSE $2
+               END,
+               updated_at=now()
            WHERE id=$1 AND evidence_eligible=false`,
           [
             lead.rows[0].id,
-            projection.decision === "qualified" ? "qualified" : "rejected",
-            authority.executionAttemptId,
+            projection.decision === "qualified"
+              ? "qualified"
+              : projection.decision === "failed"
+                ? "rejected"
+                // `qualifying` is the schema-20-compatible nonterminal
+                // projection for an evaluated candidate whose canonical
+                // disposition is unknown. Unknown evidence is not rejection.
+                : "qualifying",
           ],
         );
       }
+    });
+  }
+
+  /**
+   * Re-reads semantic-collapse facts from the fenced database projection after
+   * candidate-first qualification persistence. Retrieval telemetry remains
+   * useful for provider health, but it is not allowed to invent candidate,
+   * family, catalog, or per-clause counts at the resolution boundary.
+   */
+  async readPipelineV3SemanticCollapseDatabaseFacts(input: {
+    runId: string;
+    queryPlan: QueryPlanV3;
+    queryPlanHash: string;
+    result: RetrievalResultV3;
+    capturedAt: string;
+    fence: PipelineV3WriteFence;
+  }): Promise<SemanticCollapseDatabaseFactsV2> {
+    if (!Number.isFinite(Date.parse(input.capturedAt))) {
+      throw new HttpError(
+        409,
+        "Semantic-collapse database snapshot time is invalid",
+        "pipeline_v3_semantic_collapse_snapshot_invalid",
+      );
+    }
+    const expectedPlanHash = queryPlanV3Hash(input.queryPlan);
+    void input.result;
+    if (input.queryPlanHash !== expectedPlanHash) {
+      throw new HttpError(
+        409,
+        "Semantic-collapse database snapshot plan is invalid",
+        "pipeline_v3_semantic_collapse_snapshot_invalid",
+      );
+    }
+    return this.transaction(async (client) => {
+      const authority = await this.assertPipelineV3RecoveryPersistenceFence(
+        client,
+        input,
+      );
+      // Continuation telemetry is cumulative: the retrieval result contains
+      // the source plan's authenticated seed tracks plus observations from
+      // the current bounded pass. Re-read exactly those two fenced attempts
+      // so the database projection and telemetry describe the same set.
+      //
+      // Do not use the source UUID copied into continuation JSON as database
+      // authority. Admission and lease validate the same lineage, but this is
+      // a later integrity boundary and must independently derive and lock the
+      // source through the active successor's immutable parent relation.
+      const queryPlanRevisionIds = [authority.queryPlanRevisionId];
+      const continuation = input.queryPlan.continuation;
+      if (continuation) {
+        const lineage = await client.query<{
+          successor_id: string;
+          successor_run_id: string;
+          successor_revision: number;
+          successor_parent_revision_id: string | null;
+          successor_selection_plan_id: string;
+          successor_graph_snapshot_id: string;
+          successor_engine: string;
+          successor_plan_hash: string;
+          successor_plan_json: unknown;
+          source_id: string;
+          source_run_id: string;
+          source_revision: number;
+          source_status: string;
+          source_selection_plan_id: string;
+          source_graph_snapshot_id: string;
+          source_engine: string;
+          source_plan_hash: string;
+          source_plan_json: unknown;
+        }>(
+          `SELECT successor.id successor_id,
+                  successor.run_id successor_run_id,
+                  successor.revision successor_revision,
+                  successor.parent_revision_id successor_parent_revision_id,
+                  successor.selection_plan_id successor_selection_plan_id,
+                  successor.graph_snapshot_id successor_graph_snapshot_id,
+                  successor.engine successor_engine,
+                  successor.plan_hash successor_plan_hash,
+                  successor.plan_json successor_plan_json,
+                  source.id source_id,source.run_id source_run_id,
+                  source.revision source_revision,
+                  source.status source_status,
+                  source.selection_plan_id source_selection_plan_id,
+                  source.graph_snapshot_id source_graph_snapshot_id,
+                  source.engine source_engine,
+                  source.plan_hash source_plan_hash,
+                  source.plan_json source_plan_json
+           FROM query_plan_revisions successor
+           JOIN query_plan_revisions source
+             ON source.id=successor.parent_revision_id
+            AND source.run_id=successor.run_id
+           WHERE successor.id=$1 AND successor.run_id=$2
+           FOR SHARE OF successor,source`,
+          [authority.queryPlanRevisionId, input.runId],
+        );
+        const row = lineage.rows[0];
+        const sourcePlan = row && isQueryPlanV3(row.source_plan_json)
+          ? row.source_plan_json
+          : null;
+        const successorPlan = row && isQueryPlanV3(row.successor_plan_json)
+          ? row.successor_plan_json
+          : null;
+        const successorBase = structuredClone(input.queryPlan);
+        delete successorBase.continuation;
+        const sourceStageKey = row
+          ? `v3-retrieval:active:${row.source_plan_hash.slice(0, 48)}`
+          : null;
+        if (!row
+          || !sourcePlan
+          || !successorPlan
+          || row.successor_id !== authority.queryPlanRevisionId
+          || row.successor_run_id !== input.runId
+          || row.successor_parent_revision_id !== row.source_id
+          || row.source_id !== continuation.sourceQueryPlanRevisionId
+          || row.source_run_id !== input.runId
+          || row.source_status !== "superseded"
+          || Number(row.successor_revision) !== Number(row.source_revision) + 1
+          || row.successor_selection_plan_id !== row.source_selection_plan_id
+          || row.successor_graph_snapshot_id !== row.source_graph_snapshot_id
+          || row.successor_engine !== row.source_engine
+          || row.successor_plan_hash !== input.queryPlanHash
+          || queryPlanV3Hash(successorPlan) !== row.successor_plan_hash
+          || stableStringify(successorPlan)
+            !== stableStringify(input.queryPlan)
+          || row.source_plan_hash !== continuation.sourceQueryPlanHash
+          || queryPlanV3Hash(sourcePlan) !== row.source_plan_hash
+          || sourcePlan.continuation !== undefined
+          || continuation.sourceStageKey !== sourceStageKey
+          || stableStringify(successorBase) !== stableStringify(sourcePlan)) {
+          throw new HttpError(
+            409,
+            "Semantic-collapse continuation source lineage is invalid",
+            "pipeline_v3_semantic_collapse_snapshot_invalid",
+          );
+        }
+        queryPlanRevisionIds.push(row.source_id);
+      }
+      const leads = await client.query<{
+        observation_count: number;
+        unique_lead_count: number;
+      }>(
+        `SELECT COALESCE(sum(
+                  CASE
+                    WHEN jsonb_typeof(
+                      lead.lead_json->'observationReceiptHashes'
+                    )='array'
+                    THEN GREATEST(
+                      jsonb_array_length(
+                        lead.lead_json->'observationReceiptHashes'
+                      ),
+                      1
+                    )
+                    ELSE 1
+                  END
+                ),0)::int observation_count,
+                count(DISTINCT lead.identity_hint_hash)::int unique_lead_count
+         FROM playlist_discovery_leads lead
+         JOIN playlist_execution_attempts attempt
+           ON attempt.id=lead.execution_attempt_id
+          AND attempt.run_id=lead.run_id
+          AND attempt.contract_revision_id=lead.contract_revision_id
+         WHERE lead.run_id=$1 AND lead.contract_revision_id=$2
+           AND attempt.query_plan_revision_id=ANY($3::uuid[])`,
+        [
+          input.runId,
+          authority.contractRevisionId,
+          queryPlanRevisionIds,
+        ],
+      );
+      const candidates = await client.query<{
+        materialized_candidate_count: number;
+        unique_recording_family_count: number;
+      }>(
+        `SELECT count(DISTINCT qualification.candidate_id)::int
+                  materialized_candidate_count,
+                count(DISTINCT candidate.recording_family_id)::int
+                  unique_recording_family_count
+         FROM playlist_qualification_records qualification
+         JOIN playlist_discovery_leads lead
+           ON lead.id=qualification.discovery_lead_id
+          AND lead.run_id=qualification.run_id
+          AND lead.contract_revision_id=qualification.contract_revision_id
+         JOIN playlist_execution_attempts attempt
+           ON attempt.id=lead.execution_attempt_id
+          AND attempt.run_id=lead.run_id
+          AND attempt.contract_revision_id=lead.contract_revision_id
+         JOIN track_candidates candidate
+           ON candidate.id=qualification.candidate_id
+          AND candidate.run_id=qualification.run_id
+         WHERE qualification.run_id=$1
+           AND qualification.contract_revision_id=$2
+           AND qualification.revoked_at IS NULL
+           AND attempt.query_plan_revision_id=ANY($3::uuid[])`,
+        [
+          input.runId,
+          authority.contractRevisionId,
+          queryPlanRevisionIds,
+        ],
+      );
+      const nullCandidates = await client.query<{ count: number }>(
+        `SELECT count(*)::int count
+         FROM playlist_qualification_records qualification
+         JOIN playlist_discovery_leads lead
+           ON lead.id=qualification.discovery_lead_id
+          AND lead.run_id=qualification.run_id
+          AND lead.contract_revision_id=qualification.contract_revision_id
+         JOIN playlist_execution_attempts attempt
+           ON attempt.id=lead.execution_attempt_id
+          AND attempt.run_id=lead.run_id
+          AND attempt.contract_revision_id=lead.contract_revision_id
+         WHERE qualification.run_id=$1
+           AND qualification.contract_revision_id=$2
+           AND qualification.revoked_at IS NULL
+           AND qualification.candidate_id IS NULL
+           AND attempt.query_plan_revision_id=ANY($3::uuid[])`,
+        [
+          input.runId,
+          authority.contractRevisionId,
+          queryPlanRevisionIds,
+        ],
+      );
+      const qualifications = await client.query<{
+        candidate_id: string;
+        decision: "qualified" | "failed" | "unknown" | "revoked";
+        predicate_results_json: Record<string, unknown>;
+        catalog_result_json: Record<string, unknown>;
+      }>(
+        `SELECT DISTINCT ON (qualification.candidate_id)
+                qualification.candidate_id,qualification.decision,
+                qualification.predicate_results_json,
+                qualification.catalog_result_json
+         FROM playlist_qualification_records qualification
+         JOIN playlist_discovery_leads lead
+           ON lead.id=qualification.discovery_lead_id
+          AND lead.run_id=qualification.run_id
+          AND lead.contract_revision_id=qualification.contract_revision_id
+         JOIN playlist_execution_attempts attempt
+           ON attempt.id=lead.execution_attempt_id
+          AND attempt.run_id=lead.run_id
+          AND attempt.contract_revision_id=lead.contract_revision_id
+         WHERE qualification.run_id=$1
+           AND qualification.contract_revision_id=$2
+           AND qualification.revoked_at IS NULL
+           AND qualification.candidate_id IS NOT NULL
+           AND attempt.query_plan_revision_id=ANY($3::uuid[])
+         ORDER BY qualification.candidate_id,
+                  qualification.qualified_at DESC,qualification.id DESC`,
+        [
+          input.runId,
+          authority.contractRevisionId,
+          queryPlanRevisionIds,
+        ],
+      );
+      const clauseCounts: Record<
+        string,
+        { pass: number; fail: number; unknown: number }
+      > = {};
+      let storefrontPlayableCount = 0;
+      let evidenceQualifiedCount = 0;
+      for (const row of qualifications.rows) {
+        if (row.decision === "qualified") evidenceQualifiedCount += 1;
+        const catalogRoot = recordValue(row.catalog_result_json);
+        const catalog = recordValue(catalogRoot?.catalog) ?? catalogRoot;
+        const version = recordValue(catalogRoot?.version);
+        const storefrontPlayable =
+          catalog?.storefrontPlayable === true;
+        const versionCompatible = version
+          ? version.compatible === true
+          : catalog?.versionCompatible === true;
+        const appleSongId = typeof catalog?.appleSongId === "string"
+          ? catalog.appleSongId.trim()
+          : "";
+        if (storefrontPlayable && versionCompatible && appleSongId) {
+          storefrontPlayableCount += 1;
+        }
+        const predicateRoot = recordValue(row.predicate_results_json);
+        const canonical = recordValue(predicateRoot?.canonicalContract);
+        const assessments = recordValue(canonical?.assessments);
+        if (!assessments) continue;
+        for (const [clauseId, rawAssessment] of Object.entries(assessments)) {
+          const assessment = recordValue(rawAssessment);
+          const status = assessment?.status;
+          if (status !== "pass" && status !== "fail" && status !== "unknown") {
+            throw new CanonicalExecutionIntegrityError(
+              "pipeline_v3_semantic_collapse_assessment_invalid",
+            );
+          }
+          const counts = clauseCounts[clauseId]
+            ?? { pass: 0, fail: 0, unknown: 0 };
+          counts[status] += 1;
+          clauseCounts[clauseId] = counts;
+        }
+      }
+      const acquisitionLedger = await client.query<{ state_json: unknown }>(
+        `SELECT state_json
+         FROM research_checkpoints
+         WHERE run_id=$1 AND phase=$2
+         FOR SHARE`,
+        [
+          input.runId,
+          PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_PHASE_V1,
+        ],
+      );
+      const acquisitionState = acquisitionLedger.rows[0]?.state_json;
+      let evidenceAcquisitionAttempts: EvidenceAcquisitionAttemptV3[] = [];
+      if (acquisitionState !== undefined) {
+        if (!acquisitionState
+          || typeof acquisitionState !== "object"
+          || Array.isArray(acquisitionState)
+          || (acquisitionState as Record<string, unknown>).version
+            !== PIPELINE_V3_EVIDENCE_ACQUISITION_LEDGER_VERSION_V1
+          || !Array.isArray(
+            (acquisitionState as Record<string, unknown>).receipts,
+          )) {
+          throw new CanonicalExecutionIntegrityError(
+            "pipeline_v3_evidence_acquisition_ledger_invalid",
+          );
+        }
+        const receipts = (
+          acquisitionState as {
+            receipts: PipelineV3EvidenceAcquisitionReceiptV1[];
+          }
+        ).receipts;
+        evidenceAcquisitionAttempts = receipts
+          .filter((receipt) => (
+            receipt.contractRevisionId === authority.contractRevisionId
+            && queryPlanRevisionIds.includes(receipt.queryPlanRevisionId)
+          ))
+          .flatMap((receipt) => receipt.obligationIds.map(
+            (obligationId): EvidenceAcquisitionAttemptV3 => ({
+              obligationId,
+              producerFamily: receipt.producerFamily,
+              dependencyRootId: receipt.dependencyRootId,
+              operation: receipt.operation,
+              attemptedAt: receipt.attemptedAt,
+              outcome: receipt.outcome,
+              failureClass: receipt.failureClass as
+                EvidenceAcquisitionAttemptV3["failureClass"],
+              retryAfterUntil: receipt.retryAfterUntil,
+              strategyDeltaProofHash: receipt.strategyDeltaProofHash,
+              automaticRescueOrdinal: receipt.automaticRescueOrdinal,
+              attemptCount: 1,
+            }),
+          ));
+      }
+      return createSemanticCollapseDatabaseFactsV2({
+        queryPlanHash: input.queryPlanHash,
+        contractRevisionId: authority.contractRevisionId,
+        observationCount: Number(leads.rows[0]?.observation_count ?? 0),
+        uniqueLeadCount: Number(leads.rows[0]?.unique_lead_count ?? 0),
+        materializedCandidateCount:
+          Number(candidates.rows[0]?.materialized_candidate_count ?? 0),
+        uniqueRecordingFamilyCount:
+          Number(candidates.rows[0]?.unique_recording_family_count ?? 0),
+        storefrontPlayableCount,
+        evidenceQualifiedCount,
+        nullCandidateQualificationCount:
+          Number(nullCandidates.rows[0]?.count ?? 0),
+        evidenceAcquisitionAttempts,
+        canonicalClauseDispositionCounts: clauseCounts,
+        capturedAt: input.capturedAt,
+      });
     });
   }
 
@@ -7901,10 +10710,14 @@ export class Repository {
       const persistedEvidence = await client.query<
         PersistedPipelineV3EvidenceBindingRow
       >(
-        `SELECT binding.candidate_id,binding.source_url,
+        `SELECT binding.candidate_id,
+                candidate.artist candidate_artist,binding.source_url,
                 source.provenance_root,binding.binding_kind,
                 binding.confidence,binding.provenance_path_json
          FROM track_scope_bindings binding
+         JOIN track_candidates candidate
+           ON candidate.id=binding.candidate_id
+          AND candidate.run_id=binding.run_id
          JOIN source_records source
            ON source.id=binding.source_record_id
           AND source.run_id=binding.run_id
@@ -7915,7 +10728,7 @@ export class Repository {
            AND binding.scope_axis<>'evidence'
            AND binding.pipeline_version='corpus_first_v3'
          ORDER BY binding.candidate_id,binding.id
-         FOR SHARE OF binding,source`,
+         FOR SHARE OF binding,candidate,source`,
         [input.runId, candidateIds],
       );
       const evidenceIntegrityReason = persistedCanonicalEvidenceIntegrityReason({
@@ -8075,8 +10888,11 @@ export class Repository {
   }
 
   async getSetting(key: string): Promise<string | null> {
-    const rows = await this.db.select({ value: settings.value }).from(settings).where(eq(settings.key, key)).limit(1);
-    return rows[0]?.value ?? null;
+    const result = await this.pool.query<{ value: string }>(
+      "SELECT value FROM settings WHERE key=$1 LIMIT 1",
+      [key],
+    );
+    return result.rows[0]?.value ?? null;
   }
 
   async getPublicRolloutDatabaseAuthority(): Promise<
@@ -8084,6 +10900,7 @@ export class Repository {
   > {
     const keys = [
       "public_rollout_state:global",
+      "public_rollout_state:editorial_influence",
       "public_rollout_state:genre_scene",
       "public_rollout_state:mood_activity_theme",
       "public_rollout_state:similarity",
@@ -8123,15 +10940,35 @@ export class Repository {
     } as PublicRolloutDatabaseAuthorityV1;
   }
 
+  async getV254DirectExposureDatabaseAuthority(): Promise<
+    V254DirectExposureDatabaseAuthorityV1 | null
+  > {
+    const result = await this.pool.query<{ value: string }>(
+      "SELECT value FROM settings WHERE key='v254_direct_exposure_state:active' LIMIT 1",
+    );
+    const value = result.rows[0]?.value;
+    if (!value) return null;
+    try {
+      return { active: JSON.parse(value) };
+    } catch {
+      throw new HttpError(
+        503,
+        "Direct exposure database authority is corrupt",
+        "direct_exposure_database_authority_invalid",
+      );
+    }
+  }
+
   async setSetting(key: string, value: string): Promise<void> {
-    await this.db.insert(settings).values({ key, value }).onConflictDoUpdate({
-      target: settings.key,
-      set: { value, updatedAt: new Date() },
-    });
+    await this.pool.query(
+      `INSERT INTO settings(key,value) VALUES($1,$2)
+       ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+      [key, value],
+    );
   }
 
   async deleteSetting(key: string): Promise<void> {
-    await this.db.delete(settings).where(eq(settings.key, key));
+    await this.pool.query("DELETE FROM settings WHERE key=$1", [key]);
   }
 
   async isPipelineCohortDisabled(input: {
@@ -8915,6 +11752,7 @@ export class Repository {
          WHERE id=$1`,
         [authority.runId, patch.status, patch.phase],
       );
+      await this.shadowPlaylistResolutionV1(client, authority.runId);
     });
   }
 
@@ -10303,6 +13141,11 @@ export class Repository {
     briefContractVersion?: 1 | 2 | 3;
     publicRolloutAssignment?: PersistedPublicRolloutAssignmentV1 | null;
     releaseCanary?: UnsignedReleaseCanaryMetadata | null;
+    /** Issued only after the HTTP boundary verifies owner + signed brief canary. */
+    contract3RouteAuthority?:
+      | "signed_owner_canary"
+      | "signed_release_canary"
+      | null;
     /** Set only after authenticated owner + activated-schema admission. */
     allowExecutableTrackCount?: boolean;
   }): Promise<{ id: string; status: string; created: boolean }> {
@@ -10349,6 +13192,16 @@ export class Repository {
         409,
         "Playlist sizes above 300 require a canonical contract-3 brief",
         "expanded_track_count_contract_required",
+      );
+    }
+    if (
+      expandedTrackCount
+      && input.contract3RouteAuthority !== "signed_owner_canary"
+    ) {
+      throw new HttpError(
+        403,
+        "Playlist sizes above 300 require a signed owner-canary route authority",
+        "expanded_track_count_route_authority_required",
       );
     }
     if (expandedTrackCount && Number(await this.getSchemaVersion() ?? 0) < 18) {
@@ -10459,11 +13312,21 @@ export class Repository {
               guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,
               brief_contract_version,public_rollout_assignment_json,active_guidance_question_set_id,
               (SELECT question_set_hash FROM guidance_question_sets
-               WHERE id=brief_requests.active_guidance_question_set_id) question_set_hash,
+               WHERE id=brief_requests.active_guidance_question_set_id
+                 AND active) question_set_hash,
               (SELECT checkpoint_mode FROM guidance_question_sets
-               WHERE id=brief_requests.active_guidance_question_set_id) checkpoint_mode,
+               WHERE id=brief_requests.active_guidance_question_set_id
+                 AND active) checkpoint_mode,
               (SELECT interpretation_summary_json FROM guidance_question_sets
-               WHERE id=brief_requests.active_guidance_question_set_id) interpretation_summary_json,
+               WHERE id=brief_requests.active_guidance_question_set_id
+                 AND active) interpretation_summary_json,
+              (SELECT execution_delta_json
+               FROM guidance_answer_sets
+               WHERE brief_request_id=brief_requests.id
+                 AND execution_delta_json->>'schema'
+                   ='guidance_execution_decision/v1'
+               ORDER BY created_at DESC,id DESC
+               LIMIT 1) execution_action_json,
               (SELECT contract_json FROM playlist_contract_revisions
                WHERE id=brief_requests.active_playlist_contract_revision_id
                  AND status='active') active_playlist_contract_json,
@@ -10483,11 +13346,22 @@ export class Repository {
       ? null
       : Number(row.requested_track_count);
     let executionRequestedTrackCount = originalRequestedTrackCount;
-    if (briefContractVersion === 3 && row.active_playlist_contract_json) {
+    const canonicalGuidanceV5 =
+      row.guidance_telemetry_json?.guidancePolicyVersion
+        === ADAPTIVE_GUIDANCE_POLICY_VERSION_V5;
+    if ((briefContractVersion === 3
+      || (briefContractVersion === 2 && canonicalGuidanceV5))
+      && row.active_playlist_contract_json) {
       assertPlaylistContractIntegrityV1(row.active_playlist_contract_json);
       executionRequestedTrackCount = Number(
         row.active_playlist_contract_json.requestedTrackCount,
       );
+    }
+    const executionAction = persistedBriefGuidanceExecutionActionV5(
+      row.execution_action_json,
+    );
+    if (row.execution_action_json != null && !executionAction) {
+      throw new Error("brief_guidance_execution_action_integrity");
     }
     return {
       id: row.id,
@@ -10516,6 +13390,7 @@ export class Repository {
         ? "unresolved_review"
         : null,
       interpretationSummary: row.interpretation_summary_json ?? null,
+      executionAction,
       pipelineVersion: row.pipeline_version ?? "legacy_v1",
       policyVersion: row.policy_version ?? "legacy_v1",
       selectionPlan: row.selection_plan_json ?? null,
@@ -10644,12 +13519,15 @@ export class Repository {
         || !Array.isArray(result.questions)) {
         throw new Error("A guidance question-set contract requires a contract-2/3 brief and questions");
       }
-      if (briefContractVersion === 3 && (
+      const canonicalGuidanceV5 =
+        result.guidanceContract.guidancePolicyVersion
+          === ADAPTIVE_GUIDANCE_POLICY_VERSION_V5;
+      if ((briefContractVersion === 3 || canonicalGuidanceV5) && (
         !updated.rows[0].active_playlist_contract_revision_id
         || !result.guidanceContract.baseContractRevisionId
         || !result.guidanceContract.baseContractSemanticHash
       )) {
-        throw new Error("Contract-3 guidance requires an active canonical contract revision");
+        throw new Error("Canonical guidance requires an active playlist contract revision");
       }
       await client.query(
         "UPDATE guidance_question_sets SET active=false WHERE brief_request_id=$1 AND active",
@@ -10683,7 +13561,7 @@ export class Repository {
           result.guidanceContract.explicitConstraintHash,
           JSON.stringify(result.guidanceContract.rejectedQuestionReasons),
           JSON.stringify(result.questions),
-          briefContractVersion === 3
+          briefContractVersion === 3 || canonicalGuidanceV5
             ? updated.rows[0].active_playlist_contract_revision_id
             : null,
           result.guidanceContract.feasibilitySnapshotId ?? null,
@@ -10730,10 +13608,16 @@ export class Repository {
         storefront: string | null;
         questionSetHash: string | null;
         questions: PlaylistGuidanceQuestion[];
+        executionAction?: BriefGuidanceExecutionActionView;
       }
     | {
         status: "prior";
-        resultStatus: "finalizing" | "complete";
+        resultStatus:
+          | "finalizing"
+          | "complete"
+          | "review_required"
+          | "cancelled";
+        executionAction?: BriefGuidanceExecutionActionView;
       }
     | {
         status: "prior_awaiting_answers";
@@ -10755,6 +13639,7 @@ export class Repository {
       active_guidance_question_set_id: string | null;
       active_playlist_contract_revision_id: string | null;
       question_set_hash: string | null;
+      question_set_guidance_policy_version: string | null;
       contract_questions_json: PlaylistGuidanceQuestion[] | null;
       parent_question_set_id: string | null;
       playlist_contract_json: PlaylistContractRevisionV1 | null;
@@ -10765,6 +13650,8 @@ export class Repository {
               brief.active_guidance_question_set_id,
               brief.active_playlist_contract_revision_id,
               question_set.question_set_hash,
+              question_set.guidance_policy_version
+                question_set_guidance_policy_version,
               question_set.questions_json contract_questions_json,
               question_set.parent_question_set_id,
               playlist_contract.contract_json playlist_contract_json
@@ -10792,10 +13679,14 @@ export class Repository {
       && Array.isArray(brief.contract_questions_json)
       ? brief.contract_questions_json
       : Array.isArray(brief.questions_json) ? brief.questions_json : [];
-    if (contractVersion === 3 && brief.playlist_contract_json) {
+    const canonicalGuidanceV5 =
+      brief.question_set_guidance_policy_version
+        === ADAPTIVE_GUIDANCE_POLICY_VERSION_V5;
+    if ((contractVersion === 3 || canonicalGuidanceV5)
+      && brief.playlist_contract_json) {
       assertPlaylistContractIntegrityV1(brief.playlist_contract_json);
     }
-    const pendingProposal = contractVersion === 3
+    const pendingProposal = contractVersion === 3 || canonicalGuidanceV5
       ? (await this.pool.query<{
           question_set_id: string;
           question_set_hash: string;
@@ -10872,6 +13763,110 @@ export class Repository {
         questions,
       };
     }
+    const priorProgressiveAnswer = contractVersion === 3 || canonicalGuidanceV5
+      ? (await this.pool.query<{
+          question_set_hash: string;
+          source_questions_json: PlaylistGuidanceQuestion[];
+          answer_hash: string;
+          execution_delta_json: unknown;
+        }>(
+          `SELECT answer_set.question_set_hash,
+                  source.questions_json source_questions_json,
+                  answer_set.answer_hash,
+                  answer_set.execution_delta_json
+           FROM guidance_answer_sets answer_set
+           JOIN guidance_question_sets source
+             ON source.id=answer_set.question_set_id
+            AND source.brief_request_id=answer_set.brief_request_id
+           WHERE answer_set.brief_request_id=$1
+             AND answer_set.idempotency_key=$2
+             AND COALESCE(answer_set.execution_delta_json->>'schema','')
+                   <>'exact_artist_identity_ambiguity/v1'
+           LIMIT 1`,
+          [input.briefRequestId, input.idempotencyKey],
+        )).rows[0]
+      : undefined;
+    if (priorProgressiveAnswer) {
+      if (input.questionSetHash
+          !== priorProgressiveAnswer.question_set_hash) {
+        throw new HttpError(
+          409,
+          "Idempotency key was already used for different playlist answers",
+          "idempotency_conflict",
+        );
+      }
+      const sourceQuestions = Array.isArray(
+        priorProgressiveAnswer.source_questions_json,
+      )
+        ? priorProgressiveAnswer.source_questions_json
+        : [];
+      const priorAnswers = normalizedGuidanceAnswers(
+        sourceQuestions,
+        input.answers,
+        contractVersion,
+      );
+      const priorAnswerHash = sha256Hex(stableStringify({
+        questionSetHash: priorProgressiveAnswer.question_set_hash,
+        answers: priorAnswers,
+      }));
+      if (priorAnswerHash !== priorProgressiveAnswer.answer_hash) {
+        throw new HttpError(
+          409,
+          "Idempotency key was already used for different playlist answers",
+          "idempotency_conflict",
+        );
+      }
+      const priorExecutionAction =
+        persistedBriefGuidanceExecutionActionV5(
+          priorProgressiveAnswer.execution_delta_json,
+        );
+      if (priorExecutionAction) {
+        const expectedStatus =
+          briefStatusForGuidanceExecutionActionV5(priorExecutionAction);
+        if (brief.status !== expectedStatus
+          && !(
+            priorExecutionAction.startsResearch
+            && brief.status === "complete"
+          )) {
+          throw new HttpError(
+            409,
+            "The saved execution decision no longer matches the brief state",
+            "guidance_history_integrity",
+          );
+        }
+        return {
+          status: "prior",
+          resultStatus: brief.status as
+            | "finalizing"
+            | "complete"
+            | "review_required"
+            | "cancelled",
+          executionAction: priorExecutionAction,
+        };
+      }
+      if (brief.status === "finalizing" || brief.status === "complete") {
+        return {
+          status: "prior",
+          resultStatus: brief.status,
+        };
+      }
+      if (brief.status === "awaiting_answers"
+        && brief.question_set_hash) {
+        // The answer was durably accepted in an earlier guidance round. Return
+        // the current active checkpoint instead of attempting the prior CAS
+        // again or falsely reporting a stale failure.
+        return {
+          status: "prior_awaiting_answers",
+          questionSetHash: brief.question_set_hash,
+          questions,
+        };
+      }
+      throw new HttpError(
+        409,
+        "The saved guidance answer is no longer on an executable lineage",
+        "stale_guidance_question_set",
+      );
+    }
     if (contractVersion >= 2
       && (!brief.question_set_hash
         || input.questionSetHash !== brief.question_set_hash)) {
@@ -10886,6 +13881,9 @@ export class Repository {
       input.answers,
       contractVersion,
     );
+    const executionAction = contractVersion === 3 || canonicalGuidanceV5
+      ? compileBriefGuidanceExecutionActionV5(questions, answers)
+      : null;
     const answersHash = sha256Hex(stableStringify({
       questionSetHash: contractVersion >= 2
         ? brief.question_set_hash
@@ -10902,6 +13900,15 @@ export class Repository {
         );
       }
       if (brief.status !== "finalizing" && brief.status !== "complete") {
+        if (executionAction
+          && brief.status
+            === briefStatusForGuidanceExecutionActionV5(executionAction)) {
+          return {
+            status: "prior",
+            resultStatus: brief.status,
+            executionAction,
+          };
+        }
         throw new HttpError(
           409,
           "Playlist answers cannot be submitted in this state",
@@ -10920,7 +13927,8 @@ export class Repository {
         "brief_not_ready",
       );
     }
-    if (contractVersion === 3 && brief.playlist_contract_json) {
+    if ((contractVersion === 3 || canonicalGuidanceV5)
+      && brief.playlist_contract_json) {
       const customAnswers = answers.filter((answer) => (
         typeof answer.customText === "string"
       ));
@@ -10955,6 +13963,7 @@ export class Repository {
       storefront: brief.playlist_contract_json?.storefront ?? null,
       questionSetHash: brief.question_set_hash,
       questions,
+      ...(executionAction ? { executionAction } : {}),
     };
   }
 
@@ -10963,7 +13972,7 @@ export class Repository {
     idempotencyKey: string;
     questionSetHash?: string;
     answers: PlaylistGuidanceAnswer[];
-    customTrackCountAuthority: CustomGuidanceTrackCountAuthorityV1;
+    customTrackCountAuthority?: CustomGuidanceTrackCountAuthorityV1;
     resolvedExactArtistIdentities?: readonly ResolvedExactArtistIdentityV1[];
     exactArtistIdentityAmbiguity?: {
       inputText: string;
@@ -10976,7 +13985,16 @@ export class Repository {
         questionSetHash: string;
         questions: PlaylistGuidanceQuestion[];
       }
-    | { status: "finalizing" | "complete"; created: boolean }
+    | {
+        status: "finalizing" | "complete";
+        created: boolean;
+        executionAction?: BriefGuidanceExecutionActionView;
+      }
+    | {
+        status: "review_required" | "cancelled";
+        created: boolean;
+        executionAction: BriefGuidanceExecutionActionView;
+      }
     | { status: "stale_question_set"; created: false; questionSetHash: string; questions: PlaylistGuidanceQuestion[] }
   > {
     return this.transaction(async (client) => {
@@ -10989,20 +14007,30 @@ export class Repository {
         brief_contract_version: number;
         active_guidance_question_set_id: string | null;
         question_set_hash: string | null;
+        question_set_active: boolean | null;
         question_set_axis: string | null;
+        question_set_guidance_policy_version: string | null;
+        public_rollout_assignment_json: unknown | null;
         contract_questions_json: PlaylistGuidanceQuestion[] | null;
         active_playlist_contract_revision_id: string | null;
         playlist_contract_json: PlaylistContractRevisionV1 | null;
+        selection_plan_json: SelectionPlan | null;
       }>(
         `SELECT brief.status,brief.questions_json,brief.answers_idempotency_key,brief.answers_hash,
                 brief.brief_contract_version,brief.active_guidance_question_set_id,
-                question_set.question_set_hash,question_set.axis question_set_axis,
+                question_set.question_set_hash,
+                question_set.active question_set_active,
+                question_set.axis question_set_axis,
+                question_set.guidance_policy_version
+                  question_set_guidance_policy_version,
+                brief.public_rollout_assignment_json,
                 question_set.questions_json contract_questions_json,
                 brief.active_playlist_contract_revision_id,
-                playlist_contract.contract_json playlist_contract_json
+                playlist_contract.contract_json playlist_contract_json,
+                brief.selection_plan_json
          FROM brief_requests brief
          LEFT JOIN guidance_question_sets question_set
-           ON question_set.id=brief.active_guidance_question_set_id AND question_set.active
+           ON question_set.id=brief.active_guidance_question_set_id
          LEFT JOIN playlist_contract_revisions playlist_contract
            ON playlist_contract.id=brief.active_playlist_contract_revision_id
              AND playlist_contract.status='active'
@@ -11020,6 +14048,9 @@ export class Repository {
       const questions = contractVersion >= 2 && Array.isArray(brief.contract_questions_json)
         ? brief.contract_questions_json
         : Array.isArray(brief.questions_json) ? brief.questions_json : [];
+      const canonicalGuidanceV5 =
+        brief.question_set_guidance_policy_version
+          === ADAPTIVE_GUIDANCE_POLICY_VERSION_V5;
       if (contractVersion >= 2) {
         if (!brief.question_set_hash || input.questionSetHash !== brief.question_set_hash) {
           return {
@@ -11031,6 +14062,9 @@ export class Repository {
         }
       }
       const answers = normalizedGuidanceAnswers(questions, input.answers, contractVersion);
+      const executionAction = contractVersion === 3 || canonicalGuidanceV5
+        ? compileBriefGuidanceExecutionActionV5(questions, answers)
+        : null;
       const guidancePreferences = deriveGuidancePreferences(questions, answers);
       const answersHash = sha256Hex(stableStringify({
         questionSetHash: contractVersion >= 2 ? brief.question_set_hash : null,
@@ -11044,6 +14078,27 @@ export class Repository {
             "idempotency_conflict",
           );
         }
+        if (executionAction) {
+          const expectedStatus =
+            briefStatusForGuidanceExecutionActionV5(executionAction);
+          if (brief.status !== expectedStatus
+            && !(executionAction.startsResearch && brief.status === "complete")) {
+            throw new HttpError(
+              409,
+              "The saved execution decision no longer matches the brief state",
+              "guidance_history_integrity",
+            );
+          }
+          return {
+            status: brief.status as
+              | "finalizing"
+              | "complete"
+              | "review_required"
+              | "cancelled",
+            created: false,
+            executionAction,
+          };
+        }
         if (brief.status !== "finalizing" && brief.status !== "complete") {
           throw new HttpError(409, "Playlist answers cannot be submitted in this state", "brief_not_ready");
         }
@@ -11052,13 +14107,21 @@ export class Repository {
       if (brief.status !== "awaiting_answers") {
         throw new HttpError(409, "Playlist questions are not ready for answers", "brief_not_ready");
       }
-      if (contractVersion === 3 && brief.playlist_contract_json) {
+      if (contractVersion >= 2 && brief.question_set_active !== true) {
+        throw new HttpError(
+          409,
+          "Playlist guidance is no longer active",
+          "stale_guidance_question_set",
+        );
+      }
+      if ((contractVersion === 3 || canonicalGuidanceV5)
+        && brief.playlist_contract_json) {
         assertCustomGuidanceTrackCountAdmission(
           brief.playlist_contract_json.requestedTrackCount,
           input.customTrackCountAuthority,
         );
       }
-      if (contractVersion === 2) {
+      if (contractVersion === 2 && !canonicalGuidanceV5) {
         if (!brief.active_guidance_question_set_id || !brief.question_set_hash) {
           throw new HttpError(409, "Playlist guidance contract is incomplete", "guidance_contract_incomplete");
         }
@@ -11083,7 +14146,7 @@ export class Repository {
             input.idempotencyKey,
           ],
         );
-      } else if (contractVersion === 3) {
+      } else if (contractVersion === 3 || canonicalGuidanceV5) {
         if (!brief.active_guidance_question_set_id
           || !brief.question_set_hash
           || !brief.active_playlist_contract_revision_id
@@ -11092,6 +14155,15 @@ export class Repository {
         }
         const baseContract = brief.playlist_contract_json;
         assertPlaylistContractIntegrityV1(baseContract);
+        if (canonicalGuidanceV5
+          && contractVersion === 2
+          && !brief.selection_plan_json) {
+          throw new HttpError(
+            409,
+            "Playlist guidance execution plan is incomplete",
+            "guidance_contract_incomplete",
+          );
+        }
         const customAnswers = answers.filter((answer) => Boolean(answer.customText));
         if (customAnswers.length > 0) {
           if (customAnswers.length !== 1) {
@@ -11268,6 +14340,126 @@ export class Repository {
             questions: confirmationQuestions,
           };
         }
+        if (executionAction) {
+          if (executionAction.startsResearch) {
+            assertCustomGuidanceTrackCountAdmission(
+              baseContract.requestedTrackCount,
+              input.customTrackCountAuthority,
+            );
+          }
+          const executionDelta = {
+            schema: GUIDANCE_EXECUTION_DECISION_DELTA_SCHEMA_V1,
+            questionSetHash: brief.question_set_hash,
+            ...executionAction,
+          };
+          await client.query(
+            `INSERT INTO guidance_answer_sets(
+               id,brief_request_id,question_set_id,question_set_hash,
+               normalized_answers_json,raw_custom_answers_json,answer_hash,
+               execution_delta_json,execution_delta_hash,idempotency_key,
+               base_contract_revision_id,resulting_contract_revision_id)
+             VALUES(
+               $1,$2,$3,$4,$5::jsonb,'[]'::jsonb,$6,$7::jsonb,$8,$9,$10,$10
+             )`,
+            [
+              randomUUID(),
+              input.briefRequestId,
+              brief.active_guidance_question_set_id,
+              brief.question_set_hash,
+              JSON.stringify(answers),
+              answersHash,
+              JSON.stringify(executionDelta),
+              executionAction.actionHash,
+              input.idempotencyKey,
+              brief.active_playlist_contract_revision_id,
+            ],
+          );
+          const deactivated = await client.query(
+            `UPDATE guidance_question_sets
+             SET active=false
+             WHERE id=$1
+               AND brief_request_id=$2
+               AND question_set_hash=$3
+               AND active`,
+            [
+              brief.active_guidance_question_set_id,
+              input.briefRequestId,
+              brief.question_set_hash,
+            ],
+          );
+          if (deactivated.rowCount !== 1) {
+            throw new HttpError(
+              409,
+              "The execution decision changed before it was saved",
+              "stale_guidance_question_set",
+            );
+          }
+          const nextStatus =
+            briefStatusForGuidanceExecutionActionV5(executionAction);
+          const executionSelectionPlan = canonicalGuidanceV5
+            && contractVersion === 2
+            ? projectGuidanceV5SuccessorToSelectionPlanV2({
+                successorContract: baseContract,
+                basePlan: brief.selection_plan_json!,
+              })
+            : null;
+          const updated = await client.query(
+            `UPDATE brief_requests
+             SET status=$2,
+                 questions_json='[]'::jsonb,
+                 answers_json=$3::jsonb,
+                 answers_idempotency_key=$4,
+                 answers_hash=$5,
+                 pipeline_version=COALESCE($10::varchar,pipeline_version),
+                 policy_version=COALESCE($11::varchar,policy_version),
+                 selection_plan_json=COALESCE($12::jsonb,selection_plan_json),
+                 error=NULL,
+                 updated_at=now()
+             WHERE id=$1
+               AND status='awaiting_answers'
+               AND active_guidance_question_set_id=$6
+               AND active_playlist_contract_revision_id=$7
+               AND EXISTS (
+                 SELECT 1
+                 FROM guidance_answer_sets saved_action
+                 WHERE saved_action.brief_request_id=$1
+                   AND saved_action.question_set_id=$6
+                   AND saved_action.question_set_hash=$9
+                   AND saved_action.idempotency_key=$4
+                   AND saved_action.execution_delta_hash=$8
+                   AND saved_action.resulting_contract_revision_id=$7
+                   AND saved_action.invalidated_at IS NULL
+               )`,
+            [
+              input.briefRequestId,
+              nextStatus,
+              JSON.stringify(answers),
+              input.idempotencyKey,
+              answersHash,
+              brief.active_guidance_question_set_id,
+              brief.active_playlist_contract_revision_id,
+              executionAction.actionHash,
+              brief.question_set_hash,
+              executionSelectionPlan?.pipelineVersion ?? null,
+              executionSelectionPlan?.policyVersion ?? null,
+              executionSelectionPlan == null
+                ? null
+                : JSON.stringify(executionSelectionPlan),
+            ],
+          );
+          if (updated.rowCount !== 1) {
+            throw new HttpError(
+              409,
+              "The execution decision changed before it was saved",
+              "stale_guidance_question_set",
+            );
+          }
+          return {
+            status: nextStatus,
+            created: true,
+            executionAction,
+          };
+        }
         let patch;
         try {
           patch = compileGuidanceRoundPatchV3({
@@ -11294,6 +14486,13 @@ export class Repository {
           nextContract.requestedTrackCount,
           input.customTrackCountAuthority,
         );
+        const nextSelectionPlan = canonicalGuidanceV5
+          && contractVersion === 2
+          ? projectGuidanceV5SuccessorToSelectionPlanV2({
+              successorContract: nextContract,
+              basePlan: brief.selection_plan_json!,
+            })
+          : null;
         const executionDelta = patch?.operations ?? [];
         const executionDeltaHash = sha256Hex(stableStringify(executionDelta));
         const answerSetId = randomUUID();
@@ -11367,9 +14566,36 @@ export class Repository {
             [answerSetId, nextId],
           );
           await client.query(
-            `UPDATE brief_requests SET active_playlist_contract_revision_id=$2
+            `UPDATE brief_requests
+             SET active_playlist_contract_revision_id=$2,
+                 pipeline_version=COALESCE($3::varchar,pipeline_version),
+                 policy_version=COALESCE($4::varchar,policy_version),
+                 selection_plan_json=COALESCE($5::jsonb,selection_plan_json)
              WHERE id=$1`,
-            [input.briefRequestId, nextId],
+            [
+              input.briefRequestId,
+              nextId,
+              nextSelectionPlan?.pipelineVersion ?? null,
+              nextSelectionPlan?.policyVersion ?? null,
+              nextSelectionPlan == null
+                ? null
+                : JSON.stringify(nextSelectionPlan),
+            ],
+          );
+        }
+        if (!patch && nextSelectionPlan) {
+          await client.query(
+            `UPDATE brief_requests
+             SET pipeline_version=$2,policy_version=$3,
+                 selection_plan_json=$4::jsonb
+             WHERE id=$1 AND active_playlist_contract_revision_id=$5`,
+            [
+              input.briefRequestId,
+              nextSelectionPlan.pipelineVersion,
+              nextSelectionPlan.policyVersion,
+              JSON.stringify(nextSelectionPlan),
+              resultingContractRevisionId,
+            ],
           );
         }
         if (brief.question_set_axis === "exact_artist_identity") {
@@ -11398,13 +14624,232 @@ export class Repository {
             );
           }
         }
+        const currentV5Question = questions.length === 1
+          && questions[0]?.schemaVersion === 5
+          ? questions[0]
+          : null;
+        if (currentV5Question?.guidanceMode
+          === "correctness_blocking") {
+          const guidanceHistory = await client.query<{
+            axis: string | null;
+            questions_json: PlaylistGuidanceQuestion[];
+          }>(
+            `SELECT question_set.axis,question_set.questions_json
+             FROM guidance_answer_sets answer_set
+             JOIN guidance_question_sets question_set
+               ON question_set.id=answer_set.question_set_id
+              AND question_set.brief_request_id=answer_set.brief_request_id
+             WHERE answer_set.brief_request_id=$1
+             ORDER BY answer_set.created_at,answer_set.id`,
+            [input.briefRequestId],
+          );
+          const answeredAxes = [
+            ...new Set(guidanceHistory.rows.flatMap(({ axis }) => (
+              typeof axis === "string" && axis ? [axis] : []
+            ))),
+          ];
+          const priorQuestionHashes = [
+            ...new Set(guidanceHistory.rows.flatMap(({ questions_json }) => (
+              Array.isArray(questions_json)
+                ? questions_json.flatMap((question) => (
+                    typeof question.questionHash === "string"
+                      ? [question.questionHash]
+                      : []
+                  ))
+                : []
+            ))),
+          ];
+          const clarificationAttemptsByAxis =
+            guidanceHistory.rows.reduce<Record<string, number>>(
+              (counts, { axis }) => {
+                if (typeof axis === "string" && axis) {
+                  counts[axis] = (counts[axis] ?? 0) + 1;
+                }
+                return counts;
+              },
+              {},
+            );
+          const runSpec = createRunSpecV3({
+            prompt: nextContract.rawPrompt,
+            requestedTrackCount: nextContract.requestedTrackCount,
+            storefront: nextContract.storefront,
+          });
+          const liveRelease = runtimeReleaseContract();
+          const persistedAssignment = parsePublicRolloutAssignmentV1(
+            brief.public_rollout_assignment_json,
+          );
+          const nextCheckpoint = guidanceCheckpointV5({
+            prompt: nextContract.rawPrompt,
+            baseContract: nextContract,
+            preservedTrackPredicate: nextContract.trackPredicate,
+            ambiguousScopeClauseIds: [],
+            criticalAmbiguities: runSpec.criticalAmbiguities,
+            requestShape: "curated",
+            answeredAxes,
+            priorQuestionHashes,
+            clarificationAttemptsByAxis,
+            capabilitySnapshotHash:
+              canonicalExecutorCapabilityForSchemaV1({
+                queryPlanSchemaVersion: 6,
+              }).hash,
+            semanticConfigurationHash:
+              liveRelease.semanticExecutionConfigurationHash,
+            expectedRolloutGroup:
+              contractVersion === 3
+                ? persistedAssignment?.intentGroup
+                : undefined,
+          });
+          if (nextCheckpoint.decisions.length > 0) {
+            const nextQuestions = nextCheckpoint.decisions.map(
+              publicGuidanceQuestionV5,
+            );
+            const deactivated = await client.query<{
+              request_classification: string;
+              locale: string;
+              storefront: string;
+              explicit_constraint_hash: string;
+              feasibility_snapshot_id: string | null;
+              guidance_round: "initial" | "rescue";
+            }>(
+              `UPDATE guidance_question_sets
+               SET active=false
+               WHERE id=$1 AND brief_request_id=$2 AND active
+               RETURNING request_classification,locale,storefront,
+                         explicit_constraint_hash,feasibility_snapshot_id,
+                         guidance_round`,
+              [
+                brief.active_guidance_question_set_id,
+                input.briefRequestId,
+              ],
+            );
+            const sourceQuestionSet = deactivated.rows[0];
+            if (!sourceQuestionSet) {
+              throw new HttpError(
+                409,
+                "The playlist guidance changed before the next question",
+                "stale_guidance_question_set",
+              );
+            }
+            const nextQuestionSetRevision = await client.query<{
+              revision: number;
+            }>(
+              `SELECT COALESCE(max(revision),0)+1 revision
+               FROM guidance_question_sets WHERE brief_request_id=$1`,
+              [input.briefRequestId],
+            );
+            const nextQuestionSetId = randomUUID();
+            await client.query(
+              `INSERT INTO guidance_question_sets(
+                 id,brief_request_id,revision,question_set_hash,
+                 request_classification,generation_mode,
+                 guidance_policy_version,locale,storefront,target_track_count,
+                 explicit_constraint_hash,rejected_question_reasons_json,
+                 questions_json,active,base_contract_revision_id,
+                 parent_question_set_id,feasibility_snapshot_id,guidance_round,
+                 trigger,axis,checkpoint_mode,interpretation_summary_json)
+               VALUES(
+                 $1,$2,$3,$4,$5,'generalized_axis_registry',
+                 $6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,true,$13,$14,$15,$16,
+                 $17,$18,$19,$20::jsonb
+               )`,
+              [
+                nextQuestionSetId,
+                input.briefRequestId,
+                Number(
+                  nextQuestionSetRevision.rows[0]?.revision ?? 1,
+                ),
+                nextCheckpoint.checkpointHash,
+                sourceQuestionSet.request_classification,
+                nextCheckpoint.policyVersion,
+                sourceQuestionSet.locale,
+                sourceQuestionSet.storefront,
+                nextContract.requestedTrackCount,
+                sourceQuestionSet.explicit_constraint_hash,
+                JSON.stringify(
+                  Object.entries(nextCheckpoint.rejectedDecisionReasons)
+                    .map(([id, reason]) => `${id}:${reason}`)
+                    .slice(0, 12),
+                ),
+                JSON.stringify(nextQuestions),
+                resultingContractRevisionId,
+                brief.active_guidance_question_set_id,
+                sourceQuestionSet.feasibility_snapshot_id,
+                sourceQuestionSet.guidance_round,
+                nextCheckpoint.decisions[0]!.trigger,
+                nextCheckpoint.decisions[0]!.axis,
+                nextCheckpoint.mode,
+                JSON.stringify(nextCheckpoint.interpretationSummary),
+              ],
+            );
+            const pointed = await client.query(
+              `UPDATE brief_requests
+               SET active_guidance_question_set_id=$2,
+                   questions_json=$3::jsonb,
+                   answers_json=$4::jsonb,
+                   guidance_preferences_json=
+                     COALESCE(guidance_preferences_json,'[]'::jsonb)
+                     || $5::jsonb,
+                   guidance_telemetry_json=
+                     COALESCE(guidance_telemetry_json,'{}'::jsonb)
+                     || jsonb_build_object(
+                          'questionSetHash',$6::text,
+                          'generationMode','generalized_axis_registry',
+                          'guidancePolicyVersion',$7::text,
+                          'proposedQuestionCount',1,
+                          'acceptedQuestionCount',1
+                        ),
+                   status='awaiting_answers',error=NULL,updated_at=now()
+               WHERE id=$1
+                 AND active_playlist_contract_revision_id=$8
+                 AND active_guidance_question_set_id=$9`,
+              [
+                input.briefRequestId,
+                nextQuestionSetId,
+                JSON.stringify(nextQuestions),
+                JSON.stringify(answers),
+                JSON.stringify(guidancePreferences),
+                nextCheckpoint.checkpointHash,
+                nextCheckpoint.policyVersion,
+                resultingContractRevisionId,
+                brief.active_guidance_question_set_id,
+              ],
+            );
+            if (pointed.rowCount !== 1) {
+              throw new HttpError(
+                409,
+                "The playlist contract changed before the next question",
+                "stale_guidance_question_set",
+              );
+            }
+            return {
+              status: "awaiting_answers",
+              created: true,
+              questionSetHash: nextCheckpoint.checkpointHash,
+              questions: nextQuestions,
+            };
+          }
+        }
       }
       await client.query(
         `UPDATE brief_requests SET status='finalizing',answers_json=$2,
-             guidance_preferences_json=$3,answers_idempotency_key=$4,answers_hash=$5,
+             guidance_preferences_json=CASE
+               WHEN brief_contract_version=3
+                 OR $6::boolean
+                 THEN COALESCE(guidance_preferences_json,'[]'::jsonb)
+                      || $3::jsonb
+               ELSE $3::jsonb
+             END,
+             answers_idempotency_key=$4,answers_hash=$5,
              error=NULL,updated_at=now()
          WHERE id=$1`,
-        [input.briefRequestId, JSON.stringify(answers), JSON.stringify(guidancePreferences), input.idempotencyKey, answersHash],
+        [
+          input.briefRequestId,
+          JSON.stringify(answers),
+          JSON.stringify(guidancePreferences),
+          input.idempotencyKey,
+          answersHash,
+          canonicalGuidanceV5,
+        ],
       );
       return { status: "finalizing", created: true };
     });
@@ -11433,6 +14878,43 @@ export class Repository {
     }
   }
 
+  private async attachCapabilitySessionBrief(
+    client: PoolClient,
+    sessionId: string,
+    briefRequestId: string,
+  ): Promise<void> {
+    const attached = await client.query(
+      `INSERT INTO capability_session_briefs(session_id,brief_request_id)
+       SELECT session.id,brief.id
+       FROM capability_sessions session
+       JOIN brief_requests brief ON brief.id=$2 AND brief.expires_at>now()
+       WHERE session.id=$1
+         AND session.revoked_at IS NULL
+         AND session.expires_at>now()
+       ON CONFLICT(session_id,brief_request_id) DO NOTHING
+       RETURNING brief_request_id`,
+      [sessionId, briefRequestId],
+    );
+    if (attached.rows[0]) return;
+    const authorized = await client.query(
+      `SELECT 1
+       FROM capability_session_briefs session_brief
+       JOIN capability_sessions session
+         ON session.id=session_brief.session_id
+       JOIN brief_requests brief
+         ON brief.id=session_brief.brief_request_id
+       WHERE session_brief.session_id=$1
+         AND session_brief.brief_request_id=$2
+         AND session.revoked_at IS NULL
+         AND session.expires_at>now()
+         AND brief.expires_at>now()`,
+      [sessionId, briefRequestId],
+    );
+    if (!authorized.rows[0]) {
+      throw new HttpError(401, "Session has expired", "capability_required");
+    }
+  }
+
   async createRunIdempotent(input: {
     prompt: string;
     briefRequestId?: string | null;
@@ -11448,11 +14930,33 @@ export class Repository {
     capabilitySessionId?: string;
     forceFreshResearch?: boolean;
     releaseCanary?: UnsignedReleaseCanaryMetadata | null;
+    releaseCanaryOwnerAuthorized?: boolean;
     releaseManifestCanary?: boolean;
     releaseManifestCanaryOwnerAuthorized?: boolean;
+    /** Issued only by the HTTP boundary after authenticating a run canary. */
+    releaseManifestCanarySignedAuthorized?: boolean;
   }): Promise<{ runId: string; accessId: string; created: boolean; reused: boolean; status: string }> {
     const estimate = finiteMoney(input.estimateUsd, "Estimate");
     const approved = finiteMoney(input.approvedBudgetUsd, "Approved budget");
+    if (
+      input.releaseCanaryOwnerAuthorized === true
+      && (
+        !input.releaseCanary
+        || input.releaseCanary.operation !== "run"
+      )
+    ) {
+      throw new HttpError(
+        409,
+        "Owner release-canary authority requires authenticated canary metadata",
+        "release_canary_scope_invalid",
+      );
+    }
+    // Cache bypass and route authority are intentionally orthogonal. The API
+    // may force a fresh owner run, but only its already-authenticated,
+    // operation-scoped release canary is allowed to enter an owner cohort.
+    const signedOwnerCanaryRouteAuthority =
+      input.releaseCanaryOwnerAuthorized === true
+      && input.releaseCanary?.operation === "run";
     const stagingManifestCanary = input.releaseManifestCanary === true
       && process.env.RELEASE_ENVIRONMENT === "staging"
       && input.releaseCanary?.environment === "staging";
@@ -11460,8 +14964,23 @@ export class Repository {
       && process.env.RELEASE_ENVIRONMENT === "production"
       && input.releaseCanary?.environment === "production"
       && input.releaseManifestCanaryOwnerAuthorized === true;
+    const productionSignedManifestCanary =
+      input.releaseManifestCanary === true
+      && process.env.RELEASE_ENVIRONMENT === "production"
+      && input.releaseCanary?.environment === "production"
+      && input.releaseCanary.operation === "run"
+      && input.releaseManifestCanarySignedAuthorized === true;
+    // A separately authenticated, manifest-only production release canary is
+    // explicit synthetic route authority. It may bypass the public percentage
+    // and soft pause, but never the route hard switch or Apple write fence.
+    const routeAuthorizingManifestCanary =
+      stagingManifestCanary
+      || productionOwnerManifestCanary
+      || productionSignedManifestCanary;
     if (input.releaseManifestCanary && (
-      (!stagingManifestCanary && !productionOwnerManifestCanary)
+      (!stagingManifestCanary
+        && !productionOwnerManifestCanary
+        && !productionSignedManifestCanary)
       || input.releaseCanary?.operation !== "run"
       || input.autoPublish === true
     )) {
@@ -11481,6 +15000,16 @@ export class Repository {
     let publicRolloutAssignment: PersistedPublicRolloutAssignmentV1 | null = null;
     let activePlaylistContractDatabaseId: string | null = null;
     let activePlaylistContract: PlaylistContractRevisionV1 | null = null;
+    let guidanceV5ExecutionSeed: {
+      questionSetHash: string;
+      question: PlaylistGuidanceQuestion;
+      answer: PlaylistGuidanceAnswer;
+      baseContract: PlaylistContractRevisionV1;
+    } | null = null;
+    let legacyRepairAdmission:
+      AuthenticatedLegacyRepairAdmissionV1 | null = null;
+    let technicalRepairAdmission:
+      AuthenticatedTechnicalRepairAdmissionV1 | null = null;
     let guidanceExecutionDeltaHash = compileGuidanceExecutionDeltaV2([], []).hash;
     let repairedStoredSelectionPlan = false;
     if (input.briefRequestId) {
@@ -11496,6 +15025,10 @@ export class Repository {
         execution_delta_hash: string | null;
         active_playlist_contract_revision_id: string | null;
         playlist_contract_json: PlaylistContractRevisionV1 | null;
+        v5_question_set_hash: string | null;
+        v5_questions_json: PlaylistGuidanceQuestion[] | null;
+        v5_answers_json: PlaylistGuidanceAnswer[] | null;
+        v5_base_contract_json: PlaylistContractRevisionV1 | null;
       }>(
         `SELECT guidance_source_hints_json,guidance_telemetry_json,guidance_preferences_json,
            answers_json,selection_plan_json,requested_track_count,brief_contract_version,
@@ -11505,8 +15038,32 @@ export class Repository {
            active_playlist_contract_revision_id,
            (SELECT contract_json FROM playlist_contract_revisions
             WHERE id=brief_requests.active_playlist_contract_revision_id
-              AND status='active') playlist_contract_json
-         FROM brief_requests WHERE id=$1 AND expires_at>now()`,
+              AND status='active') playlist_contract_json,
+           v5_answer.question_set_hash v5_question_set_hash,
+           v5_answer.questions_json v5_questions_json,
+           v5_answer.normalized_answers_json v5_answers_json,
+           v5_answer.base_contract_json v5_base_contract_json
+         FROM brief_requests
+         LEFT JOIN LATERAL (
+           SELECT answer_set.question_set_hash,
+                  question_set.questions_json,
+                  answer_set.normalized_answers_json,
+                  base_contract.contract_json base_contract_json
+           FROM guidance_answer_sets answer_set
+           JOIN guidance_question_sets question_set
+             ON question_set.id=answer_set.question_set_id
+            AND question_set.brief_request_id=answer_set.brief_request_id
+           JOIN playlist_contract_revisions base_contract
+             ON base_contract.id=answer_set.base_contract_revision_id
+           WHERE answer_set.brief_request_id=brief_requests.id
+             AND answer_set.invalidated_at IS NULL
+             AND answer_set.resulting_contract_revision_id
+               =brief_requests.active_playlist_contract_revision_id
+             AND question_set.guidance_policy_version='adaptive_guidance_v5'
+           ORDER BY answer_set.accepted_at DESC,answer_set.id DESC
+           LIMIT 1
+         ) v5_answer ON true
+         WHERE brief_requests.id=$1 AND brief_requests.expires_at>now()`,
         [input.briefRequestId],
       );
       const row = context.rows[0];
@@ -11535,7 +15092,9 @@ export class Repository {
         const authority = await this.pool.query<{ value: string }>(
           "SELECT value FROM settings WHERE key=$1",
           [
-            `public_rollout_authority:${publicRolloutAssignment.rolloutEvidenceHash}`,
+            publicRolloutAssignmentAuthoritySettingKeyV1(
+              publicRolloutAssignment,
+            ),
           ],
         );
         try {
@@ -11568,7 +15127,23 @@ export class Repository {
       }
       activePlaylistContractDatabaseId = row.active_playlist_contract_revision_id;
       activePlaylistContract = row.playlist_contract_json;
-      if (briefContractVersion === 3) {
+      if (typeof row.v5_question_set_hash === "string"
+        && Array.isArray(row.v5_questions_json)
+        && row.v5_questions_json.length === 1
+        && Array.isArray(row.v5_answers_json)
+        && row.v5_answers_json.length === 1
+        && row.v5_base_contract_json) {
+        guidanceV5ExecutionSeed = {
+          questionSetHash: row.v5_question_set_hash,
+          question: row.v5_questions_json[0]!,
+          answer: row.v5_answers_json[0]!,
+          baseContract: row.v5_base_contract_json,
+        };
+      }
+      const canonicalGuidanceV5OnV2 = briefContractVersion === 2
+        && guidanceTelemetry?.guidancePolicyVersion
+          === ADAPTIVE_GUIDANCE_POLICY_VERSION_V5;
+      if (briefContractVersion === 3 || canonicalGuidanceV5OnV2) {
         if (!activePlaylistContractDatabaseId || !activePlaylistContract) {
           throw new HttpError(
             409,
@@ -11578,9 +15153,48 @@ export class Repository {
         }
         assertPlaylistContractIntegrityV1(activePlaylistContract);
       }
+      legacyRepairAdmission =
+        await this.loadAuthenticatedLegacyRepairAdmissionV1(
+          this.pool,
+          input.briefRequestId,
+        );
+      technicalRepairAdmission = legacyRepairAdmission
+        ? null
+        : await this.loadAuthenticatedTechnicalRepairAdmissionV1(
+            this.pool,
+            input.briefRequestId,
+          );
+      if (legacyRepairAdmission && (
+        briefContractVersion !== 3
+        || publicRolloutAssignment !== null
+        || input.releaseCanary !== null
+        && input.releaseCanary !== undefined
+      )) {
+        throw new HttpError(
+          409,
+          "The repair successor has conflicting execution authority",
+          "legacy_repair_admission_conflict",
+        );
+      }
+      if (technicalRepairAdmission && (
+        briefContractVersion !== 3
+        || publicRolloutAssignment !== null
+        || input.releaseCanary !== null
+        && input.releaseCanary !== undefined
+      )) {
+        throw new HttpError(
+          409,
+          "The technical repair successor has conflicting execution authority",
+          "technical_repair_admission_conflict",
+        );
+      }
     }
+    const canonicalGuidanceV5OnV2 = briefContractVersion === 2
+      && guidanceTelemetry?.guidancePolicyVersion
+        === ADAPTIVE_GUIDANCE_POLICY_VERSION_V5;
     const exactRequestedTrackCount = (() => {
-      if (briefContractVersion === 3 && activePlaylistContract) {
+      if ((briefContractVersion === 3 || canonicalGuidanceV5OnV2)
+        && activePlaylistContract) {
         return activePlaylistContract.requestedTrackCount;
       }
       if (Number.isInteger(briefRequestedTrackCount)
@@ -11599,7 +15213,8 @@ export class Repository {
           ? minimum
           : null;
     })();
-    const executionBrief = briefContractVersion === 3
+    const executionBrief = (briefContractVersion === 3
+      || canonicalGuidanceV5OnV2)
       && exactRequestedTrackCount !== null
       ? applyExecutableRequestedTrackCount(
           input.brief,
@@ -11614,7 +15229,7 @@ export class Repository {
       selectionPlan.requestedTrackCount !== exactRequestedTrackCount
       || selectionPlan.minimumQualifiedTrackCount !== exactRequestedTrackCount
     )) {
-      selectionPlan = briefContractVersion === 3
+      selectionPlan = briefContractVersion === 3 || canonicalGuidanceV5OnV2
         ? {
             ...selectionPlan,
             requestedTrackCount: exactRequestedTrackCount,
@@ -11627,7 +15242,8 @@ export class Repository {
         : null;
       repairedStoredSelectionPlan = true;
     }
-    if (briefContractVersion === 3 && !selectionPlan) {
+    if ((briefContractVersion === 3 || canonicalGuidanceV5OnV2)
+      && !selectionPlan) {
       throw new HttpError(
         409,
         "The canonical playlist contract is missing its typed execution base",
@@ -11651,7 +15267,25 @@ export class Repository {
           basePlan: baseSelectionPlan,
         })
       : null;
-    const proposedSelectionPlan = contractExecutionProjection?.plan ?? baseSelectionPlan;
+    const v5V2ExecutionPlan = canonicalGuidanceV5OnV2
+      && activePlaylistContract
+      ? projectGuidanceV5SuccessorToSelectionPlanV2({
+          successorContract: activePlaylistContract,
+          basePlan: baseSelectionPlan,
+        })
+      : null;
+    if (v5V2ExecutionPlan
+      && stableStringify(v5V2ExecutionPlan)
+        !== stableStringify(baseSelectionPlan)) {
+      throw new HttpError(
+        409,
+        "The selected guidance answer is not bound to its V2 execution plan",
+        "guidance_v5_v2_execution_plan_mismatch",
+      );
+    }
+    const proposedSelectionPlan = contractExecutionProjection?.plan
+      ?? v5V2ExecutionPlan
+      ?? baseSelectionPlan;
     if (exactRequestedTrackCount !== null && (
       proposedSelectionPlan.requestedTrackCount !== exactRequestedTrackCount
       || proposedSelectionPlan.minimumQualifiedTrackCount !== exactRequestedTrackCount
@@ -11666,6 +15300,7 @@ export class Repository {
     const supportsImmutableRunSpec = schemaVersion >= 14;
     const supportsGroundedRecoveryAudit = schemaVersion >= 15;
     let selectionPlanV3: SelectionPlanV3 | null = null;
+    let pipelineV3Assignment: PipelineV3Assignment | null = null;
     let contractExecutionPause: {
       blockerKind: "provider" | "scope_decision";
       dependencyKey: string;
@@ -11674,7 +15309,8 @@ export class Repository {
     } | null = null;
     if (supportsImmutableRunSpec
       && exactRequestedTrackCount !== null
-      && contractCapabilityDecision === null) {
+      && contractCapabilityDecision === null
+      && !canonicalGuidanceV5OnV2) {
       try {
         // Contract-v3 is already the immutable, confirmed semantic authority.
         // Its execution bridge compiled the complete Boolean predicate tree,
@@ -11701,10 +15337,47 @@ export class Repository {
             })();
         const assignmentV3 = assignPipelineV3({
           plan: confirmedV3,
-          owner: input.forceFreshResearch === true,
+          owner: briefContractVersion === 3
+            ? signedOwnerCanaryRouteAuthority
+              || routeAuthorizingManifestCanary
+            : signedOwnerCanaryRouteAuthority,
           stickyKey: input.clientBucket,
           env: process.env,
         });
+        pipelineV3Assignment = assignmentV3;
+        const authenticatedRepairAdmission =
+          legacyRepairAdmission !== null
+          || technicalRepairAdmission !== null;
+        if (
+          legacyRepairAdmission
+          && (
+            assignmentV3.group
+              !== legacyRepairAdmission.authority.targetIntentGroup
+            || legacyRepairAdmission.authority.targetExecutionRoute
+              !== "corpus_first_v3"
+          )
+        ) {
+          throw new HttpError(
+            409,
+            "The repaired contract no longer matches its authorized route",
+            "legacy_repair_route_mismatch",
+          );
+        }
+        if (
+          technicalRepairAdmission
+          && (
+            technicalRepairAdmission.sourceRouteReceipt.executionRoute
+              !== "corpus_first_v3"
+            || technicalRepairAdmission.sourceRouteReceipt
+                .assignmentAuthority.intentGroup !== assignmentV3.group
+          )
+        ) {
+          throw new HttpError(
+            409,
+            "The technical repair contract no longer matches its authenticated source route",
+            "technical_repair_route_mismatch",
+          );
+        }
         if ((process.env.PIPELINE_V3_ASSIGNMENT_ENABLED === "true"
           || briefContractVersion === 3) && !confirmedV3.confirmed) {
           throw new HttpError(
@@ -11713,18 +15386,23 @@ export class Repository {
             "v3_guidance_required",
           );
         }
-        let publicRolloutCapabilityChanged = false;
-        try {
-          assertPublicRolloutExecutionGroupV1(
-            publicRolloutAssignment,
-            assignmentV3.group,
-          );
-          assertPublicRolloutExecutionEligibilityV1(
-            publicRolloutAssignment,
-            assignmentV3.reason,
-          );
-        } catch {
-          publicRolloutCapabilityChanged = true;
+        let publicRolloutCapabilityChanged =
+          !authenticatedRepairAdmission && !routeAuthorizingManifestCanary;
+        if (!authenticatedRepairAdmission
+          && !routeAuthorizingManifestCanary) {
+          try {
+            assertPublicRolloutExecutionGroupV1(
+              publicRolloutAssignment,
+              assignmentV3.group,
+            );
+            assertPublicRolloutExecutionEligibilityV1(
+              publicRolloutAssignment,
+              assignmentV3.reason,
+            );
+            publicRolloutCapabilityChanged = false;
+          } catch {
+            publicRolloutCapabilityChanged = true;
+          }
         }
         // Contract-3 is immutable semantic authority, not execution
         // authority. The projected contract may be persisted for review, but
@@ -11736,7 +15414,38 @@ export class Repository {
           route: "corpus_first_v3",
           intentGroup: assignmentV3.group,
         });
-        if (publicRolloutCapabilityChanged) {
+        const intentPublicAssignmentPaused =
+          await this.getSetting(
+            `pipeline_v3_public_assignment_paused:${assignmentV3.group}`,
+          ) === "true";
+        const signedReleaseCanaryRunAuthority =
+          input.releaseCanary?.operation === "run";
+        // An intent hard switch fences every request classified into that
+        // route, including 0%-control traffic and signed canaries. The
+        // intent-specific public pause is checked at execution admission as
+        // well as brief admission so a previously accepted V2/control brief
+        // cannot silently fall back after containment begins. Only an
+        // authenticated owner/release canary may bypass this softer pause.
+        if (cohortDisabled) {
+          throw new HttpError(
+            503,
+            "This playlist route is temporarily paused; your confirmed interpretation is saved",
+            authenticatedRepairAdmission
+              ? "repair_replay_route_disabled"
+              : "contract_execution_cohort_paused",
+          );
+        } else if (
+          intentPublicAssignmentPaused
+          && !signedReleaseCanaryRunAuthority
+        ) {
+          throw new HttpError(
+            503,
+            "This playlist route is temporarily paused; your confirmed interpretation is saved",
+            "intent_public_assignment_paused",
+          );
+        } else if (authenticatedRepairAdmission) {
+          selectionPlanV3 = confirmedV3;
+        } else if (publicRolloutCapabilityChanged) {
           // Confirmation may legitimately move a sticky pre-brief assignment
           // to another intent/capability. Preserve that accepted immutable
           // contract as a visible decision and offer a separate, explicit
@@ -11772,15 +15481,6 @@ export class Repository {
             "This playlist route is temporarily paused; your confirmed interpretation is saved",
             "contract_execution_assignment_paused",
           );
-        } else if (canonicalBackendAssigned && cohortDisabled) {
-          // A hard switch is an operator-controlled retryable service state.
-          // It must never be presented as a musical-scope decision or create
-          // a terminal-looking job with no executable action.
-          throw new HttpError(
-            503,
-            "This playlist route is temporarily paused; your confirmed interpretation is saved",
-            "contract_execution_cohort_paused",
-          );
         } else if (assignmentV3.assigned
           && (
             canonicalBackendAssigned
@@ -11813,19 +15513,30 @@ export class Repository {
     const pipelineAssignment = selectionPlanV3 === null
       && contractCapabilityDecision === null ? assignPipelineV2({
       plan: proposedSelectionPlan,
-      owner: input.forceFreshResearch === true,
+      signedOwnerCanary: signedOwnerCanaryRouteAuthority,
       // A visitor remains in the same rollout cohort across prompts. Scope
       // text must not reshuffle one browser between V1 and V2; only a new
       // pipeline route or policy version intentionally creates a new cohort.
       stickyKey: pipelineRolloutStickyKey(input.clientBucket, proposedSelectionPlan),
       env: process.env,
     }) : null;
+    const pipelineV2CohortDisabled = pipelineAssignment?.assigned
+      ? await this.isPipelineCohortDisabled({
+          route: "catalog_first_v2",
+          intentGroup: proposedSelectionPlan.scopeKind ?? "broad_curated",
+        })
+      : false;
+    if (canonicalGuidanceV5OnV2
+      && (!pipelineAssignment?.assigned || pipelineV2CohortDisabled)) {
+      throw new HttpError(
+        503,
+        "This guided playlist route is temporarily paused; your answer is saved",
+        "guidance_v5_v2_execution_paused",
+      );
+    }
     selectionPlan = contractCapabilityDecision === null
       && pipelineAssignment?.assigned
-      && !await this.isPipelineCohortDisabled({
-        route: "catalog_first_v2",
-        intentGroup: proposedSelectionPlan.scopeKind ?? "broad_curated",
-      })
+      && !pipelineV2CohortDisabled
       ? proposedSelectionPlan
       : null;
     const modelRoutingSignals = { scoutTelemetry: guidanceTelemetry };
@@ -11891,7 +15602,8 @@ export class Repository {
       : selectionPlanV3?.selectionPlanVersion === "selection_plan_v3"
       ? "corpus_first_v3_policy_v1"
       : selectionPlan?.policyVersion ?? "legacy_v1";
-    const runSpecStorefront = briefContractVersion === 3
+    const runSpecStorefront = (briefContractVersion === 3
+      || canonicalGuidanceV5OnV2)
       && activePlaylistContract
       ? activePlaylistContract.storefront
       : (process.env.APPLE_STOREFRONT ?? "us").trim().toLowerCase();
@@ -11919,27 +15631,86 @@ export class Repository {
         }));
     // Owner requests are deliberate test/refresh runs. Never attach them to a
     // prior visitor result, even when the confirmed brief hashes identically.
-    const reuseDays = input.forceFreshResearch || input.releaseCanary
+    const effectiveAutoPublication =
+      legacyRepairAdmission || technicalRepairAdmission
+      ? false
+      : input.autoPublish === true;
+    const reuseDays = legacyRepairAdmission
+      || technicalRepairAdmission
+      || input.forceFreshResearch
+      || input.releaseCanary
       ? 0
       : Math.max(0, Math.min(input.reuseDays ?? 30, 30));
     return this.transaction(async (client) => {
       await lockClientAliases(client, `run:${input.idempotencyKey}`, input.clientBucketAliases);
-      if (productionOwnerManifestCanary) {
-        const assignmentPause = await client.query<{ value: string }>(
-          `SELECT value
-           FROM settings
-           WHERE key='pipeline_v3_public_assignment_paused'
-           FOR SHARE`,
-        );
-        if (assignmentPause.rows[0]?.value !== "true") {
+      if (legacyRepairAdmission && input.briefRequestId) {
+        const lockedAdmission =
+          await this.loadAuthenticatedLegacyRepairAdmissionV1(
+            client,
+            input.briefRequestId,
+          );
+        if (
+          !lockedAdmission
+          || lockedAdmission.authority.authorityHash
+            !== legacyRepairAdmission.authority.authorityHash
+          || lockedAdmission.consumption.consumptionHash
+            !== legacyRepairAdmission.consumption.consumptionHash
+        ) {
           throw new HttpError(
             409,
-            "Production manifest-only canaries require public assignment to remain paused",
+            "The authenticated repair admission changed before execution",
+            "legacy_repair_admission_conflict",
+          );
+        }
+        legacyRepairAdmission = lockedAdmission;
+      }
+      if (technicalRepairAdmission && input.briefRequestId) {
+        const lockedAdmission =
+          await this.loadAuthenticatedTechnicalRepairAdmissionV1(
+            client,
+            input.briefRequestId,
+          );
+        if (!lockedAdmission
+          || lockedAdmission.sourceRunId
+            !== technicalRepairAdmission.sourceRunId
+          || lockedAdmission.consumption.consumptionHash
+            !== technicalRepairAdmission.consumption.consumptionHash) {
+          throw new HttpError(
+            409,
+            "The technical repair admission changed before execution",
+            "technical_repair_admission_conflict",
+          );
+        }
+        technicalRepairAdmission = lockedAdmission;
+      }
+      if (productionOwnerManifestCanary || productionSignedManifestCanary) {
+        const assignmentPauses = await client.query<{
+          key: string;
+          value: string;
+        }>(
+          `SELECT key,value
+           FROM settings
+           WHERE key = ANY($1::text[])
+           FOR SHARE`,
+          [[
+            "pipeline_v3_public_assignment_paused",
+            `pipeline_v3_public_assignment_paused:${
+              pipelineV3Assignment?.group ?? "unclassified"
+            }`,
+          ]],
+        );
+        if (
+          assignmentPauses.rows.length !== 2
+          || assignmentPauses.rows.some(({ value }) => value !== "true")
+        ) {
+          throw new HttpError(
+            409,
+            "Production manifest-only canaries require the exact public route to remain paused",
             "release_manifest_canary_scope_invalid",
           );
         }
       }
-      if (briefContractVersion === 3) {
+      if (briefContractVersion === 3 || canonicalGuidanceV5OnV2) {
         if (!input.briefRequestId
           || !activePlaylistContractDatabaseId
           || !activePlaylistContract) {
@@ -12014,7 +15785,7 @@ export class Repository {
         const prior = existing.rows[0];
         if (prior.prompt !== input.prompt
           || prior.brief_hash !== briefHash
-          || prior.auto_publish !== (input.autoPublish === true)
+          || prior.auto_publish !== effectiveAutoPublication
           || prior.manifest_only !== (input.releaseManifestCanary === true)
           || prior.brief_request_id !== (input.briefRequestId ?? null)) {
           throw new HttpError(
@@ -12124,6 +15895,14 @@ export class Repository {
               playlistContractRevisionId: activePlaylistContract.revisionId,
               playlistContractSemanticHash: activePlaylistContract.semanticHash,
               playlistContractCompilerVersion: activePlaylistContract.versions.compiler,
+              ...(emittedSchema === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+                ? {
+                    guidancePolicyVersion:
+                      canonicalQueryPlanGuidancePolicyVersionV1(
+                        guidanceTelemetry?.guidancePolicyVersion,
+                      ),
+                  }
+                : {}),
             })
             : briefContractVersion === 2
             ? createQueryPlanV3(selectionPlanV3, v3GraphSnapshotId, {
@@ -12174,7 +15953,7 @@ export class Repository {
             phase,
             input.clientBucket,
             input.idempotencyKey,
-            input.autoPublish === true,
+            effectiveAutoPublication,
             estimate,
             Math.max(approved, status === "queued" ? (v3ApprovedBudgetUsd ?? estimate) : 0),
             selectionPlanV3 || contractCapabilityDecision
@@ -12186,7 +15965,9 @@ export class Repository {
             selectionPlanV3 ? null : selectionPlan == null ? null : JSON.stringify(selectionPlan),
             pipelinePolicySnapshot == null ? null : JSON.stringify(pipelinePolicySnapshot),
             briefContractVersion,
-            activePlaylistContractDatabaseId,
+            briefContractVersion === 3
+              ? activePlaylistContractDatabaseId
+              : null,
           ],
         );
         if (supportsImmutableRunSpec) {
@@ -12271,6 +16052,30 @@ export class Repository {
              VALUES($1,$2,now())`,
             [runId, queryPlanRevisionId],
           );
+          if (v3QueryPlan.guidancePolicyVersion === "adaptive_guidance_v5") {
+            if (!activePlaylistContract || !guidanceV5ExecutionSeed) {
+              throw new HttpError(
+                409,
+                "The selected Guidance V5 option has no executable worker authority",
+                "guidance_v5_execution_authority_missing",
+              );
+            }
+            const authority = createGuidanceWorkerExecutionAuthorityV5({
+              ...guidanceV5ExecutionSeed,
+              successorContract: activePlaylistContract,
+              queryPlan: v3QueryPlan,
+              queryPlanRevisionId,
+            });
+            await client.query(
+              `INSERT INTO research_checkpoints(run_id,phase,state_json)
+               VALUES($1,$2,$3::jsonb)`,
+              [
+                runId,
+                GUIDANCE_V5_EXECUTION_AUTHORITY_CHECKPOINT,
+                JSON.stringify(authority),
+              ],
+            );
+          }
           if (input.releaseManifestCanary && input.releaseCanary) {
             const stageKey = v3RetrievalStageKey(v3QueryPlan, "shadow");
             const marker = createReleaseManifestCanaryMarker({
@@ -12327,6 +16132,288 @@ export class Repository {
              VALUES($1,$2,$3)`,
             [runId, `fast:route:${executionPolicy.version}`, route],
           );
+        }
+        if (status === "queued") {
+          const executionRoute = selectionPlanV3
+            ? "corpus_first_v3"
+            : selectionPlan?.pipelineVersion ?? "legacy_v1";
+          const ownerCanaryRouteAssigned =
+            (
+              signedOwnerCanaryRouteAuthority
+              || productionOwnerManifestCanary
+            )
+            && input.releaseCanary !== null
+            && input.releaseCanary !== undefined
+            && (
+              (
+                executionRoute === "corpus_first_v3"
+                && pipelineV3Assignment?.assigned === true
+                && pipelineV3Assignment.reason === "owner_canary"
+              )
+              || (
+                executionRoute === "catalog_first_v2"
+                && pipelineAssignment?.assigned === true
+                && pipelineAssignment.reason === "owner_canary"
+              )
+            );
+          const explicitSyntheticCanary =
+            (stagingManifestCanary || productionSignedManifestCanary)
+            && input.releaseCanary !== null
+            && input.releaseCanary !== undefined
+            && executionRoute === "corpus_first_v3";
+          let assignmentAuthority:
+            ExecutionRouteReceiptV1["assignmentAuthority"];
+          if (
+            executionRoute === "corpus_first_v3"
+            && briefContractVersion === 3
+          ) {
+            if (!legacyRepairAdmission
+              && !technicalRepairAdmission
+              && !pipelineV3Assignment?.assigned) {
+              executionRouteReceiptMismatch();
+            }
+            if (legacyRepairAdmission) {
+              if (
+                !input.briefRequestId
+                || legacyRepairAdmission.authority.targetExecutionRoute
+                  !== executionRoute
+                || legacyRepairAdmission.authority.targetIntentGroup
+                  !== pipelineV3Assignment?.group
+                || (
+                  v3QueryPlan?.guidancePolicyVersion
+                  ?? guidanceTelemetry?.guidancePolicyVersion
+                ) !== legacyRepairAdmission.authority.targetGuidanceVersion
+              ) {
+                executionRouteReceiptMismatch();
+              }
+              assignmentAuthority = {
+                kind: "authenticated_legacy_repair",
+                receiptHash:
+                  legacyRepairAdmission.authority.authorityHash,
+                intentGroup:
+                  legacyRepairAdmission.authority.targetIntentGroup,
+                assignmentReason: "legacy_repair_authority_v1",
+              };
+            } else if (technicalRepairAdmission) {
+              const sourceRoute =
+                technicalRepairAdmission.sourceRouteReceipt;
+              const guidanceVersion =
+                v3QueryPlan?.guidancePolicyVersion
+                ?? guidanceTelemetry?.guidancePolicyVersion;
+              if (
+                !input.briefRequestId
+                || publicRolloutAssignment !== null
+                || sourceRoute.executionRoute !== executionRoute
+                || sourceRoute.assignmentAuthority.intentGroup
+                  !== pipelineV3Assignment?.group
+                || guidanceVersion !== "adaptive_guidance_v5"
+              ) {
+                executionRouteReceiptMismatch();
+              }
+              assignmentAuthority = {
+                kind: "authenticated_legacy_repair",
+                receiptHash:
+                  technicalRepairAdmission.consumption.consumptionHash,
+                intentGroup:
+                  sourceRoute.assignmentAuthority.intentGroup,
+                assignmentReason: "technical_repair_consumption_v1",
+              };
+            } else {
+              const assignment = pipelineV3Assignment;
+              if (!assignment?.assigned) executionRouteReceiptMismatch();
+              if (ownerCanaryRouteAssigned || explicitSyntheticCanary) {
+                if (assignment.reason !== "owner_canary") {
+                  executionRouteReceiptMismatch();
+                }
+                assignmentAuthority = {
+                  kind: ownerCanaryRouteAssigned
+                    ? "signed_owner_canary"
+                    : "signed_release_canary",
+                  receiptHash: releaseCanaryExecutionAuthorityHashV1(
+                    input.releaseCanary!,
+                  ),
+                  intentGroup: assignment.group,
+                  assignmentReason: ownerCanaryRouteAssigned
+                    ? assignment.reason
+                    : "release_manifest_canary",
+                };
+              } else {
+                if (
+                  publicRolloutAssignment?.assigned !== true
+                  || assignment.reason !== "sticky_rollout"
+                  || publicRolloutAssignment.intentGroup
+                    !== assignment.group
+                ) {
+                  executionRouteReceiptMismatch();
+                }
+                assignmentAuthority = {
+                  kind: publicRolloutAssignment.version
+                      === V254_DIRECT_EXPOSURE_ASSIGNMENT_VERSION
+                    ? "signed_public_direct_exposure"
+                    : "signed_public_rollout",
+                  receiptHash: publicRolloutAssignment.assignmentHash,
+                  intentGroup: publicRolloutAssignment.intentGroup,
+                  assignmentReason: assignment.reason,
+                };
+              }
+            }
+          } else if (ownerCanaryRouteAssigned) {
+            assignmentAuthority = {
+              kind: "signed_owner_canary",
+              receiptHash: releaseCanaryExecutionAuthorityHashV1(
+                input.releaseCanary!,
+              ),
+              intentGroup: executionRoute === "catalog_first_v2"
+                ? pipelineV2RolloutGroup(proposedSelectionPlan)
+                : pipelineV3Assignment?.group ?? null,
+              assignmentReason: "owner_canary",
+            };
+          } else {
+            assignmentAuthority = {
+              kind: "legacy_control",
+              receiptHash: legacyControlExecutionAuthorityHashV1({
+                briefHash,
+                runSpecHash,
+                contractVersion: briefContractVersion,
+                executionRoute,
+              }),
+              intentGroup: null,
+              assignmentReason: "legacy_control",
+            };
+          }
+          const receipt = createExecutionRouteReceiptV1({
+            version: EXECUTION_ROUTE_RECEIPT_VERSION_V1,
+            briefId: input.briefRequestId ?? `run:${runId}`,
+            rootLineageId:
+              activePlaylistContract?.contractId
+              ?? input.briefRequestId
+              ?? `run:${runId}`,
+            trafficClass: legacyRepairAdmission || technicalRepairAdmission
+              ? "replay"
+              : ownerCanaryRouteAssigned
+                ? "owner_canary"
+                : explicitSyntheticCanary || input.releaseCanary
+                  ? "synthetic"
+                  : "public",
+            contractVersion: briefContractVersion,
+            guidanceVersion: v3QueryPlan
+              ? v3QueryPlan.guidancePolicyVersion ?? "legacy_guidance_v1"
+              : guidanceTelemetry?.guidancePolicyVersion
+                ?? (briefContractVersion === 2
+                  ? "intelligent_guidance_v2"
+                  : "legacy_guidance_v1"),
+            assignmentAuthority,
+            // This field binds the parser/selection route that admitted the
+            // brief, not the canonical executor route projected from the
+            // answered successor contract. Those are intentionally separate:
+            // a catalog-first brief may be signed into Contract 3 and execute
+            // on corpus_first_v3. Rewriting this compatibility label to the
+            // executor route makes the immediately following enqueue compare
+            // the receipt with the unchanged brief row and reject a valid
+            // guidance answer as route drift.
+            briefSelectionPipelineVersion: baseSelectionPlan.pipelineVersion,
+            executionRoute,
+            queryPlanSchema: v3QueryPlan?.schemaVersion ?? null,
+            queryPlanHash: v3QueryPlan ? queryPlanV3Hash(v3QueryPlan) : null,
+            capabilitySnapshotHash: v3QueryPlan
+              ? queryPlanCapabilitySnapshotHashV1(v3QueryPlan)
+              : null,
+            releaseRevision:
+              canonicalExecutorReleaseIdentityV1().executorRevision,
+            executorConfigurationHash:
+              canonicalExecutorReleaseIdentityV1()
+                .semanticExecutionConfigurationHash,
+            createdAt: insertedRun.rows[0]!.created_at.toISOString(),
+          });
+          await client.query(
+            `INSERT INTO research_checkpoints(run_id,phase,state_json)
+             VALUES($1,$2,$3::jsonb)`,
+            [
+              runId,
+              EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+              JSON.stringify(receipt),
+            ],
+          );
+          if (canonicalGuidanceV5OnV2) {
+            if (executionRoute !== "catalog_first_v2"
+              || !selectionPlan
+              || !activePlaylistContract
+              || !guidanceV5ExecutionSeed) {
+              throw new HttpError(
+                409,
+                "The selected Guidance V5 option has no V2 worker authority",
+                "guidance_v5_v2_execution_authority_missing",
+              );
+            }
+            const authority = createGuidanceV5V2ExecutionAuthority({
+              ...guidanceV5ExecutionSeed,
+              successorContract: activePlaylistContract,
+              selectionPlan,
+            });
+            await client.query(
+              `INSERT INTO research_checkpoints(run_id,phase,state_json)
+               VALUES($1,$2,$3::jsonb)`,
+              [
+                runId,
+                GUIDANCE_V5_V2_EXECUTION_AUTHORITY_CHECKPOINT,
+                JSON.stringify(authority),
+              ],
+            );
+          }
+          if (legacyRepairAdmission) {
+            const runAdmission = createLegacyRepairRunAdmissionV1({
+              version: "legacy_repair_run_admission_v1",
+              authority: legacyRepairAdmission.authority,
+              consumption: legacyRepairAdmission.consumption,
+              sourceRunId: legacyRepairAdmission.sourceRunId,
+              successorBriefRequestId: input.briefRequestId!,
+              trafficClass: "replay",
+              resultReuse: false,
+              autoPublication: false,
+              admittedAt: insertedRun.rows[0]!.created_at.toISOString(),
+            });
+            await client.query(
+              `INSERT INTO research_checkpoints(
+                 run_id,phase,state_json
+               )
+               VALUES($1,$2,$3::jsonb)`,
+              [
+                runId,
+                LEGACY_REPAIR_RUN_ADMISSION_PHASE_V1,
+                JSON.stringify(runAdmission),
+              ],
+            );
+          } else if (technicalRepairAdmission && input.briefRequestId) {
+            const runAdmission = createTechnicalRepairRunAdmissionV1({
+              version: "technical_repair_run_admission_v1",
+              sourceRunId: technicalRepairAdmission.sourceRunId,
+              consumptionHash:
+                technicalRepairAdmission.consumption.consumptionHash,
+              successorBriefRequestId: input.briefRequestId,
+              admittedRunId: runId,
+              targetIntentGroup:
+                receipt.assignmentAuthority.intentGroup!,
+              targetExecutionRoute: "corpus_first_v3",
+              targetGuidanceVersion: "adaptive_guidance_v5",
+              repairReleaseRevision: receipt.releaseRevision,
+              repairExecutorConfigurationHash:
+                receipt.executorConfigurationHash,
+              resultReuse: false,
+              autoPublication: false,
+              admittedAt: insertedRun.rows[0]!.created_at.toISOString(),
+            });
+            await client.query(
+              `INSERT INTO research_checkpoints(
+                 run_id,phase,state_json
+               )
+               VALUES($1,$2,$3::jsonb)`,
+              [
+                runId,
+                TECHNICAL_REPAIR_RUN_ADMISSION_PHASE_V1,
+                JSON.stringify(runAdmission),
+              ],
+            );
+          }
         }
         await this.shadowPlaylistResolutionV1(client, runId);
       } else {
@@ -12880,6 +16967,13 @@ export class Repository {
                 label: option.label,
                 description: option.description ?? "",
                 recommended: option.recommended === true,
+                ...(typeof option.recommendationReason === "string"
+                  && option.recommendationReason.trim()
+                  ? {
+                      recommendationReason:
+                        option.recommendationReason.trim(),
+                    }
+                  : {}),
               })),
             },
             selectedOptionIds,
@@ -13832,6 +17926,1229 @@ export class Repository {
     };
   }
 
+  /**
+   * Creates a fresh execution lineage after a repaired technical quarantine.
+   * The immutable semantic contract is cloned verbatim; this is intentionally
+   * not expressed as a fake user patch. No prior candidates, evidence,
+   * qualifications, manifests, result reuse, or publication authority cross
+   * the lineage boundary.
+   */
+  private async ensureRepairReplayPlanningJobWithClient(
+    client: PoolClient,
+    briefRequestId: string,
+    briefStatus: ReplayCanonicalRunAfterRepairResult["status"],
+  ): Promise<void> {
+    if (briefStatus !== "queued") return;
+    const dedupeKey = `brief:${briefRequestId}`;
+    const payload = { briefRequestId };
+    await client.query(
+      `INSERT INTO job_queue(
+         id,run_id,brief_request_id,kind,dedupe_key,payload_json,
+         max_attempts,pipeline_version,minimum_worker_protocol,
+         query_plan_revision_id,stage_key,queue_class,
+         required_executor_revision,
+         required_executor_semantic_configuration_hash
+       )
+       VALUES(
+         $1,NULL,$2,'brief',$3,$4::jsonb,6,'legacy_v1',$5,
+         NULL,'default','interactive',NULL,NULL
+       )
+       ON CONFLICT(kind,dedupe_key) DO NOTHING`,
+      [
+        randomUUID(),
+        briefRequestId,
+        dedupeKey,
+        JSON.stringify(payload),
+        BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL,
+      ],
+    );
+    const persisted = await client.query<{
+      run_id: string | null;
+      brief_request_id: string | null;
+      kind: string;
+      dedupe_key: string;
+      payload_json: unknown;
+      status: string;
+      max_attempts: number;
+      pipeline_version: string;
+      minimum_worker_protocol: number;
+      query_plan_revision_id: string | null;
+      stage_key: string;
+      queue_class: string;
+      required_executor_revision: string | null;
+      required_executor_semantic_configuration_hash: string | null;
+    }>(
+      `SELECT run_id,brief_request_id,kind,dedupe_key,payload_json,status,
+              max_attempts,pipeline_version,minimum_worker_protocol,
+              query_plan_revision_id,stage_key,queue_class,
+              required_executor_revision,
+              required_executor_semantic_configuration_hash
+       FROM job_queue
+       WHERE kind='brief' AND dedupe_key=$1
+       FOR UPDATE`,
+      [dedupeKey],
+    );
+    const job = persisted.rows[0];
+    if (!job
+      || job.run_id !== null
+      || job.brief_request_id !== briefRequestId
+      || job.kind !== "brief"
+      || job.dedupe_key !== dedupeKey
+      || stableStringify(job.payload_json) !== stableStringify(payload)
+      || !["queued", "leased"].includes(job.status)
+      || job.max_attempts !== 6
+      || job.pipeline_version !== "legacy_v1"
+      || job.minimum_worker_protocol
+        < BRIEF_CONTRACT_3_MINIMUM_WORKER_PROTOCOL
+      || job.query_plan_revision_id !== null
+      || job.stage_key !== "default"
+      || job.queue_class !== "interactive"
+      || job.required_executor_revision !== null
+      || job.required_executor_semantic_configuration_hash !== null) {
+      throw new HttpError(
+        409,
+        "The repair successor planning job is not executable",
+        "repair_replay_planning_job_integrity",
+      );
+    }
+  }
+
+  private async replayCurrentTechnicalRunAfterRepairWithClient(
+    client: PoolClient,
+    input: ReplayCanonicalRunAfterRepairInput,
+    normalizedIdempotencyKey: string,
+    incidentReference: string,
+  ): Promise<ReplayCanonicalRunAfterRepairResult> {
+    const source = await this.loadAuthenticatedTechnicalRepairSourceV1(
+      client,
+      {
+        sourceRunId: input.runId,
+        sourceAccessId: input.sourceAccessId,
+        capabilitySessionId: input.capabilitySessionId,
+      },
+    );
+    if (source.resolutionGeneration !== input.expectedGeneration
+      || source.incidentReference !== incidentReference
+      || source.contractRevisionId !== input.expectedContractRevisionId
+      || source.contractSemanticHash
+        !== input.expectedContractSemanticHash) {
+      throw new HttpError(
+        409,
+        "The technical incident changed before replay",
+        "repair_replay_stale",
+      );
+    }
+    const requestHash = sha256Hex(stableStringify({
+      domain: "genio-technical-repair-planning-successor/v1",
+      sourceRunId: source.sourceRunId,
+      sourceAccessId: source.sourceAccessId,
+      sourceResolutionGeneration: source.resolutionGeneration,
+      incidentReference: source.incidentReference,
+      sourceContractRevisionId: source.contractRevisionId,
+      sourceContractSemanticHash: source.contractSemanticHash,
+      sourceRouteReceiptHash: source.routeReceipt.receiptHash,
+    }));
+    const idempotencyKeyHash = sha256Hex(stableStringify({
+      domain: "genio-technical-repair-idempotency/v1",
+      idempotencyKey: normalizedIdempotencyKey,
+    }));
+    const use = decideTechnicalRepairReplayUseV1({
+      existingConsumptions: source.existingConsumptions,
+      requestHash,
+      idempotencyKeyHash,
+      sourceResolutionGeneration: source.resolutionGeneration,
+      incidentReference: source.incidentReference,
+      sourceContractRevisionId: source.contractRevisionId,
+      sourceContractSemanticHash: source.contractSemanticHash,
+      sourceRouteReceiptHash: source.routeReceipt.receiptHash,
+    });
+    if (use.kind === "reject") {
+      throw new HttpError(
+        409,
+        "The one-time technical replay cannot create another successor",
+        use.reasonCode,
+      );
+    }
+    if (use.kind === "return_existing") {
+      const existing = await client.query<{
+        id: string;
+        status: ReplayCanonicalRunAfterRepairResult["status"];
+      }>(
+        `SELECT id,status
+         FROM brief_requests
+         WHERE id=$1 AND expires_at>now()
+         FOR SHARE`,
+        [use.successorBriefRequestId],
+      );
+      if (!existing.rows[0]) {
+        throw new HttpError(
+          409,
+          "The consumed technical replay has no planning successor",
+          "technical_repair_consumption_integrity",
+        );
+      }
+      await this.attachCapabilitySessionBrief(
+        client,
+        input.capabilitySessionId,
+        use.successorBriefRequestId,
+      );
+      await this.ensureRepairReplayPlanningJobWithClient(
+        client,
+        use.successorBriefRequestId,
+        existing.rows[0].status,
+      );
+      return {
+        briefRequestId: use.successorBriefRequestId,
+        created: false,
+        status: existing.rows[0].status,
+        successorKind: "v5_1_planning_successor",
+        resultReuse: false,
+        autoPublication: false,
+      };
+    }
+    const current = canonicalExecutorReleaseIdentityV1();
+    const assignmentKind =
+      source.routeReceipt.assignmentAuthority.kind;
+    if (assignmentKind !== "signed_public_rollout"
+      && assignmentKind !== "signed_public_direct_exposure"
+      && assignmentKind !== "signed_owner_canary") {
+      throw new HttpError(
+        409,
+        "The source route cannot authorize a technical replay",
+        "technical_repair_route_receipt_invalid",
+      );
+    }
+    const availability = technicalRepairReplayAvailabilityV1({
+      sourceReleaseRevision: source.routeReceipt.releaseRevision,
+      sourceExecutorConfigurationHash:
+        source.routeReceipt.executorConfigurationHash,
+      activeReleaseRevision: current.executorRevision,
+      activeExecutorConfigurationHash:
+        current.semanticExecutionConfigurationHash,
+      globalResearchPaused: source.globalResearchPaused,
+      publicAssignmentPaused: source.publicAssignmentPaused,
+      hardRouteDisabled: source.hardRouteDisabled,
+      assignmentKind,
+      successorBriefRequestId: null,
+    });
+    if (!availability.available) {
+      throw new HttpError(
+        503,
+        availability.reason === "repair_pending"
+          ? "Technical repair is not deployed yet"
+          : "Technical repair replay is paused",
+        availability.reason === "repair_pending"
+          ? "technical_repair_pending"
+          : "repair_replay_route_paused",
+      );
+    }
+    const briefRequestId = randomUUID();
+    const consumedAt = new Date().toISOString();
+    const consumption = createTechnicalRepairReplayConsumptionV1({
+      version: TECHNICAL_REPAIR_REPLAY_CONSUMPTION_VERSION_V1,
+      sourceRunId: source.sourceRunId,
+      sourceAccessId: source.sourceAccessId,
+      sourceResolutionGeneration: source.resolutionGeneration,
+      incidentReference: source.incidentReference,
+      sourceContractRevisionId: source.contractRevisionId,
+      sourceContractSemanticHash: source.contractSemanticHash,
+      sourceRouteReceiptHash: source.routeReceipt.receiptHash,
+      requestHash,
+      idempotencyKeyHash,
+      successorBriefRequestId: briefRequestId,
+      successorKind: "v5_1_planning_successor",
+      resultReuse: false,
+      autoPublication: false,
+      consumedAt,
+    });
+    await client.query(
+      `INSERT INTO brief_requests(
+         id,prompt,requested_track_count,model,status,client_bucket,
+         idempotency_key,brief_contract_version,
+         public_rollout_assignment_json,expires_at
+       )
+       VALUES(
+         $1,$2,$3,$4,'queued',$5,$6,3,NULL,
+         now()+interval '24 hours'
+       )`,
+      [
+        briefRequestId,
+        source.prompt,
+        source.requestedTrackCount,
+        source.model,
+        source.clientBucket,
+        normalizedIdempotencyKey,
+      ],
+    );
+    await this.attachCapabilitySessionBrief(
+      client,
+      input.capabilitySessionId,
+      briefRequestId,
+    );
+    await client.query(
+      `INSERT INTO research_checkpoints(run_id,phase,state_json)
+       VALUES($1,$2,$3::jsonb)`,
+      [
+        source.sourceRunId,
+        TECHNICAL_REPAIR_REPLAY_CONSUMPTION_PHASE_V1,
+        JSON.stringify(consumption),
+      ],
+    );
+    await client.query(
+      `INSERT INTO audit_events(run_id,actor,action,detail_json)
+       VALUES($1,'capability_authenticated_user',
+              'technical_repair.planning_successor_created',$2::jsonb)`,
+      [
+        source.sourceRunId,
+        JSON.stringify({
+          consumptionHash: consumption.consumptionHash,
+          sourceResolutionGeneration: source.resolutionGeneration,
+          incidentReference: source.incidentReference,
+          successorBriefRequestId: briefRequestId,
+          successorKind: consumption.successorKind,
+          resultReuse: false,
+          autoPublication: false,
+        }),
+      ],
+    );
+    await this.ensureRepairReplayPlanningJobWithClient(
+      client,
+      briefRequestId,
+      "queued",
+    );
+    return {
+      briefRequestId,
+      created: true,
+      status: "queued",
+      successorKind: "v5_1_planning_successor",
+      resultReuse: false,
+      autoPublication: false,
+    };
+  }
+
+  async replayCanonicalRunAfterRepair(
+    input: ReplayCanonicalRunAfterRepairInput,
+  ): Promise<ReplayCanonicalRunAfterRepairResult> {
+    const normalizedIdempotencyKey = input.idempotencyKey
+      .normalize("NFKC")
+      .trim();
+    const incidentReference = input.expectedIncidentReference
+      .normalize("NFKC")
+      .trim();
+    if (!normalizedIdempotencyKey
+      || normalizedIdempotencyKey.length > 160) {
+      throw new HttpError(
+        400,
+        "Repair replay idempotency key is invalid",
+        "invalid_idempotency_key",
+      );
+    }
+    if (!Number.isSafeInteger(input.expectedGeneration)
+      || input.expectedGeneration < 1
+      || !incidentReference
+      || incidentReference.length > 160
+      || !/^[a-f0-9]{64}$/u.test(input.expectedContractSemanticHash)) {
+      throw new HttpError(
+        400,
+        "Repair replay fence is invalid",
+        "invalid_repair_replay_fence",
+      );
+    }
+    const requestHash = sha256Hex(stableStringify({
+      domain: "genio-legacy-repair-planning-successor/v1",
+      sourceRunId: input.runId,
+      sourceAccessId: input.sourceAccessId,
+      expectedGeneration: input.expectedGeneration,
+      expectedIncidentReference: incidentReference,
+      expectedContractRevisionId: input.expectedContractRevisionId,
+      expectedContractSemanticHash: input.expectedContractSemanticHash,
+    }));
+    const idempotencyKeyHash = sha256Hex(stableStringify({
+      domain: "genio-legacy-repair-idempotency/v1",
+      idempotencyKey: normalizedIdempotencyKey,
+    }));
+    return this.transaction(async (client) => {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        [`legacy-repair:${input.runId}`],
+      );
+      const legacyAuthority = await client.query(
+        `SELECT 1
+         FROM research_checkpoints
+         WHERE run_id=$1 AND phase=$2
+         LIMIT 1`,
+        [input.runId, LEGACY_REPAIR_AUTHORITY_PHASE_V1],
+      );
+      if (!legacyAuthority.rows[0]) {
+        return this.replayCurrentTechnicalRunAfterRepairWithClient(
+          client,
+          input,
+          normalizedIdempotencyKey,
+          incidentReference,
+        );
+      }
+      const source = await this.loadAuthenticatedLegacyRepairSourceV1(
+        client,
+        {
+          sourceRunId: input.runId,
+          sourceAccessId: input.sourceAccessId,
+          capabilitySessionId: input.capabilitySessionId,
+        },
+      );
+      const authority = source.authority;
+      if (
+        authority.sourceResolutionGeneration !== input.expectedGeneration
+        || authority.incidentReference !== incidentReference
+        || authority.sourceContractRevisionId
+          !== input.expectedContractRevisionId
+        || authority.sourceContractSemanticHash
+          !== input.expectedContractSemanticHash
+      ) {
+        throw new HttpError(
+          409,
+          "The technical incident changed before replay was authorized",
+          "repair_replay_stale",
+        );
+      }
+      const pause = repairReplayPauseDecisionV1({
+        authorityKind: "authenticated_legacy_repair",
+        globalResearchPaused: source.globalResearchPaused,
+        publicAssignmentPaused: source.publicAssignmentPaused,
+        hardRouteDisabled: source.hardRouteDisabled,
+      });
+      if (!pause.allowed) {
+        throw new HttpError(
+          503,
+          "Repair replay is paused until its repaired route is available",
+          pause.reasonCode,
+        );
+      }
+      const use = decideLegacyRepairAuthorityUseV1({
+        authority,
+        existingConsumptions: source.existingConsumptions,
+        requestHash,
+        idempotencyKeyHash,
+      });
+      if (use.kind === "reject") {
+        throw new HttpError(
+          409,
+          "The one-time repair authority cannot create this successor",
+          use.reasonCode,
+        );
+      }
+      if (use.kind === "return_existing") {
+        const existing = await client.query<{
+          id: string;
+          status: ReplayCanonicalRunAfterRepairResult["status"];
+        }>(
+          `SELECT id,status
+           FROM brief_requests
+           WHERE id=$1 AND expires_at>now()
+           FOR SHARE`,
+          [use.successorBriefRequestId],
+        );
+        if (!existing.rows[0]) {
+          throw new HttpError(
+            409,
+            "The consumed repair authority has no planning successor",
+            "legacy_repair_consumption_integrity",
+          );
+        }
+        const attached = await client.query<{ brief_request_id: string }>(
+          `INSERT INTO capability_session_briefs(
+             session_id,brief_request_id
+           )
+           SELECT session.id,$2
+           FROM capability_sessions session
+           WHERE session.id=$1
+             AND session.revoked_at IS NULL
+             AND session.expires_at>now()
+           ON CONFLICT(session_id,brief_request_id) DO NOTHING
+           RETURNING brief_request_id`,
+          [input.capabilitySessionId, use.successorBriefRequestId],
+        );
+        if (!attached.rows[0]) {
+          const authorized = await client.query(
+            `SELECT 1
+             FROM capability_session_briefs
+             JOIN capability_sessions session
+               ON session.id=capability_session_briefs.session_id
+             WHERE capability_session_briefs.session_id=$1
+               AND capability_session_briefs.brief_request_id=$2
+               AND session.revoked_at IS NULL
+               AND session.expires_at>now()`,
+            [input.capabilitySessionId, use.successorBriefRequestId],
+          );
+          if (!authorized.rows[0]) {
+            throw new HttpError(
+              401,
+              "The repair replay session has expired",
+              "capability_required",
+            );
+          }
+        }
+        await this.ensureRepairReplayPlanningJobWithClient(
+          client,
+          use.successorBriefRequestId,
+          existing.rows[0].status,
+        );
+        return {
+          briefRequestId: use.successorBriefRequestId,
+          created: false,
+          status: existing.rows[0].status,
+          successorKind: "v5_1_planning_successor",
+          resultReuse: false,
+          autoPublication: false,
+        };
+      }
+
+      const briefRequestId = randomUUID();
+      const consumedAt = new Date().toISOString();
+      const consumption = createLegacyRepairAuthorityConsumptionV1({
+        version: "legacy_repair_authority_consumption_v1",
+        authorityHash: authority.authorityHash,
+        requestHash,
+        idempotencyKeyHash,
+        successorBriefRequestId: briefRequestId,
+        successorKind: "v5_1_planning_successor",
+        consumedAt,
+      });
+      await client.query(
+        `INSERT INTO brief_requests(
+           id,prompt,requested_track_count,model,status,client_bucket,
+           idempotency_key,brief_contract_version,
+           public_rollout_assignment_json,expires_at
+         )
+         VALUES(
+           $1,$2,$3,$4,'queued',$5,$6,3,NULL,
+           now()+interval '24 hours'
+         )`,
+        [
+          briefRequestId,
+          source.prompt,
+          source.requestedTrackCount,
+          source.model,
+          source.clientBucket,
+          normalizedIdempotencyKey,
+        ],
+      );
+      const attached = await client.query<{ brief_request_id: string }>(
+        `INSERT INTO capability_session_briefs(
+           session_id,brief_request_id
+         )
+         SELECT session.id,$2
+         FROM capability_sessions session
+         WHERE session.id=$1
+           AND session.revoked_at IS NULL
+           AND session.expires_at>now()
+         ON CONFLICT(session_id,brief_request_id) DO NOTHING
+         RETURNING brief_request_id`,
+        [input.capabilitySessionId, briefRequestId],
+      );
+      if (!attached.rows[0]) {
+        throw new HttpError(
+          401,
+          "The repair replay session has expired",
+          "capability_required",
+        );
+      }
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES($1,$2,$3::jsonb)`,
+        [
+          source.sourceRunId,
+          LEGACY_REPAIR_CONSUMPTION_PHASE_V1,
+          JSON.stringify(consumption),
+        ],
+      );
+      await client.query(
+        `INSERT INTO audit_events(run_id,actor,action,detail_json)
+         VALUES($1,'authenticated_owner_control_plane',
+                'legacy_repair.planning_successor_created',$2::jsonb)`,
+        [
+          source.sourceRunId,
+          JSON.stringify({
+            authorityHash: authority.authorityHash,
+            consumptionHash: consumption.consumptionHash,
+            successorBriefRequestId: briefRequestId,
+            successorKind: consumption.successorKind,
+            resultReuse: false,
+            autoPublication: false,
+            bypassedPublicAssignmentPause:
+              pause.bypassedPublicAssignmentPause,
+          }),
+        ],
+      );
+      await this.ensureRepairReplayPlanningJobWithClient(
+        client,
+        briefRequestId,
+        "queued",
+      );
+      return {
+        briefRequestId,
+        created: true,
+        status: "queued",
+        successorKind: "v5_1_planning_successor",
+        resultReuse: false,
+        autoPublication: false,
+      };
+    });
+
+    /*
+     * Historical direct-run replay implementation retained as inert source
+     * context until the v2.5.4 recovery branch is squashed. Runtime execution
+     * returns above only after creating or loading the linked planning brief.
+     */
+    /*
+    const idempotencyKey = input.idempotencyKey.normalize("NFKC").trim();
+    const incidentReference = input.expectedIncidentReference
+      .normalize("NFKC").trim();
+    if (!idempotencyKey || idempotencyKey.length > 160) {
+      throw new HttpError(
+        400,
+        "Repair replay idempotency key is invalid",
+        "invalid_idempotency_key",
+      );
+    }
+    if (!Number.isSafeInteger(input.expectedGeneration)
+      || input.expectedGeneration < 1
+      || !incidentReference
+      || incidentReference.length > 160
+      || !/^[a-f0-9]{64}$/u.test(input.expectedContractSemanticHash)) {
+      throw new HttpError(
+        400,
+        "Repair replay fence is invalid",
+        "invalid_repair_replay_fence",
+      );
+    }
+    const requestHash = sha256Hex(stableStringify({
+      operation: "repair_replay_v1",
+      sourceRunId: input.runId,
+      sourceAccessId: input.sourceAccessId,
+      expectedGeneration: input.expectedGeneration,
+      expectedIncidentReference: incidentReference,
+      expectedContractRevisionId: input.expectedContractRevisionId,
+      expectedContractSemanticHash: input.expectedContractSemanticHash,
+    }));
+    return this.transaction(async (client) => {
+      await client.query(
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        [`repair-replay:${input.runId}:${input.sourceAccessId}`],
+      );
+      const selected = await client.query<{
+        access_id: string;
+        client_bucket: string;
+        access_prompt: string | null;
+        brief_request_id: string | null;
+        run_status: string;
+        run_phase: string;
+        brief_json: PlaylistBrief;
+        guidance_source_hints_json: PlaylistGuidanceSourceHint[] | null;
+        guidance_telemetry_json: PlaylistGuidanceTelemetry | null;
+        guidance_preferences_json: PlaylistGuidancePreference[] | null;
+        estimated_cost_usd: string;
+        approved_budget_usd: string;
+        raw_prompt: string;
+        guidance_answers_json: PlaylistGuidanceAnswer[] | null;
+        generation: number;
+        resolution_state: string;
+        incident_reference: string | null;
+        contract_revision_id: string;
+        contract_status: string;
+        contract_hash: string;
+        contract_json: PlaylistContractRevisionV1;
+        blocker_kind: string | null;
+        blocker_reason_code: string | null;
+        public_rollout_assignment_json: unknown | null;
+        rollout_authority_json: string | null;
+        public_assignment_paused: boolean;
+        route_disabled: boolean;
+        has_published_reconciliation: boolean;
+        source_query_plan_revision_id: string | null;
+        source_route_receipt: unknown | null;
+      }>(
+        `SELECT access.id access_id,access.client_bucket,
+                access.prompt access_prompt,access.brief_request_id,
+                run.status run_status,run.phase run_phase,run.brief_json,
+                run.guidance_source_hints_json,run.guidance_telemetry_json,
+                run.guidance_preferences_json,run.estimated_cost_usd,
+                run.approved_budget_usd,
+                spec.raw_prompt,spec.guidance_answers_json,
+                resolution.generation,resolution.state resolution_state,
+                resolution.incident_reference,
+                contract.id contract_revision_id,
+                contract.status contract_status,
+                contract.contract_hash,contract.contract_json,
+                blocker.blocker_kind,
+                blocker.state_json->>'reasonCode' blocker_reason_code,
+                brief.public_rollout_assignment_json,
+                rollout_authority.value rollout_authority_json,
+                COALESCE(public_pause.value='true',false)
+                  public_assignment_paused,
+                EXISTS(
+                  SELECT 1
+                  FROM pipeline_cohort_kill_switches hard_switch
+                  WHERE hard_switch.route='corpus_first_v3'
+                    AND hard_switch.disabled
+                    AND (
+                      hard_switch.intent_group IS NULL
+                      OR hard_switch.intent_group=
+                        brief.public_rollout_assignment_json->>'intentGroup'
+                    )
+                ) route_disabled,
+                EXISTS(
+                  SELECT 1
+                  FROM playlist_publication_reconciliations reconciliation
+                  WHERE reconciliation.run_id=run.id
+                    AND reconciliation.state='complete'
+                ) has_published_reconciliation,
+                active.query_plan_revision_id source_query_plan_revision_id,
+                route.state_json source_route_receipt
+         FROM run_accesses access
+         JOIN capability_session_accesses session_access
+           ON session_access.access_id=access.id
+          AND session_access.run_id=access.run_id
+         JOIN capability_sessions session
+           ON session.id=session_access.session_id
+         JOIN research_runs run ON run.id=access.run_id
+         JOIN run_specs spec
+           ON spec.run_id=run.id AND spec.brief_contract_version=3
+         JOIN playlist_run_resolutions resolution
+           ON resolution.run_id=run.id
+         JOIN playlist_contract_revisions contract
+           ON contract.id=run.active_playlist_contract_revision_id
+         LEFT JOIN playlist_run_blockers blocker
+           ON blocker.id=resolution.blocker_id
+         LEFT JOIN brief_requests brief
+           ON brief.id=access.brief_request_id
+         LEFT JOIN settings rollout_authority
+           ON rollout_authority.key=(CASE
+             WHEN brief.public_rollout_assignment_json->>'version'
+               ='signed_public_direct_exposure_v1'
+             THEN 'v254_direct_exposure_authority:'
+             ELSE 'public_rollout_authority:'
+           END) || COALESCE(
+             brief.public_rollout_assignment_json->>'rolloutEvidenceHash',''
+           )
+         LEFT JOIN settings public_pause
+           ON public_pause.key='pipeline_v3_public_assignment_paused'
+         LEFT JOIN run_active_query_plans active ON active.run_id=run.id
+         LEFT JOIN research_checkpoints route
+           ON route.run_id=run.id AND route.phase=$4
+         WHERE access.id=$1 AND access.run_id=$2
+           AND session.id=$3
+           AND access.deleted_at IS NULL AND access.expires_at>now()
+           AND session.revoked_at IS NULL AND session.expires_at>now()
+           AND run.deleted_at IS NULL
+         FOR UPDATE OF access,run,resolution,contract`,
+        [
+          input.sourceAccessId,
+          input.runId,
+          input.capabilitySessionId,
+          EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+        ],
+      );
+      const source = selected.rows[0];
+      if (!source) {
+        throw new HttpError(
+          401,
+          "The repair replay session is no longer authorized",
+          "capability_required",
+        );
+      }
+      if (!source.brief_request_id) {
+        throw new HttpError(
+          409,
+          "Repair replay authority is missing its signed brief",
+          "repair_replay_integrity",
+        );
+      }
+
+      const existing = await client.query<{
+        access_id: string;
+        run_id: string;
+        status: string;
+        contract_revision_id: string;
+        query_plan_revision_id: string;
+        state_json: Record<string, unknown>;
+      }>(
+        `SELECT access.id access_id,run.id run_id,run.status,
+                run.active_playlist_contract_revision_id
+                  contract_revision_id,
+                active.query_plan_revision_id,
+                checkpoint.state_json
+         FROM run_accesses access
+         JOIN research_runs run ON run.id=access.run_id
+         JOIN research_checkpoints checkpoint
+           ON checkpoint.run_id=run.id
+          AND checkpoint.phase='repair_replay_v1'
+         JOIN run_active_query_plans active ON active.run_id=run.id
+         WHERE access.client_bucket=$1
+           AND access.idempotency_key=$2
+           AND access.deleted_at IS NULL
+           AND run.deleted_at IS NULL
+         ORDER BY access.created_at DESC
+         LIMIT 1
+         FOR UPDATE OF access,run`,
+        [source.client_bucket, idempotencyKey],
+      );
+      if (existing.rows[0]) {
+        const prior = existing.rows[0];
+        if (prior.state_json.requestHash !== requestHash
+          || prior.state_json.sourceRunId !== input.runId
+          || prior.state_json.sourceAccessId !== input.sourceAccessId) {
+          throw new HttpError(
+            409,
+            "Idempotency key was already used for another repair replay",
+            "idempotency_conflict",
+          );
+        }
+        return {
+          runId: prior.run_id,
+          accessId: prior.access_id,
+          contractRevisionId: prior.contract_revision_id,
+          queryPlanRevisionId: prior.query_plan_revision_id,
+          created: false,
+          status: "queued",
+        };
+      }
+
+      if (Number(source.generation) !== input.expectedGeneration
+        || source.incident_reference !== incidentReference
+        || source.contract_revision_id
+          !== input.expectedContractRevisionId
+        || source.contract_hash
+          !== input.expectedContractSemanticHash) {
+        throw new HttpError(
+          409,
+          "The technical incident changed before replay was authorized",
+          "repair_replay_stale",
+        );
+      }
+      let assignment: PersistedPublicRolloutAssignmentV1 | null = null;
+      try {
+        assignment = parsePublicRolloutAssignmentV1(
+          source.public_rollout_assignment_json,
+        );
+        if (!assignment) throw new Error("assignment_missing");
+        assertPublicRolloutAssignmentDatabaseAuthorityV1(
+          assignment,
+          source.rollout_authority_json
+            ? JSON.parse(source.rollout_authority_json)
+            : null,
+        );
+        assertPlaylistContractIntegrityV1(source.contract_json);
+      } catch {
+        throw new HttpError(
+          409,
+          "Repair replay authority failed integrity validation",
+          "repair_replay_integrity",
+        );
+      }
+      const eligibility = canonicalRepairReplayEligibilityV1({
+        resolutionState: source.resolution_state,
+        runStatus: source.run_status,
+        runPhase: source.run_phase,
+        blockerKind: source.blocker_kind,
+        reasonCode: source.blocker_reason_code,
+        contractVersion: 3,
+        contractStatus: source.contract_status,
+        publicAssignmentActive: assignment.assigned === true,
+        hasPublishedReconciliation: source.has_published_reconciliation,
+      });
+      if (!eligibility.eligible
+        || source.contract_json.semanticHash !== source.contract_hash) {
+        throw new HttpError(
+          409,
+          "This quarantined run is not eligible for technical replay",
+          eligibility.eligible
+            ? "repair_replay_integrity"
+            : eligibility.reasonCode,
+        );
+      }
+      if (source.public_assignment_paused || source.route_disabled) {
+        throw new HttpError(
+          503,
+          "Repair replay is paused until the repaired route is activated",
+          "repair_replay_route_paused",
+        );
+      }
+      const sourceReceipt = parseExecutionRouteReceiptV1(
+        source.source_route_receipt,
+      );
+      if (!sourceReceipt
+        || (
+          sourceReceipt.assignmentAuthority.kind
+            !== "signed_public_rollout"
+          && sourceReceipt.assignmentAuthority.kind
+            !== "signed_public_direct_exposure"
+        )
+        || sourceReceipt.assignmentAuthority.receiptHash
+          !== assignment.assignmentHash
+        || sourceReceipt.assignmentAuthority.intentGroup
+          !== assignment.intentGroup) {
+        throw new HttpError(
+          409,
+          "The source route receipt cannot authorize a repair replay",
+          "repair_replay_route_receipt_invalid",
+        );
+      }
+
+      const projection = projectPlaylistContractExecutionV1({
+        contract: source.contract_json,
+        basePlan: {
+          requestedTrackCount: source.contract_json.requestedTrackCount,
+          minimumQualifiedTrackCount:
+            source.contract_json.requestedTrackCount,
+          storefront: source.contract_json.storefront,
+        },
+      });
+      const snapshot = await client.query<{ id: string }>(
+        `SELECT id FROM graph_snapshots
+         WHERE status='locked'
+         ORDER BY sequence DESC LIMIT 1 FOR SHARE`,
+      );
+      const graphSnapshotId = snapshot.rows[0]?.id;
+      if (!graphSnapshotId) {
+        throw new HttpError(
+          503,
+          "Repair replay is waiting for a locked evidence snapshot",
+          "v3_snapshot_unavailable",
+        );
+      }
+      const selectionPlan = projection.selectionPlanV3;
+      const emittedSchema = queryPlanV3EmissionSchemaVersion(process.env);
+      const queryPlan = createQueryPlanV3(
+        selectionPlan,
+        graphSnapshotId,
+        {
+          schemaVersion: emittedSchema
+            === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+            ? VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+            : CANONICAL_CONTRACT_QUERY_PLAN_V3_VERSION,
+          briefContractVersion: 3,
+          playlistContractRevisionId: source.contract_json.revisionId,
+          playlistContractSemanticHash: source.contract_json.semanticHash,
+          playlistContractCompilerVersion:
+            source.contract_json.versions.compiler,
+          ...(emittedSchema === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+            ? {
+                guidancePolicyVersion:
+                  canonicalQueryPlanGuidancePolicyVersionV1(
+                    source.guidance_telemetry_json?.guidancePolicyVersion,
+                  ),
+              }
+            : {}),
+        },
+      );
+      const policySnapshot = createPipelinePolicySnapshotV3({
+        plan: selectionPlan,
+        environment: process.env,
+        modelRoutingSignals: pipelineV3ModelRoutingSignalsFromScoutTelemetry(
+          source.guidance_telemetry_json,
+        ),
+        conversionObservation: null,
+      });
+      if (policySnapshot.executionPolicy.kind !== "corpus_first_v3") {
+        throw new HttpError(
+          409,
+          "Repair replay did not produce the canonical execution policy",
+          "repair_replay_executor_conflict",
+        );
+      }
+      const requiredBudgetUsd =
+        policySnapshot.executionPolicy.maximumCostUsd;
+      if (Number(source.approved_budget_usd) + 0.000001
+        < requiredBudgetUsd) {
+        throw new HttpError(
+          409,
+          "Repair replay requires the original exact-contract budget",
+          "repair_replay_budget_conflict",
+        );
+      }
+
+      await client.query(
+        "SELECT pg_advisory_xact_lock($1)",
+        [RUN_CAPACITY_ADVISORY_LOCK],
+      );
+      const active = await client.query<{ count: number }>(
+        `SELECT count(*)::int count FROM research_runs
+         WHERE status=ANY($1::text[]) AND deleted_at IS NULL`,
+        [CAPACITY_RUN_STATUSES],
+      );
+      if (Number(active.rows[0]?.count ?? 0) >= 10) {
+        throw new HttpError(
+          503,
+          "gênio is at capacity; try the repair replay again soon",
+          "global_capacity_reached",
+        );
+      }
+
+      const runId = randomUUID();
+      const accessId = randomUUID();
+      const contractRevisionId = randomUUID();
+      const selectionPlanId = randomUUID();
+      const queryPlanRevisionId = randomUUID();
+      const jobId = randomUUID();
+      const createdAt = new Date();
+      const selectionHash = selectionPlanV3Hash(selectionPlan);
+      const queryHash = queryPlanV3Hash(queryPlan);
+      const contractBriefHash = sha256Hex(stableStringify({
+        executionAuthority: "playlist_contract_revision_v1",
+        briefContractVersion: 3,
+        playlistContractRevisionId: source.contract_json.revisionId,
+        playlistContractSemanticHash: source.contract_json.semanticHash,
+        requestedTrackCount: source.contract_json.requestedTrackCount,
+        storefront: source.contract_json.storefront,
+      }));
+      const runSpecHash = sha256Hex(stableStringify({
+        executionAuthority: "playlist_contract_revision_v1",
+        briefContractVersion: 3,
+        playlistContractRevisionId: source.contract_json.revisionId,
+        playlistContractSemanticHash: source.contract_json.semanticHash,
+        requestedTrackCount: source.contract_json.requestedTrackCount,
+        storefront: source.contract_json.storefront,
+        pipelineVersion: "corpus_first_v3",
+        policyVersion: "corpus_first_v3_policy_v1",
+      }));
+      const canonicalPrompt =
+        `${source.brief_json.title}: ${source.brief_json.description}`
+          .slice(0, 2_000);
+      await client.query(
+        `INSERT INTO research_runs(
+           id,prompt,brief_json,guidance_source_hints_json,
+           guidance_telemetry_json,guidance_preferences_json,brief_hash,
+           status,phase,client_bucket,idempotency_key,auto_publish,
+           estimated_cost_usd,approved_budget_usd,pipeline_version,
+           policy_version,selection_plan_json,
+           pipeline_policy_snapshot_json,brief_contract_version,
+           active_playlist_contract_revision_id,retention_expires_at)
+         VALUES(
+           $1,$2,$3::jsonb,$4::jsonb,$5::jsonb,$6::jsonb,$7,
+           'queued','queued',$8,$9,false,$10,$11,
+           'corpus_first_v3','corpus_first_v3_policy_v1',NULL,
+           $12::jsonb,3,NULL,now()+interval '90 days'
+         )`,
+        [
+          runId,
+          canonicalPrompt,
+          JSON.stringify(source.brief_json),
+          JSON.stringify(source.guidance_source_hints_json ?? []),
+          source.guidance_telemetry_json == null
+            ? null
+            : JSON.stringify(source.guidance_telemetry_json),
+          JSON.stringify(source.guidance_preferences_json ?? []),
+          contractBriefHash,
+          source.client_bucket,
+          idempotencyKey,
+          requiredBudgetUsd,
+          Number(source.approved_budget_usd),
+          JSON.stringify(policySnapshot),
+        ],
+      );
+      await client.query(
+        `INSERT INTO playlist_contract_revisions(
+           id,brief_request_id,run_id,revision,parent_revision_id,status,
+           contract_hash,contract_json,compiler_version,ontology_version,
+           evidence_policy_version,question_template_version,
+           catalog_policy_version,locale,storefront,answer_lineage_hash)
+         VALUES(
+           $1,NULL,$2,$3,$4,'active',$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14
+         )`,
+        [
+          contractRevisionId,
+          runId,
+          source.contract_json.revision,
+          source.contract_revision_id,
+          source.contract_hash,
+          JSON.stringify(source.contract_json),
+          source.contract_json.versions.compiler,
+          source.contract_json.versions.ontology,
+          source.contract_json.versions.evidencePolicy,
+          source.contract_json.versions.questionTemplates,
+          source.contract_json.versions.catalogPolicy,
+          source.contract_json.locale,
+          source.contract_json.storefront,
+          sha256Hex(stableStringify(source.contract_json.answerLineage)),
+        ],
+      );
+      await client.query(
+        `UPDATE research_runs
+         SET active_playlist_contract_revision_id=$2
+         WHERE id=$1`,
+        [runId, contractRevisionId],
+      );
+      await client.query(
+        `INSERT INTO run_specs(
+           run_id,raw_prompt,requested_track_count,storefront,
+           guidance_answers_json,guidance_source_hints_json,spec_hash,
+           pipeline_version,policy_version,brief_contract_version)
+         VALUES(
+           $1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,
+           'corpus_first_v3','corpus_first_v3_policy_v1',3
+         )`,
+        [
+          runId,
+          source.raw_prompt,
+          source.contract_json.requestedTrackCount,
+          source.contract_json.storefront,
+          JSON.stringify(source.guidance_answers_json ?? []),
+          JSON.stringify(selectionPlan.sourceDiscoveryHints ?? []),
+          runSpecHash,
+        ],
+      );
+      await client.query(
+        `INSERT INTO selection_plans(
+           id,run_id,revision,status,plan_hash,plan_json,pipeline_version,
+           policy_version,confirmed_at)
+         VALUES(
+           $1,$2,1,'active',$3,$4::jsonb,'corpus_first_v3',
+           'corpus_first_v3_policy_v1',now()
+         )`,
+        [selectionPlanId, runId, selectionHash, JSON.stringify(selectionPlan)],
+      );
+      await client.query(
+        `INSERT INTO query_plan_revisions(
+           id,run_id,selection_plan_id,revision,parent_revision_id,
+           graph_snapshot_id,engine,status,plan_hash,plan_json,
+           pipeline_version,policy_version,activated_at)
+         VALUES(
+           $1,$2,$3,1,$4,$5,$6,'active',$7,$8::jsonb,
+           'corpus_first_v3','corpus_first_v3_policy_v1',now()
+         )`,
+        [
+          queryPlanRevisionId,
+          runId,
+          selectionPlanId,
+          source.source_query_plan_revision_id,
+          graphSnapshotId,
+          queryPlan.engine,
+          queryHash,
+          JSON.stringify(queryPlan),
+        ],
+      );
+      await client.query(
+        `INSERT INTO run_active_query_plans(
+           run_id,query_plan_revision_id,activated_at)
+         VALUES($1,$2,now())`,
+        [runId, queryPlanRevisionId],
+      );
+      await client.query(
+        `INSERT INTO run_accesses(
+           id,run_id,brief_request_id,prompt,client_bucket,
+           idempotency_key,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6,now()+interval '90 days')`,
+        [
+          accessId,
+          runId,
+          source.brief_request_id,
+          source.access_prompt ?? source.raw_prompt,
+          source.client_bucket,
+          idempotencyKey,
+        ],
+      );
+      await this.attachCapabilitySessionAccess(
+        client,
+        input.capabilitySessionId,
+        runId,
+        accessId,
+      );
+      const release = canonicalExecutorReleaseIdentityV1();
+      const routeReceipt = createExecutionRouteReceiptV1({
+        version: EXECUTION_ROUTE_RECEIPT_VERSION_V1,
+        briefId: source.brief_request_id,
+        rootLineageId: source.contract_json.contractId,
+        trafficClass: "replay",
+        contractVersion: 3,
+        guidanceVersion:
+          queryPlan.guidancePolicyVersion ?? "adaptive_guidance_v4",
+        assignmentAuthority: {
+          kind: "signed_public_rollout",
+          receiptHash: assignment.assignmentHash,
+          intentGroup: assignment.intentGroup,
+          assignmentReason: "repair_replay",
+        },
+        briefSelectionPipelineVersion: "corpus_first_v3",
+        executionRoute: "corpus_first_v3",
+        queryPlanSchema: queryPlan.schemaVersion,
+        queryPlanHash: queryHash,
+        capabilitySnapshotHash:
+          queryPlanCapabilitySnapshotHashV1(queryPlan),
+        releaseRevision: release.executorRevision,
+        executorConfigurationHash:
+          release.semanticExecutionConfigurationHash,
+        createdAt: createdAt.toISOString(),
+      });
+      await client.query(
+        `INSERT INTO research_checkpoints(run_id,phase,state_json)
+         VALUES
+           ($1,'repair_replay_v1',$2::jsonb),
+           ($1,$3,$4::jsonb)`,
+        [
+          runId,
+          JSON.stringify({
+            version: "repair_replay_v1",
+            requestHash,
+            sourceRunId: input.runId,
+            sourceAccessId: input.sourceAccessId,
+            sourceGeneration: input.expectedGeneration,
+            sourceIncidentHash: sha256Hex(incidentReference),
+            sourceContractRevisionId: input.expectedContractRevisionId,
+            sourceContractSemanticHash:
+              input.expectedContractSemanticHash,
+            resultReuse: false,
+            autoPublication: false,
+          }),
+          EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+          JSON.stringify(routeReceipt),
+        ],
+      );
+      const queueClass: JobQueueClass = isDeepQueryPlan(queryPlan)
+        ? "deep"
+        : "interactive";
+      const stageKey = v3RetrievalStageKey(queryPlan, "active");
+      await client.query(
+        `INSERT INTO job_queue(
+           id,run_id,kind,dedupe_key,payload_json,max_attempts,
+           pipeline_version,minimum_worker_protocol,query_plan_revision_id,
+           stage_key,queue_class,required_executor_revision,
+           required_executor_semantic_configuration_hash)
+         VALUES(
+           $1,$2,'research',$3,$4::jsonb,10,'corpus_first_v3',
+           $5,$6,$7,$8,$9,$10
+         )`,
+        [
+          jobId,
+          runId,
+          `research:${runId}:${stageKey}`.slice(0, 160),
+          JSON.stringify({
+            runId,
+            phase: "v3_retrieval",
+            v3ExecutionMode: "active",
+            stageExecutionKey: stageKey,
+            repairReplayOf: input.runId,
+          }),
+          minimumWorkerProtocolForActiveProofArchitecture(queryPlan),
+          queryPlanRevisionId,
+          stageKey,
+          queueClass,
+          release.executorRevision,
+          release.semanticExecutionConfigurationHash,
+        ],
+      );
+      await this.shadowPlaylistResolutionV1(client, runId);
+      return {
+        runId,
+        accessId,
+        contractRevisionId,
+        queryPlanRevisionId,
+        created: true,
+        status: "queued",
+      };
+    });
+    */
+  }
+
   async createCanonicalRunSuccessor(
     input: CreateCanonicalRunSuccessorInput,
   ): Promise<CanonicalRunSuccessorResult> {
@@ -14219,6 +19536,14 @@ export class Repository {
           playlistContractRevisionId: successorContract.revisionId,
           playlistContractSemanticHash: successorContract.semanticHash,
           playlistContractCompilerVersion: successorContract.versions.compiler,
+          ...(emittedSchema === VERIFICATION_CANONICAL_QUERY_PLAN_V3_VERSION
+            ? {
+                guidancePolicyVersion:
+                  canonicalQueryPlanGuidancePolicyVersionV1(
+                    row.guidance_telemetry_json?.guidancePolicyVersion,
+                  ),
+              }
+            : {}),
         });
       }
 
@@ -15191,6 +20516,171 @@ export class Repository {
    * worker is alive. Likewise, a frozen manifest proves selection—not an
    * Apple side effect.
    */
+  private async readApprovedPartialPublicationTruthV1(
+    client: Pick<PoolClient, "query">,
+    input: {
+      runId: string;
+      manifestId: string | null;
+      activeContractRevisionId: string | null;
+      requestedTrackCount: number | null;
+      reconciledPublishedTrackCount: number | null;
+      exactAppleReconciliation: boolean;
+      legacyStatus: RunStatus;
+    },
+  ): Promise<boolean> {
+    if (!input.manifestId
+      || !input.activeContractRevisionId
+      || !input.exactAppleReconciliation
+      || !["complete", "partial"].includes(input.legacyStatus)
+      || !Number.isSafeInteger(input.requestedTrackCount)
+      || input.requestedTrackCount! < 1
+      || !Number.isSafeInteger(input.reconciledPublishedTrackCount)
+      || input.reconciledPublishedTrackCount! < 1
+      || input.reconciledPublishedTrackCount! >= input.requestedTrackCount!) {
+      return false;
+    }
+    const result = await client.query<{
+      capability_session_id: string | null;
+      outcome_hash: string;
+      idempotency_key: string;
+      target_count: number;
+      selected_count: number;
+      manifest_revision_id: string;
+      manifest_revision_hash: string;
+      decision_selection_set_id: string | null;
+      decision_manifest_payload_hash: string | null;
+      decision_attestation_set_hash: string | null;
+      partial_consent_answer_hash: string | null;
+      revision_content_hash: string;
+      revision_selection_set_id: string | null;
+      revision_attestation_set_hash: string | null;
+      revision_proof_kind: string;
+      selection_contract_revision_id: string;
+      selection_requested_count: number;
+      selection_selected_count: number;
+      selection_attestation_set_hash: string;
+      selection_proof_mode: string;
+      selection_output_attested: boolean;
+      checkpoint_outcome_hash: string | null;
+      reconciliation_exact: boolean;
+    }>(
+      `SELECT decision.capability_session_id,decision.outcome_hash,
+              decision.idempotency_key,decision.target_count,
+              decision.selected_count,decision.manifest_revision_id,
+              decision.manifest_revision_hash,
+              decision.selection_set_id decision_selection_set_id,
+              decision.manifest_payload_hash decision_manifest_payload_hash,
+              decision.attestation_set_hash decision_attestation_set_hash,
+              manifest.partial_consent_answer_hash,
+              revision.content_hash revision_content_hash,
+              revision.selection_set_id revision_selection_set_id,
+              revision.attestation_set_hash revision_attestation_set_hash,
+              revision.proof_kind revision_proof_kind,
+              selection.contract_revision_id selection_contract_revision_id,
+              selection.requested_count selection_requested_count,
+              selection.selected_count selection_selected_count,
+              selection.attestation_set_hash selection_attestation_set_hash,
+              selection.proof_mode selection_proof_mode,
+              EXISTS(
+                SELECT 1
+                FROM selection_attempt_output_attestations output
+                WHERE output.selection_set_id=selection.id
+                  AND output.execution_attempt_id=selection.execution_attempt_id
+                  AND output.output_hash=selection.output_hash
+                  AND output.attestation_set_hash=selection.attestation_set_hash
+              ) selection_output_attested,
+              checkpoint.state_json->>'outcomeHash' checkpoint_outcome_hash,
+              (
+                reconciliation.state='complete'
+                AND reconciliation.completed_at IS NOT NULL
+                AND decision.decided_at<=reconciliation.completed_at
+                AND reconciliation.expected_count=decision.selected_count
+                AND reconciliation.appended_count=decision.selected_count
+                AND reconciliation.observed_ordered_ids_hash
+                  =reconciliation.expected_ordered_ids_hash
+              ) reconciliation_exact
+       FROM partial_publication_decisions decision
+       JOIN manifest_revisions revision
+         ON revision.id=decision.manifest_revision_id
+        AND revision.content_hash=decision.manifest_revision_hash
+        AND revision.status='published'
+       JOIN manifests manifest
+         ON manifest.id=revision.manifest_id
+        AND manifest.run_id=decision.run_id
+       JOIN immutable_selection_sets selection
+         ON selection.id=revision.selection_set_id
+        AND selection.attestation_set_hash=revision.attestation_set_hash
+       JOIN playlist_publication_reconciliations reconciliation
+         ON reconciliation.run_id=decision.run_id
+        AND reconciliation.manifest_id=manifest.id
+        AND reconciliation.manifest_revision_id=revision.id
+       LEFT JOIN research_checkpoints checkpoint
+         ON checkpoint.run_id=decision.run_id
+        AND checkpoint.phase='partial_ready'
+       WHERE decision.run_id=$1
+         AND manifest.id=$2
+         AND decision.decision='publish_partial'
+       ORDER BY decision.decided_at DESC,decision.id DESC
+       LIMIT 1`,
+      [input.runId, input.manifestId],
+    );
+    const row = result.rows[0];
+    if (!row) return false;
+    const expectedConsentHash = sha256Hex(stableStringify({
+      decision: "publish_partial",
+      runId: input.runId,
+      capabilitySessionId: row.capability_session_id,
+      outcomeHash: row.outcome_hash,
+      manifestId: input.manifestId,
+      manifestRevisionId: row.manifest_revision_id,
+      manifestRevisionHash: row.manifest_revision_hash,
+      targetTrackCount: Number(row.target_count),
+      selectedTrackCount: Number(row.selected_count),
+      idempotencyKey: row.idempotency_key,
+    }));
+    const expectedManifestPayloadHash = schema20ManifestPayloadHashV1({
+      runId: input.runId,
+      contractRevisionId: row.selection_contract_revision_id,
+      manifestRevisionId: row.manifest_revision_id,
+      manifestContentHash: row.revision_content_hash,
+      selectionSetHash: row.selection_attestation_set_hash,
+      attestationSetHash: row.selection_attestation_set_hash,
+      targetCount: Number(row.selection_requested_count),
+      selectedCount: Number(row.selection_selected_count),
+    });
+    const approvalChecks = {
+      reconciliationExact: row.reconciliation_exact === true,
+      checkpointOutcomeBound: row.checkpoint_outcome_hash === row.outcome_hash,
+      decisionTargetBound:
+        Number(row.target_count) === input.requestedTrackCount,
+      decisionSelectedBound:
+        Number(row.selected_count) === input.reconciledPublishedTrackCount,
+      revisionHashBound:
+        row.manifest_revision_hash === row.revision_content_hash,
+      nativeRevision: row.revision_proof_kind === "native",
+      nativeSelection: row.selection_proof_mode === "native",
+      contractBound:
+        row.selection_contract_revision_id === input.activeContractRevisionId,
+      selectionTargetBound:
+        Number(row.selection_requested_count) === input.requestedTrackCount,
+      selectionCountBound:
+        Number(row.selection_selected_count)
+          === input.reconciledPublishedTrackCount,
+      decisionSelectionBound:
+        row.decision_selection_set_id === row.revision_selection_set_id,
+      decisionAttestationBound:
+        row.decision_attestation_set_hash === row.revision_attestation_set_hash,
+      selectionAttestationBound:
+        row.revision_attestation_set_hash === row.selection_attestation_set_hash,
+      manifestPayloadBound:
+        row.decision_manifest_payload_hash === expectedManifestPayloadHash,
+      consentHashBound: row.partial_consent_answer_hash === expectedConsentHash,
+      outputAttested: row.selection_output_attested === true,
+    };
+    const approved = Object.values(approvalChecks).every(Boolean);
+    return approved;
+  }
+
   private async readRunWorkTruthV1(
     client: Pick<PoolClient, "query">,
     runId: string,
@@ -15394,11 +20884,19 @@ export class Repository {
     let workMotion: RunWorkMotion;
     if (state === "completed"
       || state === "cancelled"
-      || state === "quarantined"
       || state === "needs_input"
       || state === "needs_decision"
       || state === "ready") {
       workMotion = "none";
+    } else if (state === "quarantined") {
+      // Quarantine removes any claim that a worker is live, but work motion is
+      // an orthogonal observation. Preserve a previously observed stalled
+      // worker while its queued/leased row remains present; other quarantine
+      // causes are deliberately projected as quiescent.
+      workMotion = retainedState.workMotion === "stalled"
+        && row.job_status !== null
+        ? "stalled"
+        : "none";
     } else if (blockerKind === "provider") {
       workMotion = "waiting_dependency";
     } else if (blockerKind === "apple_authorization"
@@ -15407,6 +20905,20 @@ export class Repository {
       workMotion = "paused";
     } else if (running) {
       workMotion = "running";
+    } else if (row.job_status === "leased"
+      && leaseValid
+      && row.attempt_status === null
+      && heartbeatFresh
+      && row.executor_identity_matches === true
+      && row.job_updated_at instanceof Date
+      && row.job_updated_at.getTime() > now - 120_000) {
+      // Leasing and fenced-attempt creation are separate transactions. A
+      // matching, freshly heartbeating worker can therefore own a valid lease
+      // for a brief handoff window before the attempt row exists. This is not
+      // proof of LIVE execution, but it is also not a stalled job. Keep the
+      // resolution accepted until the attempt starts; an expired/stale lease
+      // still falls through to `stalled` and fails closed.
+      workMotion = "none";
     } else if ((row.job_status === "queued" || row.job_status === "retry")
       && row.job_available_at instanceof Date
       && row.job_available_at.getTime() > now) {
@@ -15501,7 +21013,8 @@ export class Repository {
     const authorityMode = settingsMap.get(
       "playlist_resolution_authority_mode",
     );
-    if (Number(settingsMap.get("schema_version") ?? 0) < 19
+    const schemaVersion = Number(settingsMap.get("schema_version") ?? 0);
+    if (schemaVersion < 19
       || authorityMode === "authoritative") {
       return;
     }
@@ -15519,6 +21032,8 @@ export class Repository {
       status: RunStatus;
       phase: string;
       active_contract_revision_id: string | null;
+      active_contract_semantic_revision_id: string | null;
+      active_contract_semantic_hash: string | null;
       execution_attempt_id: string | null;
       blocker_id: string | null;
       blocker_kind: string | null;
@@ -15526,13 +21041,22 @@ export class Repository {
       question_set_id: string | null;
       manifest_id: string | null;
       requested_track_count: number | null;
+      partial_state_json: Record<string, unknown> | null;
+      decision_state_json: Record<string, unknown> | null;
     }>(
-      `SELECT run.status,run.phase,run.active_playlist_contract_revision_id,
+      `SELECT run.status,run.phase,
+              run.active_playlist_contract_revision_id
+                active_contract_revision_id,
+              contract.contract_json->>'revisionId'
+                active_contract_semantic_revision_id,
+              contract.contract_hash active_contract_semantic_hash,
               attempt.id execution_attempt_id,
               blocker.id blocker_id,blocker.blocker_kind,
               blocker.state_json blocker_state_json,
               questions.id question_set_id,
               manifest.id manifest_id,
+              partial.state_json partial_state_json,
+              decision_checkpoint.state_json decision_state_json,
               COALESCE(
                 NULLIF(spec.requested_track_count,0),
                 NULLIF(run.selection_plan_json->>'requestedTrackCount','')::int,
@@ -15540,6 +21064,9 @@ export class Repository {
                 NULLIF(run.brief_json #>> '{targetSize,min}','')::int
               ) requested_track_count
        FROM research_runs run
+       LEFT JOIN playlist_contract_revisions contract
+         ON contract.id=run.active_playlist_contract_revision_id
+        AND contract.status='active'
        LEFT JOIN run_specs spec ON spec.run_id=run.id
        LEFT JOIN LATERAL (
          SELECT id
@@ -15569,6 +21096,19 @@ export class Repository {
          WHERE run_id=run.id
          ORDER BY created_at DESC,id DESC LIMIT 1
        ) manifest ON true
+       LEFT JOIN LATERAL (
+         SELECT state_json
+         FROM research_checkpoints
+         WHERE run_id=run.id AND phase='partial_ready'
+         LIMIT 1
+       ) partial ON true
+       LEFT JOIN LATERAL (
+         SELECT state_json
+         FROM research_checkpoints
+         WHERE run_id=run.id AND phase='run_decision'
+         ORDER BY updated_at DESC
+         LIMIT 1
+       ) decision_checkpoint ON true
        WHERE run.id=$1 AND run.deleted_at IS NULL
        FOR UPDATE OF run`,
       [runId],
@@ -15584,6 +21124,72 @@ export class Repository {
     const requestedTrackCount = row.requested_track_count == null
       ? null
       : Number(row.requested_track_count);
+    const partial = parsePartialReadyCheckpoint(row.partial_state_json);
+    const partialState = row.partial_state_json ?? {};
+    const partialProof = schemaVersion >= 20
+      && row.status === "partial_ready"
+      && row.manifest_id
+      ? (await client.query<{
+          manifest_revision_id: string;
+          manifest_revision_hash: string;
+          selection_set_id: string;
+          selection_contract_revision_id: string;
+          selection_query_plan_revision_id: string;
+          selection_requested_count: number;
+          selection_selected_count: number;
+          selection_item_count: number;
+          selection_proof_mode: string;
+          selection_output_attested: boolean;
+        }>(
+          `SELECT revision.id manifest_revision_id,
+                  revision.content_hash manifest_revision_hash,
+                  selection.id selection_set_id,
+                  selection.contract_revision_id selection_contract_revision_id,
+                  selection.query_plan_revision_id selection_query_plan_revision_id,
+                  selection.requested_count selection_requested_count,
+                  selection.selected_count selection_selected_count,
+                  selection.proof_mode selection_proof_mode,
+                  (SELECT count(*)::int
+                   FROM immutable_selection_set_items item
+                   WHERE item.selection_set_id=selection.id
+                     AND item.role='selected') selection_item_count,
+                  (output.selection_set_id IS NOT NULL) selection_output_attested
+           FROM manifest_revisions revision
+           JOIN immutable_selection_sets selection
+             ON selection.id=revision.selection_set_id
+            AND selection.attestation_set_hash=revision.attestation_set_hash
+           LEFT JOIN selection_attempt_output_attestations output
+             ON output.selection_set_id=selection.id
+            AND output.execution_attempt_id=selection.execution_attempt_id
+            AND output.output_hash=selection.output_hash
+            AND output.attestation_set_hash=selection.attestation_set_hash
+           WHERE revision.manifest_id=$1
+             AND revision.status='locked'
+             AND revision.proof_kind='native'
+           ORDER BY revision.created_at DESC,revision.id DESC LIMIT 1`,
+          [row.manifest_id],
+        )).rows[0] ?? null
+      : null;
+    const verifiedPartialDecisionAvailable = schemaVersion >= 20
+      && row.status === "partial_ready"
+      && partial !== null
+      && row.active_contract_revision_id !== null
+      && row.manifest_id !== null
+      && partialProof?.selection_proof_mode === "native"
+      && partialProof.selection_output_attested === true
+      && partialProof.selection_contract_revision_id === row.active_contract_revision_id
+      && Number(partialProof.selection_requested_count) === partial.targetTrackCount
+      && Number(partialProof.selection_selected_count) === partial.verifiedTrackCount
+      && Number(partialProof.selection_item_count) === partial.verifiedTrackCount
+      && requestedTrackCount === partial.targetTrackCount
+      && partialState.manifestId === row.manifest_id
+      && partialState.manifestRevisionId === partialProof.manifest_revision_id
+      && partialState.manifestHash === partialProof.manifest_revision_hash
+      && partialState.queryPlanRevisionId
+        === partialProof.selection_query_plan_revision_id;
+    const adaptiveDecision = publicAdaptiveRunDecisionV1(
+      row.decision_state_json,
+    ) ?? publicAdaptiveRunDecisionV1(row.blocker_state_json);
     const workTruth = await this.readRunWorkTruthV1(
       client,
       runId,
@@ -15593,6 +21199,18 @@ export class Repository {
         ? date(row.blocker_state_json?.nextRetryAt)
         : null,
     );
+    const approvedPartialPublication = schemaVersion >= 20
+      ? await this.readApprovedPartialPublicationTruthV1(client, {
+          runId,
+          manifestId: row.manifest_id,
+          activeContractRevisionId: row.active_contract_revision_id,
+          requestedTrackCount,
+          reconciledPublishedTrackCount:
+            workTruth.reconciledPublishedTrackCount,
+          exactAppleReconciliation: workTruth.exactAppleReconciliation,
+          legacyStatus: row.status,
+        })
+      : false;
     const reduction = reduceResolutionFactsV1({
       legacyStatus: row.status,
       legacyPhase: row.phase,
@@ -15604,16 +21222,17 @@ export class Repository {
       reconciledPublishedTrackCount:
         workTruth.reconciledPublishedTrackCount,
       exactAppleReconciliation: workTruth.exactAppleReconciliation,
+      approvedPartialPublication,
       workMotion: workTruth.workMotion,
       integrityIncident: row.status === "failed_integrity"
         || row.blocker_kind === "integrity"
         || row.blocker_kind === "publication_reconciliation",
       cancellationRequested: row.status === "cancelled",
-      decisionAvailable: row.status === "needs_decision"
-        || row.status === "awaiting_budget"
-        || row.status === "partial_ready"
-        || row.status === "partial"
-        || row.status === "no_compatible_tracks",
+      verifiedPartialDecisionAvailable,
+      activeContractSemanticRevisionId:
+        row.active_contract_semantic_revision_id,
+      activeContractSemanticHash: row.active_contract_semantic_hash,
+      decision: adaptiveDecision,
     });
     let state = reduction.state;
     let nextAction = reduction.nextAction;
@@ -15629,21 +21248,21 @@ export class Repository {
     const projectedWorkTruth = (
       state === "completed"
       || state === "cancelled"
-      || state === "quarantined"
       || state === "needs_input"
       || state === "needs_decision"
       || state === "ready"
+      || (state === "quarantined" && workTruth.workMotion !== "stalled")
     )
       ? { ...workTruth, workMotion: "none" as const, stageDeadlineAt: null }
       : workTruth;
     const decision = state === "needs_decision"
-      ? {
-          kind: "compatibility_decision",
-          legacyStatus: row.status,
-          legacyPhase: row.phase,
-          editableInterpretationSummary: true,
-          ...(row.blocker_state_json ?? {}),
-        }
+      ? verifiedPartialDecisionAvailable
+        ? {
+            kind: "verified_partial_publication",
+            legacyStatus: row.status,
+            legacyPhase: row.phase,
+          }
+        : adaptiveDecision as unknown as Record<string, unknown>
       : null;
     const incidentReference = state === "quarantined"
       ? `resolution-shadow:${runId}:${row.status}:${row.phase}`.slice(0, 160)
@@ -15656,6 +21275,11 @@ export class Repository {
       resolutionReasonCode: reduction.reasonCode,
       observedAppleSideEffect: reduction.observedAppleSideEffect,
       incidentRequired: reduction.incidentRequired,
+      verifiedPartialDecisionAvailable,
+      approvedPartialPublication,
+      activeContractSemanticRevisionId:
+        row.active_contract_semantic_revision_id,
+      activeContractSemanticHash: row.active_contract_semantic_hash,
       ...projectedWorkTruth,
     };
     const companions = {
@@ -16338,6 +21962,7 @@ export class Repository {
       manifest_id: string | null;
       state_json: Record<string, unknown>;
       incident_reference: string | null;
+      contract_semantic_revision_id: string | null;
       contract_revision: number | null;
       contract_hash: string | null;
       blocker_kind: string | null;
@@ -16353,6 +21978,8 @@ export class Repository {
               resolution.question_set_id,resolution.decision_json,
               resolution.manifest_id,resolution.state_json,
               resolution.incident_reference,
+              contract.contract_json->>'revisionId'
+                contract_semantic_revision_id,
               contract.revision contract_revision,
               contract.contract_hash,
               blocker.blocker_kind,blocker.dependency_key,
@@ -16376,6 +22003,7 @@ export class Repository {
         nextAction: "contact_support",
         terminal: false,
         contractRevisionId: null,
+        contractSemanticRevisionId: null,
         contractRevision: null,
         contractHash: null,
         blocker: null,
@@ -16417,6 +22045,7 @@ export class Repository {
         nextAction: "contact_support",
         terminal: false,
         contractRevisionId: row.active_contract_revision_id,
+        contractSemanticRevisionId: row.contract_semantic_revision_id,
         contractRevision: row.contract_revision == null
           ? null
           : Number(row.contract_revision),
@@ -16453,6 +22082,7 @@ export class Repository {
         nextAction: "contact_support",
         terminal: false,
         contractRevisionId: row.active_contract_revision_id,
+        contractSemanticRevisionId: row.contract_semantic_revision_id,
         contractRevision: row.contract_revision == null
           ? null
           : Number(row.contract_revision),
@@ -16497,6 +22127,7 @@ export class Repository {
       nextAction,
       terminal: state === "completed" || state === "cancelled",
       contractRevisionId: row.active_contract_revision_id,
+      contractSemanticRevisionId: row.contract_semantic_revision_id,
       contractRevision: row.contract_revision == null
         ? null
         : Number(row.contract_revision),
@@ -16523,6 +22154,7 @@ export class Repository {
       return {
         ...projected,
         contractRevisionId: null,
+        contractSemanticRevisionId: null,
         contractRevision: null,
         contractHash: null,
         blocker: null,
@@ -16532,6 +22164,7 @@ export class Repository {
     if (authoritative) return authoritative;
     const result = await this.pool.query<{
       contract_revision_id: string | null;
+      contract_semantic_revision_id: string | null;
       contract_revision: number | null;
       contract_hash: string | null;
       blocker_id: string | null;
@@ -16542,9 +22175,12 @@ export class Repository {
       automatic_retry_until: Date | null;
       blocker_state_json: Record<string, unknown> | null;
       provider_checkpoint_state: Record<string, unknown> | null;
+      decision_state_json: Record<string, unknown> | null;
     }>(
       `SELECT
          contract.id contract_revision_id,
+         contract.contract_json->>'revisionId'
+           contract_semantic_revision_id,
          contract.revision contract_revision,
          contract.contract_hash,
          blocker.id blocker_id,
@@ -16554,7 +22190,8 @@ export class Repository {
          blocker.next_retry_at,
          blocker.automatic_retry_until,
          blocker.state_json blocker_state_json,
-         provider_checkpoint.state_json provider_checkpoint_state
+         provider_checkpoint.state_json provider_checkpoint_state,
+         decision_checkpoint.state_json decision_state_json
        FROM research_runs run
        LEFT JOIN playlist_contract_revisions contract
          ON contract.id=run.active_playlist_contract_revision_id
@@ -16570,6 +22207,14 @@ export class Repository {
          ORDER BY checkpoint.updated_at DESC,checkpoint.phase
          LIMIT 1
        ) provider_checkpoint ON true
+       LEFT JOIN LATERAL (
+         SELECT checkpoint.state_json
+         FROM research_checkpoints checkpoint
+         WHERE checkpoint.run_id=run.id
+           AND checkpoint.phase='run_decision'
+         ORDER BY checkpoint.updated_at DESC
+         LIMIT 1
+       ) decision_checkpoint ON true
        LEFT JOIN LATERAL (
          SELECT id,blocker_kind,dependency_key,retry_count,next_retry_at,
                 automatic_retry_until,state_json
@@ -16669,11 +22314,20 @@ export class Repository {
       && row?.automatic_retry_until instanceof Date
       && Number.isFinite(row.automatic_retry_until.getTime())
       && row.automatic_retry_until.getTime() <= Date.now();
+    const adaptiveDecision = publicAdaptiveRunDecisionV1(
+      row?.decision_state_json,
+    ) ?? publicAdaptiveRunDecisionV1(row?.blocker_state_json);
+    const adaptiveDecisionAction = adaptiveDecision
+      && adaptiveDecision.contractRevisionId
+        === row?.contract_semantic_revision_id
+      && adaptiveDecision.contractSemanticHash === row?.contract_hash
+      ? advancingAdaptiveRunDecisionActionV1(adaptiveDecision)
+      : null;
     const canonicalProviderDecision = providerRetryWindowExpired
       && typeof row?.blocker_id === "string"
       && blockerState.nextAction === "resume_revise_or_cancel"
-      && publicAdaptiveRunDecisionV1(blockerState)?.reason
-        === "dependency_retry_window_expired";
+      && adaptiveDecision?.reason === "dependency_retry_window_expired"
+      && adaptiveDecisionAction === "resume_research";
     let projected: Pick<
       RunResolutionView,
       "state" | "nextAction" | "terminal"
@@ -16740,12 +22394,53 @@ export class Repository {
           row?.next_retry_at ?? providerCheckpoint?.nextRetryAt ?? null,
         )
       : null;
+    if (workTruth
+      && (projected.nextAction === "review_contract"
+        || projected.nextAction === "resume_research")
+      && adaptiveDecisionAction !== projected.nextAction) {
+      projected = {
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+      };
+    }
+    if (workTruth
+      && (workTruth.workMotion === "retry_scheduled"
+        || workTruth.workMotion === "waiting_dependency")
+      && blockerKind === "provider") {
+      projected = {
+        state: "blocked_dependency",
+        nextAction: "wait_for_dependency",
+        terminal: false,
+      };
+    } else if (workTruth
+      && (workTruth.workMotion === "retry_scheduled"
+        || workTruth.workMotion === "waiting_dependency"
+        || workTruth.workMotion === "paused"
+        || workTruth.workMotion === "stalled")) {
+      projected = {
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+      };
+    }
+    const projectedWorkTruth = workTruth
+      && projected.state === "quarantined"
+      && workTruth.workMotion !== "stalled"
+      ? {
+          ...workTruth,
+          workMotion: "none" as const,
+          stageDeadlineAt: null,
+        }
+      : workTruth;
     return {
       ...projected,
       contractRevisionId: row?.contract_revision_id ?? null,
+      contractSemanticRevisionId:
+        row?.contract_semantic_revision_id ?? null,
       contractRevision: row?.contract_revision == null ? null : Number(row.contract_revision),
       contractHash: row?.contract_hash ?? null,
-      ...(workTruth ?? {}),
+      ...(projectedWorkTruth ?? {}),
       blocker: blockerKind ? {
         kind: blockerKind,
         nextRetryAt: row?.next_retry_at?.toISOString()
@@ -16814,10 +22509,15 @@ export class Repository {
       [runId],
     );
     const row = result.rows[0];
+    const semanticRevisionId = row?.contract_json?.revisionId;
     const semanticHash = row?.contract_json?.semanticHash;
     for (const value of [row?.checkpoint_state, row?.blocker_state]) {
       const decision = publicAdaptiveRunDecisionV1(value);
-      if (decision && decision.contractSemanticHash === semanticHash) return decision;
+      if (decision
+        && decision.contractRevisionId === semanticRevisionId
+        && decision.contractSemanticHash === semanticHash) {
+        return decision;
+      }
     }
     return null;
   }
@@ -16836,13 +22536,55 @@ export class Repository {
     }>(
       `SELECT
          r.brief_json->>'mode' AS mode,
-         NULLIF(r.brief_json #>> '{targetSize,min}','')::int AS target_minimum,
-         (SELECT count(*)::int FROM manifest_tracks mt
-          WHERE mt.manifest_id=$2) AS manifest_track_count,
+         COALESCE(
+           spec.requested_track_count,
+           NULLIF(r.selection_plan_json->>'requestedTrackCount','')::int,
+           CASE
+             WHEN NULLIF(r.brief_json #>> '{targetSize,min}','')::int
+                = NULLIF(r.brief_json #>> '{targetSize,max}','')::int
+             THEN NULLIF(r.brief_json #>> '{targetSize,max}','')::int
+             ELSE NULL
+           END
+         ) AS target_minimum,
+         COALESCE((
+           SELECT count(*)::int
+           FROM manifest_revisions revision
+           JOIN manifest_revision_tracks track
+             ON track.manifest_revision_id=revision.id
+           WHERE revision.manifest_id=$2
+             AND revision.status IN ('locked','published')
+             AND NOT EXISTS (
+               SELECT 1 FROM manifest_revisions successor
+               WHERE successor.manifest_id=revision.manifest_id
+                 AND successor.status IN ('locked','published')
+                 AND successor.revision>revision.revision
+             )
+           GROUP BY revision.id
+           LIMIT 1
+         ),(
+           SELECT count(*)::int FROM manifest_tracks track
+           WHERE track.manifest_id=$2
+         ),0) AS manifest_track_count,
          (SELECT count(*)::int FROM track_candidates c
           WHERE c.run_id=$1 AND c.outcome<>'duplicate'
             AND NOT EXISTS (
-              SELECT 1 FROM manifest_tracks mt WHERE mt.manifest_id=$2 AND mt.candidate_id=c.id
+              SELECT 1
+              FROM manifest_revisions revision
+              JOIN manifest_revision_tracks track
+                ON track.manifest_revision_id=revision.id
+               AND track.candidate_id=c.id
+              WHERE revision.manifest_id=$2
+                AND revision.status IN ('locked','published')
+                AND NOT EXISTS (
+                  SELECT 1 FROM manifest_revisions successor
+                  WHERE successor.manifest_id=revision.manifest_id
+                    AND successor.status IN ('locked','published')
+                    AND successor.revision>revision.revision
+                )
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM manifest_tracks track
+              WHERE track.manifest_id=$2 AND track.candidate_id=c.id
             )) AS omitted_candidate_count,
          ((SELECT count(*)::int FROM source_frontier f
            WHERE f.run_id=$1 AND (
@@ -16859,6 +22601,7 @@ export class Repository {
            FROM research_checkpoints rc
            WHERE rc.run_id=$1 AND rc.phase='catalog_matching_outcome'),0)::int AS curated_quality_gap_count
        FROM research_runs r
+       LEFT JOIN run_specs spec ON spec.run_id=r.id
        WHERE r.id=$1`,
       [runId, manifestId],
     );
@@ -16866,14 +22609,661 @@ export class Repository {
     const mode = row?.mode === "curated" || row?.mode === "hybrid"
       ? row.mode
       : "exhaustive";
-    return resolvePublicationCompleteness({
+    const targetTrackCount = row?.target_minimum == null
+      ? null
+      : Number(row.target_minimum);
+    const manifestTrackCount = Number(row?.manifest_track_count ?? 0);
+    const completeness = resolvePublicationCompleteness({
       mode,
-      targetMinimum: row?.target_minimum == null ? null : Number(row.target_minimum),
-      manifestTrackCount: Number(row?.manifest_track_count ?? 0),
+      targetMinimum: targetTrackCount,
+      manifestTrackCount,
       omittedCandidateCount: Number(row?.omitted_candidate_count ?? 0),
       unresolvedCoverageCount: Number(row?.unresolved_coverage_count ?? 0),
       curatedQualityGapCount: Number(row?.curated_quality_gap_count ?? 0),
     });
+    // Exact count is immutable for every mode. Discovery accounting can be
+    // empty after selection (or in a fixed/hybrid plan), but a manifest below
+    // the persisted requested count is still a publication shortfall.
+    return {
+      ...completeness,
+      omittedCandidateCount: Math.max(
+        completeness.omittedCandidateCount,
+        Number.isSafeInteger(targetTrackCount) && targetTrackCount! > 0
+          ? Math.max(0, targetTrackCount! - manifestTrackCount)
+          : 0,
+      ),
+    };
+  }
+
+  private async getRunRepairReplayAction(
+    runId: string,
+  ): Promise<RunRepairReplayActionView | null> {
+    if (Number(await this.getSchemaVersion() ?? 0) < 19) return null;
+    try {
+      const source = await this.loadAuthenticatedLegacyRepairSourceV1(
+        this.pool,
+        { sourceRunId: runId },
+      );
+      const existing = source.existingConsumptions.map(
+        parseLegacyRepairAuthorityConsumptionV1,
+      );
+      if (existing.some((value) => value === null)
+        || existing.length > 1) return null;
+      const consumed = existing[0];
+      const pause = repairReplayPauseDecisionV1({
+        authorityKind: "authenticated_legacy_repair",
+        globalResearchPaused: source.globalResearchPaused,
+        publicAssignmentPaused: source.publicAssignmentPaused,
+        hardRouteDisabled: source.hardRouteDisabled,
+      });
+      const availability = consumed
+        ? { available: false as const, reason: "already_started" as const }
+        : pause.allowed
+          ? { available: true as const, reason: "ready" as const }
+          : { available: false as const, reason: "route_paused" as const };
+      return {
+        kind: "repair_replay",
+        expectedGeneration:
+          source.authority.sourceResolutionGeneration,
+        incidentReference: source.authority.incidentReference,
+        contractRevisionId:
+          source.authority.sourceContractRevisionId,
+        contractSemanticHash:
+          source.authority.sourceContractSemanticHash,
+        available: availability.available,
+        availabilityReason: availability.reason,
+        ...(consumed
+          ? { successorBriefRequestId: consumed.successorBriefRequestId }
+          : {}),
+        resultReuse: false,
+        autoPublication: false,
+      };
+    } catch {
+      // A current signed Contract-3 quarantine does not need a fabricated
+      // legacy admission receipt; its execution route receipt is authoritative.
+    }
+    try {
+      const source = await this.loadAuthenticatedTechnicalRepairSourceV1(
+        this.pool,
+        { sourceRunId: runId },
+      );
+      const current = canonicalExecutorReleaseIdentityV1();
+      const consumed = source.existingConsumptions[0] ?? null;
+      const assignmentKind =
+        source.routeReceipt.assignmentAuthority.kind;
+      if (assignmentKind !== "signed_public_rollout"
+        && assignmentKind !== "signed_public_direct_exposure"
+        && assignmentKind !== "signed_owner_canary") return null;
+      const availability = technicalRepairReplayAvailabilityV1({
+        sourceReleaseRevision: source.routeReceipt.releaseRevision,
+        sourceExecutorConfigurationHash:
+          source.routeReceipt.executorConfigurationHash,
+        activeReleaseRevision: current.executorRevision,
+        activeExecutorConfigurationHash:
+          current.semanticExecutionConfigurationHash,
+        globalResearchPaused: source.globalResearchPaused,
+        publicAssignmentPaused: source.publicAssignmentPaused,
+        hardRouteDisabled: source.hardRouteDisabled,
+        assignmentKind,
+        successorBriefRequestId:
+          consumed?.successorBriefRequestId ?? null,
+      });
+      return {
+        kind: "repair_replay",
+        expectedGeneration: source.resolutionGeneration,
+        incidentReference: source.incidentReference,
+        contractRevisionId: source.contractRevisionId,
+        contractSemanticHash: source.contractSemanticHash,
+        available: availability.available,
+        availabilityReason: availability.reason,
+        ...(consumed
+          ? { successorBriefRequestId: consumed.successorBriefRequestId }
+          : {}),
+        resultReuse: false,
+        autoPublication: false,
+      };
+    } catch {
+      return null;
+    }
+    /*
+     * Superseded signed-public direct replay projection. Authenticated legacy
+     * repair now exposes only the linked planning-successor action above.
+     */
+    /*
+    const result = await this.pool.query<{
+      generation: number;
+      resolution_state: string;
+      incident_reference: string | null;
+      run_status: string;
+      run_phase: string;
+      brief_contract_version: number;
+      contract_revision_id: string | null;
+      contract_status: string | null;
+      contract_hash: string | null;
+      contract_json: PlaylistContractRevisionV1 | null;
+      blocker_kind: string | null;
+      blocker_reason_code: string | null;
+      public_rollout_assignment_json: unknown | null;
+      rollout_authority_json: string | null;
+      public_assignment_paused: boolean;
+      route_disabled: boolean;
+      has_published_reconciliation: boolean;
+    }>(
+      `SELECT resolution.generation,
+              resolution.state resolution_state,
+              resolution.incident_reference,
+              run.status run_status,run.phase run_phase,
+              run.brief_contract_version,
+              contract.id contract_revision_id,
+              contract.status contract_status,
+              contract.contract_hash,contract.contract_json,
+              blocker.blocker_kind,
+              blocker.state_json->>'reasonCode' blocker_reason_code,
+              brief.public_rollout_assignment_json,
+              rollout_authority.value rollout_authority_json,
+              COALESCE(public_pause.value='true',false)
+                public_assignment_paused,
+              EXISTS(
+                SELECT 1
+                FROM pipeline_cohort_kill_switches hard_switch
+                WHERE hard_switch.route='corpus_first_v3'
+                  AND hard_switch.disabled
+                  AND (
+                    hard_switch.intent_group IS NULL
+                    OR hard_switch.intent_group=
+                      brief.public_rollout_assignment_json->>'intentGroup'
+                  )
+              ) route_disabled,
+              EXISTS(
+                SELECT 1
+                FROM playlist_publication_reconciliations reconciliation
+                WHERE reconciliation.run_id=run.id
+                  AND reconciliation.state='complete'
+              ) has_published_reconciliation
+       FROM research_runs run
+       JOIN playlist_run_resolutions resolution
+         ON resolution.run_id=run.id
+       LEFT JOIN playlist_contract_revisions contract
+         ON contract.id=run.active_playlist_contract_revision_id
+       LEFT JOIN playlist_run_blockers blocker
+         ON blocker.id=resolution.blocker_id
+       LEFT JOIN LATERAL (
+         SELECT access.brief_request_id
+         FROM run_accesses access
+         WHERE access.run_id=run.id
+           AND access.brief_request_id IS NOT NULL
+           AND access.deleted_at IS NULL
+         ORDER BY access.created_at,access.id
+         LIMIT 1
+       ) scoped_access ON true
+       LEFT JOIN brief_requests brief
+         ON brief.id=scoped_access.brief_request_id
+       LEFT JOIN settings rollout_authority
+         ON rollout_authority.key=(CASE
+           WHEN brief.public_rollout_assignment_json->>'version'
+             ='signed_public_direct_exposure_v1'
+           THEN 'v254_direct_exposure_authority:'
+           ELSE 'public_rollout_authority:'
+         END) || COALESCE(
+           brief.public_rollout_assignment_json->>'rolloutEvidenceHash',''
+         )
+       LEFT JOIN settings public_pause
+         ON public_pause.key='pipeline_v3_public_assignment_paused'
+       WHERE run.id=$1 AND run.deleted_at IS NULL`,
+      [runId],
+    );
+    const row = result.rows[0];
+    if (!row?.incident_reference
+      || !row.contract_revision_id
+      || !row.contract_hash
+      || !row.contract_json
+      || row.public_assignment_paused
+      || row.route_disabled) {
+      return null;
+    }
+    let assignment: PersistedPublicRolloutAssignmentV1 | null = null;
+    try {
+      assignment = parsePublicRolloutAssignmentV1(
+        row.public_rollout_assignment_json,
+      );
+      if (!assignment) throw new Error("assignment_missing");
+      assertPublicRolloutAssignmentDatabaseAuthorityV1(
+        assignment,
+        row.rollout_authority_json
+          ? JSON.parse(row.rollout_authority_json)
+          : null,
+      );
+      assertPlaylistContractIntegrityV1(row.contract_json);
+    } catch {
+      return null;
+    }
+    const eligibility = canonicalRepairReplayEligibilityV1({
+      resolutionState: row.resolution_state,
+      runStatus: row.run_status,
+      runPhase: row.run_phase,
+      blockerKind: row.blocker_kind,
+      reasonCode: row.blocker_reason_code,
+      contractVersion: Number(row.brief_contract_version),
+      contractStatus: row.contract_status ?? "",
+      publicAssignmentActive: assignment.assigned === true,
+      hasPublishedReconciliation: row.has_published_reconciliation,
+    });
+    if (!eligibility.eligible
+      || row.contract_hash !== row.contract_json.semanticHash) {
+      return null;
+    }
+    return {
+      kind: "repair_replay",
+      expectedGeneration: Number(row.generation),
+      incidentReference: row.incident_reference,
+      contractRevisionId: row.contract_revision_id,
+      contractSemanticHash: row.contract_hash,
+      resultReuse: false,
+      autoPublication: false,
+    };
+    */
+  }
+
+  private async getRunExecutionTruthV1(runId: string): Promise<{
+    executionRouteReceipt: RunExecutionRouteReceiptView | null;
+    evidenceCoverage: RunEvidenceCoverageView;
+  }> {
+    const result = await this.pool.query<{
+      route_receipt: unknown | null;
+      discovery_observations: number;
+      qualification_observations: number;
+      legacy_unbound_qualifications: number;
+      unique_leads: number;
+      candidates: number;
+      identity_bound: number;
+      apple_resolved: number;
+      version_compatible: number;
+      storefront_playable: number;
+      obligation_counts: Record<string, {
+        pass: number;
+        fail: number;
+        unknown: number;
+      }>;
+      evidence_passed: number;
+      evidence_unknown: number;
+      evidence_failed: number;
+      selected: number;
+      manifested: number;
+      appended_count: number;
+      reconciled_published: number | null;
+    }>(
+      `WITH authority AS (
+         SELECT run.id run_id,
+                COALESCE(
+                  resolution.active_contract_revision_id,
+                  run.active_playlist_contract_revision_id
+                ) contract_revision_id,
+                active.query_plan_revision_id,
+                CASE
+                  WHEN active_plan.id IS NOT NULL
+                    AND source_plan.id IS NOT NULL
+                    AND active_plan.parent_revision_id=source_plan.id
+                    AND active_plan.revision=source_plan.revision+1
+                    AND active_plan.selection_plan_id=
+                      source_plan.selection_plan_id
+                    AND active_plan.graph_snapshot_id=
+                      source_plan.graph_snapshot_id
+                    AND active_plan.engine=source_plan.engine
+                    AND source_plan.status='superseded'
+                    AND NOT (source_plan.plan_json ? 'continuation')
+                    AND active_plan.plan_json
+                      #>> '{continuation,sourceQueryPlanRevisionId}'=
+                      source_plan.id::text
+                    AND active_plan.plan_json
+                      #>> '{continuation,sourceQueryPlanHash}'=
+                      source_plan.plan_hash
+                    AND active_plan.plan_json
+                      #>> '{continuation,sourceStageKey}'=
+                      'v3-retrieval:active:' || left(source_plan.plan_hash,48)
+                    AND active_plan.plan_json-'continuation'=
+                      source_plan.plan_json
+                  THEN ARRAY[
+                    active.query_plan_revision_id,
+                    source_plan.id
+                  ]::uuid[]
+                  ELSE ARRAY[active.query_plan_revision_id]::uuid[]
+                END query_plan_revision_ids
+         FROM research_runs run
+         LEFT JOIN playlist_run_resolutions resolution
+           ON resolution.run_id=run.id
+         LEFT JOIN run_active_query_plans active ON active.run_id=run.id
+         LEFT JOIN query_plan_revisions active_plan
+           ON active_plan.id=active.query_plan_revision_id
+          AND active_plan.run_id=run.id
+         LEFT JOIN query_plan_revisions source_plan
+           ON source_plan.id=active_plan.parent_revision_id
+          AND source_plan.run_id=run.id
+         WHERE run.id=$1
+       ),
+       scoped_leads AS (
+         SELECT lead.*
+         FROM playlist_discovery_leads lead
+         JOIN authority
+           ON authority.run_id=lead.run_id
+          AND authority.contract_revision_id=lead.contract_revision_id
+         JOIN playlist_execution_attempts attempt
+           ON attempt.id=lead.execution_attempt_id
+          AND attempt.run_id=lead.run_id
+          AND attempt.contract_revision_id=lead.contract_revision_id
+          AND attempt.query_plan_revision_id=
+            ANY(authority.query_plan_revision_ids)
+       ),
+       scoped_qualifications AS (
+         SELECT qualification.*
+         FROM playlist_qualification_records qualification
+         JOIN authority
+           ON authority.run_id=qualification.run_id
+          AND authority.contract_revision_id=
+            qualification.contract_revision_id
+         JOIN scoped_leads lead
+           ON lead.id=qualification.discovery_lead_id
+         WHERE qualification.revoked_at IS NULL
+       ),
+       latest_bound_qualifications AS (
+         -- Qualification observations are immutable, so a bounded evidence
+         -- repair may legitimately append a newer disposition for the same
+         -- materialized candidate. Public outcome/obligation counters must
+         -- describe the latest active observation per candidate rather than
+         -- inflate the result with its repair history. Retained legacy rows
+         -- have no candidate identity and remain separate diagnostic
+         -- observations below.
+         SELECT DISTINCT ON (qualification.candidate_id) qualification.*
+         FROM scoped_qualifications qualification
+         WHERE qualification.candidate_id IS NOT NULL
+         ORDER BY qualification.candidate_id,
+                  qualification.qualified_at DESC,
+                  qualification.id DESC
+       ),
+       effective_qualifications AS (
+         SELECT qualification.*
+         FROM latest_bound_qualifications qualification
+         UNION ALL
+         SELECT qualification.*
+         FROM scoped_qualifications qualification
+         WHERE qualification.candidate_id IS NULL
+       ),
+       scoped_candidates AS (
+         -- Candidate materialization is an observation in its own right. It
+         -- must remain visible when a worker crashes after the candidate
+         -- commit but before the qualification commit. A candidate already
+         -- bound exclusively to a superseded contract is not active truth.
+         SELECT candidate.*
+         FROM track_candidates candidate
+         JOIN authority ON authority.run_id=candidate.run_id
+         WHERE EXISTS (
+           SELECT 1
+           FROM scoped_qualifications qualification
+           WHERE qualification.candidate_id=candidate.id
+         ) OR NOT EXISTS (
+           SELECT 1
+           FROM playlist_qualification_records qualification
+           WHERE qualification.candidate_id=candidate.id
+         )
+       )
+       SELECT route.state_json route_receipt,
+              (SELECT COALESCE(sum(
+                CASE
+                  WHEN jsonb_typeof(
+                    lead.lead_json->'observationReceiptHashes'
+                  )='array'
+                  THEN GREATEST(
+                    jsonb_array_length(
+                      lead.lead_json->'observationReceiptHashes'
+                    ),
+                    1
+                  )
+                  ELSE 1
+                END
+              ),0)::int
+               FROM scoped_leads lead) discovery_observations,
+              (SELECT count(*)::int
+               FROM scoped_qualifications) qualification_observations,
+              (SELECT count(*)::int
+               FROM scoped_qualifications qualification
+               WHERE qualification.candidate_id IS NULL)
+                 legacy_unbound_qualifications,
+              (SELECT count(DISTINCT lead.identity_hint_hash)::int
+               FROM scoped_leads lead) unique_leads,
+              (SELECT count(*)::int
+               FROM scoped_candidates) candidates,
+              (SELECT count(*)::int FROM scoped_candidates candidate
+               WHERE candidate.recording_family_id IS NOT NULL
+                  OR candidate.candidate_stage<>'discovered') identity_bound,
+              (SELECT count(DISTINCT COALESCE(
+                 qualification.candidate_id::text,
+                 'legacy:' || qualification.id::text
+               ))::int
+               FROM effective_qualifications qualification
+               WHERE NULLIF(
+                   qualification.catalog_result_json
+                     #>> '{catalog,appleSongId}',
+                   ''
+                 ) IS NOT NULL
+                 AND (
+                   qualification.candidate_id IS NULL
+                   OR EXISTS (
+                     SELECT 1
+                     FROM scoped_candidates candidate
+                     JOIN recording_catalog_identities identity
+                       ON identity.recording_family_id=
+                         candidate.recording_family_id
+                      AND lower(identity.provider)='apple'
+                      AND lower(COALESCE(identity.storefront,''))=
+                        lower(COALESCE(qualification.storefront,''))
+                      AND identity.catalog_id=
+                        qualification.catalog_result_json
+                          #>> '{catalog,appleSongId}'
+                     WHERE candidate.id=qualification.candidate_id
+                       AND candidate.run_id=qualification.run_id
+                   )
+                 )) apple_resolved,
+              (SELECT count(DISTINCT COALESCE(
+                 qualification.candidate_id::text,
+                 'legacy:' || qualification.id::text
+               ))::int
+               FROM effective_qualifications qualification
+               WHERE lower(COALESCE(
+                   qualification.catalog_result_json
+                     #>> '{version,compatible}',
+                   'false'
+                 ))='true') version_compatible,
+              (SELECT count(DISTINCT COALESCE(
+                 qualification.candidate_id::text,
+                 'legacy:' || qualification.id::text
+               ))::int
+               FROM effective_qualifications qualification
+               WHERE lower(COALESCE(
+                   qualification.catalog_result_json
+                     #>> '{catalog,storefrontPlayable}',
+                   'false'
+                 ))='true'
+                 AND NULLIF(
+                   qualification.catalog_result_json
+                     #>> '{catalog,appleSongId}',
+                   ''
+                 ) IS NOT NULL) storefront_playable,
+              COALESCE((
+                SELECT jsonb_object_agg(
+                  counts.obligation_id,
+                  jsonb_build_object(
+                    'pass',counts.pass_count,
+                    'fail',counts.fail_count,
+                    'unknown',counts.unknown_count
+                  )
+                  ORDER BY counts.obligation_id
+                )
+                FROM (
+                  SELECT assessment.key obligation_id,
+                         count(*) FILTER (
+                           WHERE assessment.value->>'status'='pass'
+                         )::int pass_count,
+                         count(*) FILTER (
+                           WHERE assessment.value->>'status'='fail'
+                         )::int fail_count,
+                         count(*) FILTER (
+                           WHERE assessment.value->>'status'='unknown'
+                         )::int unknown_count
+                  FROM effective_qualifications qualification
+                  CROSS JOIN LATERAL jsonb_each(
+                    CASE
+                      WHEN jsonb_typeof(
+                        qualification.predicate_results_json
+                          #> '{canonicalContract,assessments}'
+                      )='object'
+                      THEN qualification.predicate_results_json
+                        #> '{canonicalContract,assessments}'
+                      ELSE '{}'::jsonb
+                    END
+                  ) assessment
+                  GROUP BY assessment.key
+                ) counts
+              ),'{}'::jsonb) obligation_counts,
+              (SELECT count(*)::int
+               FROM effective_qualifications qualification
+               WHERE qualification.decision='qualified') evidence_passed,
+              (SELECT count(*)::int
+               FROM effective_qualifications qualification
+               WHERE qualification.decision='unknown') evidence_unknown,
+              (SELECT count(*)::int
+               FROM effective_qualifications qualification
+               WHERE qualification.decision='failed') evidence_failed,
+              COALESCE((
+                SELECT COALESCE(
+                  selection_set.selected_count,
+                  (
+                    SELECT count(*)::int
+                    FROM manifest_revision_tracks track
+                    WHERE track.manifest_revision_id=revision.id
+                  )
+                )
+                FROM manifest_revisions revision
+                JOIN manifests manifest ON manifest.id=revision.manifest_id
+                LEFT JOIN immutable_selection_sets selection_set
+                  ON selection_set.id=revision.selection_set_id
+                 AND selection_set.attestation_set_hash=
+                   revision.attestation_set_hash
+                WHERE manifest.run_id=run.id
+                  AND manifest.contract_revision_id=
+                    authority.contract_revision_id
+                  AND revision.status IN ('locked','published')
+                ORDER BY revision.revision DESC,revision.created_at DESC
+                LIMIT 1
+              ),(
+                SELECT count(*)::int
+                FROM manifest_tracks track
+                JOIN manifests manifest ON manifest.id=track.manifest_id
+                WHERE manifest.run_id=run.id
+                  AND manifest.contract_revision_id=
+                    authority.contract_revision_id
+              ),0) selected,
+              COALESCE((
+                SELECT count(*)::int
+                FROM (
+                  SELECT revision.id
+                  FROM manifest_revisions revision
+                  JOIN manifests manifest
+                    ON manifest.id=revision.manifest_id
+                  WHERE manifest.run_id=run.id
+                    AND manifest.contract_revision_id=
+                      authority.contract_revision_id
+                    AND revision.status IN ('locked','published')
+                  ORDER BY revision.revision DESC,revision.created_at DESC
+                  LIMIT 1
+                ) latest_revision
+                JOIN manifest_revision_tracks track
+                  ON track.manifest_revision_id=latest_revision.id
+                GROUP BY latest_revision.id
+              ),(
+                SELECT count(*)::int
+                FROM manifest_tracks track
+                JOIN manifests manifest ON manifest.id=track.manifest_id
+                WHERE manifest.run_id=run.id
+                  AND manifest.contract_revision_id=
+                    authority.contract_revision_id
+              ),0) manifested,
+              COALESCE((
+                SELECT reconciliation.appended_count
+                FROM playlist_publication_reconciliations reconciliation
+                WHERE reconciliation.run_id=run.id
+                  AND reconciliation.contract_revision_id=
+                    authority.contract_revision_id
+                ORDER BY reconciliation.updated_at DESC,reconciliation.id DESC
+                LIMIT 1
+              ),0) appended_count,
+              (
+                SELECT CASE
+                  WHEN reconciliation.state='complete'
+                    AND reconciliation.appended_count=
+                      reconciliation.expected_count
+                    AND reconciliation.observed_ordered_ids_hash
+                      =reconciliation.expected_ordered_ids_hash
+                  THEN reconciliation.expected_count
+                  ELSE NULL
+                END
+                FROM playlist_publication_reconciliations reconciliation
+                WHERE reconciliation.run_id=run.id
+                  AND reconciliation.contract_revision_id=
+                    authority.contract_revision_id
+                ORDER BY reconciliation.updated_at DESC,reconciliation.id DESC
+                LIMIT 1
+              ) reconciled_published
+       FROM research_runs run
+       JOIN authority ON authority.run_id=run.id
+       LEFT JOIN research_checkpoints route
+         ON route.run_id=run.id AND route.phase=$2
+       WHERE run.id=$1`,
+      [runId, EXECUTION_ROUTE_RECEIPT_PHASE_V1],
+    );
+    const row = result.rows[0];
+    const receipt = parseExecutionRouteReceiptV1(row?.route_receipt);
+    const count = (value: unknown) =>
+      Math.max(0, Math.floor(Number(value ?? 0) || 0));
+    return {
+      executionRouteReceipt: receipt ? {
+        version: receipt.version,
+        trafficClass: receipt.trafficClass,
+        contractVersion: receipt.contractVersion,
+        guidanceVersion: receipt.guidanceVersion,
+        executionRoute: receipt.executionRoute,
+        queryPlanSchema: receipt.queryPlanSchema,
+        queryPlanHash: receipt.queryPlanHash,
+        capabilitySnapshotHash: receipt.capabilitySnapshotHash,
+        releaseRevision: receipt.releaseRevision,
+        executorConfigurationHash: receipt.executorConfigurationHash,
+        assignmentKind: receipt.assignmentAuthority.kind,
+        intentGroup: receipt.assignmentAuthority.intentGroup,
+        receiptHash: receipt.receiptHash,
+      } : null,
+      evidenceCoverage: {
+        observationCount: count(row?.discovery_observations),
+        qualificationObservationCount:
+          count(row?.qualification_observations),
+        legacyUnboundQualificationCount:
+          count(row?.legacy_unbound_qualifications),
+        uniqueLeadCount: count(row?.unique_leads),
+        candidates: count(row?.candidates),
+        materializedCandidateCount: count(row?.candidates),
+        identityBound: count(row?.identity_bound),
+        appleResolvedCount: count(row?.apple_resolved),
+        versionCompatible: count(row?.version_compatible),
+        storefrontPlayable: count(row?.storefront_playable),
+        obligationCounts: row?.obligation_counts ?? {},
+        evidencePassed: count(row?.evidence_passed),
+        evidenceUnknown: count(row?.evidence_unknown),
+        evidenceFailed: count(row?.evidence_failed),
+        selected: count(row?.selected),
+        manifested: count(row?.manifested),
+        appendedCount: count(row?.appended_count),
+        reconciledPublished: row?.reconciled_published == null
+          ? null
+          : count(row.reconciled_published),
+      },
+    };
   }
 
   async getRun(id: string): Promise<ResearchRunView & Record<string, unknown>> {
@@ -16889,6 +23279,8 @@ export class Repository {
       queryPlan,
       resolution,
       guidanceAction,
+      repairReplayAction,
+      executionTruth,
     ] = await Promise.all([
       this.pool.query(
         `SELECT
@@ -16973,6 +23365,8 @@ export class Repository {
       this.getActiveQueryPlan(id),
       this.getRunResolution(id, row.status, row.phase),
       this.getPlaylistRunRescueGuidance(id),
+      this.getRunRepairReplayAction(id),
+      this.getRunExecutionTruthV1(id),
     ]);
     const count = counts.rows[0];
     const requestedTrackCount = progressOptionalCount(
@@ -17120,6 +23514,9 @@ export class Repository {
       guidanceAction,
       explore,
       resolution,
+      repairReplayAction,
+      executionRouteReceipt: executionTruth.executionRouteReceipt,
+      evidenceCoverage: executionTruth.evidenceCoverage,
       createdAt: date(row.created_at)?.toISOString(),
       updatedAt: date(row.updated_at)?.toISOString(),
       completedAt: date(row.completed_at)?.toISOString() ?? null,
@@ -17160,6 +23557,7 @@ export class Repository {
       matching_jobs: number;
       publication_jobs: number;
       publication_volume_rows: number;
+      orphan_playlist_rows: number;
     }>(
       `SELECT run.id run_id,run.status,run.phase,run.pipeline_version,run.auto_publish,
               query.plan_json query_plan_json,
@@ -17176,7 +23574,10 @@ export class Repository {
                WHERE run_id=run.id AND kind='publication') publication_jobs,
               (SELECT count(*)::int FROM publication_volumes volume
                JOIN manifests manifest ON manifest.id=volume.manifest_id
-               WHERE manifest.run_id=run.id) publication_volume_rows
+               WHERE manifest.run_id=run.id) publication_volume_rows,
+              (SELECT count(*)::int FROM orphan_playlists orphan
+               JOIN manifests manifest ON manifest.id=orphan.manifest_id
+               WHERE manifest.run_id=run.id) orphan_playlist_rows
        FROM run_accesses access
        JOIN research_runs run ON run.id=access.run_id AND run.deleted_at IS NULL
        LEFT JOIN run_active_query_plans active ON active.run_id=run.id
@@ -17264,6 +23665,7 @@ export class Repository {
           matchingJobs: Number(row.matching_jobs),
           publicationJobs: Number(row.publication_jobs),
           publicationVolumeRows: Number(row.publication_volume_rows),
+          orphanPlaylistRows: Number(row.orphan_playlist_rows),
         },
       });
     } catch (error) {
@@ -20985,10 +27387,14 @@ export class Repository {
       const persistedEvidence = await client.query<
         PersistedPipelineV3EvidenceBindingRow
       >(
-        `SELECT binding.candidate_id,binding.source_url,
+        `SELECT binding.candidate_id,
+                candidate.artist candidate_artist,binding.source_url,
                 source.provenance_root,binding.binding_kind,
                 binding.confidence,binding.provenance_path_json
          FROM track_scope_bindings binding
+         JOIN track_candidates candidate
+           ON candidate.id=binding.candidate_id
+          AND candidate.run_id=binding.run_id
          JOIN source_records source
            ON source.id=binding.source_record_id
           AND source.run_id=binding.run_id
@@ -20999,7 +27405,7 @@ export class Repository {
            AND binding.scope_axis<>'evidence'
            AND binding.pipeline_version='corpus_first_v3'
          ORDER BY binding.candidate_id,binding.id
-         FOR SHARE OF binding,source`,
+         FOR SHARE OF binding,candidate,source`,
         [
           input.runId,
           manifestTracks.map(({ candidateId }) => candidateId),
@@ -22711,6 +29117,7 @@ export class Repository {
             [input.runId],
           );
         }
+        await this.shadowPlaylistResolutionV1(client, input.runId);
         return { queued: false, state: "in_flight", runStatus: "publishing", jobId: job.id };
       }
       if (job?.status === "complete") {
@@ -22811,6 +29218,7 @@ export class Repository {
         "UPDATE research_runs SET status='publishing',phase='publication_queued',error=NULL,completed_at=NULL,updated_at=now() WHERE id=$1",
         [input.runId],
       );
+      await this.shadowPlaylistResolutionV1(client, input.runId);
       return { queued: true, state: "queued", runStatus: "publishing", jobId };
     });
   }
@@ -23957,10 +30365,36 @@ export class Repository {
     stageKey?: string;
     queueClass?: JobQueueClass;
     workerWriteFence?: ResearchProviderJobAuthorityV2;
+    /** Retained for callers; executable run work always requires a receipt. */
+    requireExecutionRouteReceipt?: boolean;
   }): Promise<{ id: string; created: boolean }> {
     const id = randomUUID();
     const dedupeKey = input.dedupeKey ?? input.runId ?? input.briefRequestId ?? randomUUID();
+    const requiresExecutionRouteReceipt = [
+      "research",
+      "matching",
+      "publication",
+    ].includes(input.kind);
     const schemaVersion = Number(await this.getSchemaVersion() ?? 0);
+    if (input.workerWriteFence) {
+      if (!input.runId) {
+        throw new HttpError(
+          409,
+          "Worker-fenced jobs require a research run",
+          "research_provider_retry_stale",
+        );
+      }
+      // Preserve the existing stale-lease error contract and avoid letting a
+      // secondary route diagnostic mask the primary write fence. The fenced
+      // transaction below repeats this check immediately before insertion.
+      await this.transaction(async (client) => {
+        await assertResearchProviderWriteFence(
+          client,
+          input.runId!,
+          input.workerWriteFence!,
+        );
+      });
+    }
     if (schemaVersion >= 14) {
       let pipelineVersion = input.pipelineVersion ?? "legacy_v1";
       let queryPlanRevisionId = input.queryPlanRevisionId ?? null;
@@ -23973,23 +30407,143 @@ export class Repository {
       if (input.runId) {
         const run = await this.pool.query<{
           pipeline_version: PipelineVersion;
-          query_plan_revision_id: string | null;
           query_plan_json: unknown;
+          query_plan_hash: string | null;
           release_manifest_canary_marker: unknown | null;
-        }>(
+          execution_route_receipt: unknown | null;
+          brief_contract_version: number;
+          brief_request_id: string | null;
+          brief_selection_pipeline_version: string | null;
+          root_lineage_id: string | null;
+          public_rollout_assignment_json: unknown | null;
+          release_canary_marker_present: boolean;
+          legacy_repair_run_admission: unknown | null;
+          technical_repair_run_admission: unknown | null;
+        } & ExecutionRouteContinuationDatabaseRowV1>(
           `SELECT r.pipeline_version,a.query_plan_revision_id,q.plan_json query_plan_json,
-                  marker.state_json release_manifest_canary_marker
+                  q.plan_hash query_plan_hash,q.revision query_plan_revision,
+                  q.selection_plan_id query_plan_selection_plan_id,
+                  q.graph_snapshot_id query_plan_graph_snapshot_id,
+                  q.engine query_plan_engine,
+                  q.parent_revision_id query_plan_parent_revision_id,
+                  parent.id parent_query_plan_revision_id,
+                  parent.revision parent_query_plan_revision,
+                  parent.selection_plan_id parent_query_plan_selection_plan_id,
+                  parent.graph_snapshot_id parent_query_plan_graph_snapshot_id,
+                  parent.engine parent_query_plan_engine,
+                  parent.status parent_query_plan_status,
+                  parent.plan_hash parent_query_plan_hash,
+                  parent.plan_json parent_query_plan_json,
+                  continuation.state_json continuation_checkpoint,
+                  continuation_job.id continuation_job_id,
+                  continuation_job.run_id continuation_job_run_id,
+                  continuation_job.kind continuation_job_kind,
+                  continuation_job.pipeline_version
+                    continuation_job_pipeline_version,
+                  continuation_job.query_plan_revision_id
+                    continuation_job_query_plan_revision_id,
+                  continuation_job.stage_key continuation_job_stage_key,
+                  continuation_job.payload_json continuation_job_payload,
+                  marker.state_json release_manifest_canary_marker,
+                  route_receipt.state_json execution_route_receipt,
+                  r.brief_contract_version,
+                  access.brief_request_id,
+                  COALESCE(
+                    brief.selection_plan_json->>'pipelineVersion',
+                    brief.pipeline_version
+                  ) brief_selection_pipeline_version,
+                  contract.contract_json->>'contractId' root_lineage_id,
+                  brief.public_rollout_assignment_json,
+                  (canary.id IS NOT NULL) release_canary_marker_present,
+                  legacy_repair.state_json legacy_repair_run_admission,
+                  technical_repair.state_json
+                    technical_repair_run_admission
            FROM research_runs r
            LEFT JOIN run_active_query_plans a ON a.run_id=r.id
            LEFT JOIN query_plan_revisions q ON q.id=a.query_plan_revision_id
+           LEFT JOIN query_plan_revisions parent
+             ON parent.id=q.parent_revision_id AND parent.run_id=r.id
+           LEFT JOIN research_checkpoints continuation
+             ON continuation.run_id=r.id
+            AND continuation.phase='partial_research_continuation'
+           LEFT JOIN job_queue continuation_job
+             ON continuation_job.id::text=continuation.state_json->>'jobId'
+            AND continuation_job.run_id=r.id
            LEFT JOIN research_checkpoints marker
              ON marker.run_id=r.id AND marker.phase=$2
+           LEFT JOIN research_checkpoints route_receipt
+             ON route_receipt.run_id=r.id AND route_receipt.phase=$3
+           LEFT JOIN research_checkpoints legacy_repair
+             ON legacy_repair.run_id=r.id AND legacy_repair.phase=$4
+           LEFT JOIN research_checkpoints technical_repair
+             ON technical_repair.run_id=r.id
+            AND technical_repair.phase=$5
+           LEFT JOIN LATERAL (
+             SELECT brief_request_id
+             FROM run_accesses
+             WHERE run_id=r.id AND deleted_at IS NULL
+             ORDER BY created_at DESC,id DESC LIMIT 1
+           ) access ON true
+           LEFT JOIN brief_requests brief ON brief.id=access.brief_request_id
+           LEFT JOIN playlist_contract_revisions contract
+             ON contract.id=r.active_playlist_contract_revision_id
+           LEFT JOIN release_canary_markers canary ON canary.run_id=r.id
            WHERE r.id=$1`,
-          [input.runId, RELEASE_MANIFEST_CANARY_MARKER_PHASE],
+          [
+            input.runId,
+            RELEASE_MANIFEST_CANARY_MARKER_PHASE,
+            EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+            LEGACY_REPAIR_RUN_ADMISSION_PHASE_V1,
+            TECHNICAL_REPAIR_RUN_ADMISSION_PHASE_V1,
+          ],
         );
         if (run.rows[0]) {
           pipelineVersion = run.rows[0].pipeline_version;
           queryPlanRevisionId ??= run.rows[0].query_plan_revision_id;
+          let publicRolloutAssignment: PersistedPublicRolloutAssignmentV1 | null;
+          try {
+            publicRolloutAssignment = parsePublicRolloutAssignmentV1(
+              run.rows[0].public_rollout_assignment_json,
+            );
+          } catch {
+            executionRouteReceiptMismatch();
+          }
+          const contractVersion = Number(
+            run.rows[0].brief_contract_version,
+          ) === 3
+            ? 3
+            : Number(run.rows[0].brief_contract_version) === 2
+              ? 2
+              : 1;
+          assertExecutionRouteReceiptRuntimeBindingV1({
+            value: run.rows[0].execution_route_receipt,
+            // New executable work on every contract/route must carry its
+            // immutable admission receipt. Legacy compatibility is bounded to
+            // the exact jobs inventoried before deployment and is enforced at
+            // lease time; it never authorizes a new enqueue.
+            required: requiresExecutionRouteReceipt
+              || input.requireExecutionRouteReceipt === true,
+            runId: input.runId,
+            briefRequestId: run.rows[0].brief_request_id,
+            briefSelectionPipelineVersion:
+              run.rows[0].brief_selection_pipeline_version,
+            rootLineageId: run.rows[0].root_lineage_id,
+            contractVersion,
+            executionRoute: pipelineVersion,
+            queryPlan: isQueryPlanV3(run.rows[0].query_plan_json)
+              ? run.rows[0].query_plan_json
+              : null,
+            persistedQueryPlanHash: run.rows[0].query_plan_hash,
+            publicRolloutAssignment,
+            releaseCanaryMarkerPresent:
+              run.rows[0].release_canary_marker_present,
+            legacyRepairRunAdmission:
+              run.rows[0].legacy_repair_run_admission,
+            technicalRepairRunAdmission:
+              run.rows[0].technical_repair_run_admission,
+            continuationBinding:
+              executionRouteContinuationRuntimeBindingV1(run.rows[0]),
+          });
           const manifestCanary = parseReleaseManifestCanaryMarker(
             run.rows[0].release_manifest_canary_marker,
           );
@@ -24023,6 +30577,9 @@ export class Repository {
               ? "deep"
               : "interactive";
           }
+        } else if (requiresExecutionRouteReceipt
+          || input.requireExecutionRouteReceipt === true) {
+          executionRouteReceiptMismatch();
         }
       }
       if (!input.runId && ["research", "matching"].includes(input.kind)) {
@@ -24501,8 +31058,17 @@ export class Repository {
       // that lane, preventing an endless stream of fast jobs from starving it.
       const selected = await client.query(
         `SELECT candidate.*,
+                candidate_plan.plan_hash query_plan_hash,
+                NULLIF(
+                  candidate_plan.plan_json->>'strategySemanticHash',
+                  ''
+                ) strategy_semantic_hash,
                 ${effectiveMinimumWorkerProtocol} AS effective_minimum_worker_protocol
-         FROM job_queue candidate WHERE
+         FROM job_queue candidate
+         LEFT JOIN query_plan_revisions candidate_plan
+           ON candidate_plan.id=candidate.query_plan_revision_id
+          AND candidate_plan.run_id=candidate.run_id
+         WHERE
            ((candidate.status='queued' AND candidate.available_at<=now()) OR (candidate.status='leased' AND candidate.lease_expires_at<=now()))
            AND ${effectiveMinimumWorkerProtocol}<=$1
            AND candidate.pipeline_version=ANY($2::varchar[])
@@ -24563,6 +31129,178 @@ export class Repository {
       );
       const job = selected.rows[0];
       if (!job) return null;
+      if (
+        schemaVersion >= 17
+        && job.run_id
+        && ["research", "matching", "publication"].includes(job.kind)
+      ) {
+        const route = await client.query<{
+          query_plan_json: unknown;
+          query_plan_hash: string | null;
+          execution_route_receipt: unknown | null;
+          brief_contract_version: number;
+          brief_request_id: string | null;
+          brief_selection_pipeline_version: string | null;
+          root_lineage_id: string | null;
+          public_rollout_assignment_json: unknown | null;
+          release_canary_marker_present: boolean;
+          legacy_repair_run_admission: unknown | null;
+          technical_repair_run_admission: unknown | null;
+          active_contract_revision_id: string | null;
+          legacy_route_drain: unknown | null;
+        } & ExecutionRouteContinuationDatabaseRowV1>(
+          `SELECT query.plan_json query_plan_json,
+                  query.plan_hash query_plan_hash,
+                  active.query_plan_revision_id,
+                  query.revision query_plan_revision,
+                  query.selection_plan_id query_plan_selection_plan_id,
+                  query.graph_snapshot_id query_plan_graph_snapshot_id,
+                  query.engine query_plan_engine,
+                  query.parent_revision_id query_plan_parent_revision_id,
+                  parent.id parent_query_plan_revision_id,
+                  parent.revision parent_query_plan_revision,
+                  parent.selection_plan_id
+                    parent_query_plan_selection_plan_id,
+                  parent.graph_snapshot_id
+                    parent_query_plan_graph_snapshot_id,
+                  parent.engine parent_query_plan_engine,
+                  parent.status parent_query_plan_status,
+                  parent.plan_hash parent_query_plan_hash,
+                  parent.plan_json parent_query_plan_json,
+                  continuation.state_json continuation_checkpoint,
+                  continuation_job.id continuation_job_id,
+                  continuation_job.run_id continuation_job_run_id,
+                  continuation_job.kind continuation_job_kind,
+                  continuation_job.pipeline_version
+                    continuation_job_pipeline_version,
+                  continuation_job.query_plan_revision_id
+                    continuation_job_query_plan_revision_id,
+                  continuation_job.stage_key continuation_job_stage_key,
+                  continuation_job.payload_json continuation_job_payload,
+                  receipt.state_json execution_route_receipt,
+                  run.brief_contract_version,
+                  run.active_playlist_contract_revision_id
+                    active_contract_revision_id,
+                  access.brief_request_id,
+                  COALESCE(
+                    brief.selection_plan_json->>'pipelineVersion',
+                    brief.pipeline_version
+                  ) brief_selection_pipeline_version,
+                  contract.contract_json->>'contractId' root_lineage_id,
+                  brief.public_rollout_assignment_json,
+                  (canary.id IS NOT NULL) release_canary_marker_present,
+                  legacy_repair.state_json legacy_repair_run_admission,
+                  technical_repair.state_json
+                    technical_repair_run_admission
+                  ,legacy_route_drain.state_json legacy_route_drain
+           FROM research_runs run
+           LEFT JOIN run_active_query_plans active ON active.run_id=run.id
+           LEFT JOIN query_plan_revisions query
+             ON query.id=active.query_plan_revision_id
+           LEFT JOIN query_plan_revisions parent
+             ON parent.id=query.parent_revision_id AND parent.run_id=run.id
+           LEFT JOIN research_checkpoints continuation
+             ON continuation.run_id=run.id
+            AND continuation.phase='partial_research_continuation'
+           LEFT JOIN job_queue continuation_job
+             ON continuation_job.id::text=continuation.state_json->>'jobId'
+            AND continuation_job.run_id=run.id
+           LEFT JOIN research_checkpoints receipt
+             ON receipt.run_id=run.id AND receipt.phase=$2
+           LEFT JOIN research_checkpoints legacy_repair
+             ON legacy_repair.run_id=run.id AND legacy_repair.phase=$3
+           LEFT JOIN research_checkpoints technical_repair
+             ON technical_repair.run_id=run.id
+            AND technical_repair.phase=$4
+           LEFT JOIN research_checkpoints legacy_route_drain
+             ON legacy_route_drain.run_id=run.id
+            AND legacy_route_drain.phase=$5
+           LEFT JOIN LATERAL (
+             SELECT brief_request_id
+             FROM run_accesses
+             WHERE run_id=run.id AND deleted_at IS NULL
+             ORDER BY created_at DESC,id DESC LIMIT 1
+           ) access ON true
+           LEFT JOIN brief_requests brief ON brief.id=access.brief_request_id
+           LEFT JOIN playlist_contract_revisions contract
+             ON contract.id=run.active_playlist_contract_revision_id
+           LEFT JOIN release_canary_markers canary ON canary.run_id=run.id
+           WHERE run.id=$1
+           FOR UPDATE OF run`,
+          [
+            job.run_id,
+            EXECUTION_ROUTE_RECEIPT_PHASE_V1,
+            LEGACY_REPAIR_RUN_ADMISSION_PHASE_V1,
+            TECHNICAL_REPAIR_RUN_ADMISSION_PHASE_V1,
+            LEGACY_EXECUTION_ROUTE_DRAIN_PHASE_V1,
+          ],
+        );
+        const binding = route.rows[0];
+        if (!binding) executionRouteReceiptMismatch();
+        let publicRolloutAssignment:
+          PersistedPublicRolloutAssignmentV1 | null;
+        try {
+          publicRolloutAssignment = parsePublicRolloutAssignmentV1(
+            binding.public_rollout_assignment_json,
+          );
+        } catch {
+          executionRouteReceiptMismatch();
+        }
+        const contractVersion = Number(binding.brief_contract_version) === 3
+          ? 3
+          : Number(binding.brief_contract_version) === 2
+            ? 2
+            : 1;
+        const currentReleaseIdentity = executorReleaseIdentity;
+        const routeReceipt = assertExecutionRouteReceiptRuntimeBindingV1({
+          value: binding.execution_route_receipt,
+          // Missing Contract-3 authority is evaluated against one immutable
+          // pre-deployment inventory below. There is no timestamp-only or
+          // implicit legacy escape hatch.
+          required: false,
+          runId: job.run_id,
+          briefRequestId: binding.brief_request_id,
+          briefSelectionPipelineVersion:
+            binding.brief_selection_pipeline_version,
+          rootLineageId: binding.root_lineage_id,
+          contractVersion,
+          executionRoute: job.pipeline_version,
+          queryPlan: isQueryPlanV3(binding.query_plan_json)
+            ? binding.query_plan_json
+            : null,
+          persistedQueryPlanHash: binding.query_plan_hash,
+          publicRolloutAssignment,
+          releaseCanaryMarkerPresent:
+            binding.release_canary_marker_present,
+          legacyRepairRunAdmission:
+            binding.legacy_repair_run_admission,
+          technicalRepairRunAdmission:
+            binding.technical_repair_run_admission,
+          continuationBinding:
+            executionRouteContinuationRuntimeBindingV1(binding),
+        });
+        if (
+          routeReceipt === null
+          && !legacyExecutionRouteDrainAuthorizesJobV1({
+            value: binding.legacy_route_drain,
+            runId: job.run_id,
+            contractRevisionId: binding.active_contract_revision_id,
+            executionRoute: job.pipeline_version,
+            targetReleaseRevision:
+              currentReleaseIdentity.executorRevision,
+            targetSemanticConfigurationHash:
+              currentReleaseIdentity.semanticExecutionConfigurationHash,
+            jobId: job.id,
+            kind: job.kind,
+            queryPlanRevisionId: job.query_plan_revision_id,
+            queryPlanHash: binding.query_plan_hash,
+            stageKey: job.stage_key,
+            createdAt: job.created_at,
+          })
+        ) {
+          executionRouteReceiptMismatch();
+        }
+      }
       const expiresAt = new Date(Date.now() + Math.max(30_000, leaseMs));
       const updated = await client.query(
         `UPDATE job_queue SET status='leased',lease_owner=$2,lease_expires_at=$3,attempts=attempts+1,updated_at=now()
@@ -24582,6 +31320,8 @@ export class Repository {
         pipelineVersion: row.pipeline_version,
         minimumWorkerProtocol: Number(job.effective_minimum_worker_protocol ?? row.minimum_worker_protocol),
         queryPlanRevisionId: row.query_plan_revision_id ?? null,
+        queryPlanHash: job.query_plan_hash ?? null,
+        strategySemanticHash: job.strategy_semantic_hash ?? null,
         requiredExecutorCapabilityHash:
           row.required_executor_capability_hash ?? null,
         requiredExecutorCapabilityVector:
@@ -27982,6 +34722,12 @@ export class Repository {
           playlistContractRevisionId: immutable.query_plan_json.playlistContractRevisionId,
           playlistContractSemanticHash: immutable.query_plan_json.playlistContractSemanticHash,
           playlistContractCompilerVersion: immutable.query_plan_json.playlistContractCompilerVersion,
+          guidancePolicyVersion:
+            immutable.query_plan_json.guidancePolicyVersion === "adaptive_guidance_v5"
+              ? "adaptive_guidance_v5"
+              : immutable.query_plan_json.guidancePolicyVersion === "adaptive_guidance_v4"
+                ? "adaptive_guidance_v4"
+                : undefined,
         },
       );
       if (stableStringify(normalizedQueryPlanV3Invariant(
@@ -28093,6 +34839,12 @@ export class Repository {
         playlistContractRevisionId: queryPlan.playlistContractRevisionId,
         playlistContractSemanticHash: queryPlan.playlistContractSemanticHash,
         playlistContractCompilerVersion: queryPlan.playlistContractCompilerVersion,
+        guidancePolicyVersion:
+          queryPlan.guidancePolicyVersion === "adaptive_guidance_v5"
+            ? "adaptive_guidance_v5"
+            : queryPlan.guidancePolicyVersion === "adaptive_guidance_v4"
+              ? "adaptive_guidance_v4"
+              : undefined,
       })
       : queryPlanV3ExecutionProjection(plan, queryPlan);
     const executionProjectionMatches = stableStringify(normalizedQueryPlanV3Invariant(
@@ -28420,6 +35172,12 @@ export class Repository {
             playlistContractRevisionId: immutable.query_plan_json.playlistContractRevisionId,
             playlistContractSemanticHash: immutable.query_plan_json.playlistContractSemanticHash,
             playlistContractCompilerVersion: immutable.query_plan_json.playlistContractCompilerVersion,
+            guidancePolicyVersion:
+              immutable.query_plan_json.guidancePolicyVersion === "adaptive_guidance_v5"
+                ? "adaptive_guidance_v5"
+                : immutable.query_plan_json.guidancePolicyVersion === "adaptive_guidance_v4"
+                  ? "adaptive_guidance_v4"
+                  : undefined,
           },
         );
       const canonicalContractMatches = !isCanonicalQueryPlanV3SchemaVersion(
@@ -28835,6 +35593,48 @@ export class Repository {
           }
         }
         const semanticRevision = revisions.at(-1)?.revision ?? 1;
+        const continuationSourceLeadKeys = new Set<string>();
+        if (queryPlan.continuation) {
+          const sourceLeads = await client.query<{
+            strategy_id: string;
+            candidate_key: string;
+          }>(
+            `SELECT strategy_id,candidate_key
+             FROM pipeline_candidate_leads
+             WHERE run_id=$1 AND query_plan_revision_id=$2
+             ORDER BY strategy_id,candidate_key`,
+            [
+              runId,
+              queryPlan.continuation.sourceQueryPlanRevisionId,
+            ],
+          );
+          const cumulativeResultKeys = new Set(
+            (result.candidateLeads ?? []).map(({ candidateKey }) => (
+              candidateKey
+            )),
+          );
+          if (queryPlan.schemaVersion >= 6
+            && sourceLeads.rows.some(({ candidate_key: candidateKey }) => (
+              !cumulativeResultKeys.has(candidateKey)
+            ))) {
+            throw Object.assign(
+              new HttpError(
+                409,
+                "Pipeline V3 continuation omitted authenticated source lead telemetry",
+                "pipeline_v3_result_invalid",
+              ),
+              {
+                operatorCode:
+                  "pipeline_v3_result_invalid.continuation_lead_omission",
+              },
+            );
+          }
+          for (const row of sourceLeads.rows) {
+            continuationSourceLeadKeys.add(
+              `${row.strategy_id}\u0000${row.candidate_key}`,
+            );
+          }
+        }
         for (const lead of result.candidateLeads ?? []) {
           const strategy = result.strategies.find(({ id }) => id === lead.strategyId);
           const provider = strategy?.discoveryDependencyIds[0] ?? "orchestration_local";
@@ -28879,6 +35679,15 @@ export class Repository {
               ),
               { operatorCode: "pipeline_v3_result_invalid.lead_provenance" },
             );
+          }
+          // Source checkpoint leads are cumulative telemetry, not observations
+          // made by this successor. They were already persisted under the
+          // authenticated source plan/attempt and must never be rebound to
+          // the continuation attempt.
+          if (continuationSourceLeadKeys.has(
+            `${lead.strategyId}\u0000${lead.candidateKey}`,
+          )) {
+            continue;
           }
           await client.query(
             supportsSourceDiversity
@@ -28962,12 +35771,24 @@ export class Repository {
                ON CONFLICT(
                  run_id,contract_revision_id,provider,strategy_id,identity_hint_hash
                ) DO UPDATE SET
-                 execution_attempt_id=EXCLUDED.execution_attempt_id,
                  dependency_ids=EXCLUDED.dependency_ids,
                  provenance_roots=EXCLUDED.provenance_roots,
                  cache_origin=EXCLUDED.cache_origin,
                  source_fresh_until=EXCLUDED.source_fresh_until,
-                 lead_json=EXCLUDED.lead_json,
+                 lead_json=EXCLUDED.lead_json || CASE
+                   WHEN playlist_discovery_leads.lead_json->>'queryPlanHash'
+                          =(EXCLUDED.lead_json->>'queryPlanHash')
+                     AND jsonb_typeof(
+                       playlist_discovery_leads.lead_json
+                         ->'observationReceiptHashes'
+                     )='array'
+                   THEN jsonb_build_object(
+                     'observationReceiptHashes',
+                     playlist_discovery_leads.lead_json
+                       ->'observationReceiptHashes'
+                   )
+                   ELSE '{}'::jsonb
+                 END,
                  status=CASE
                    WHEN playlist_discovery_leads.status IN ('qualified','rejected','revoked')
                    THEN playlist_discovery_leads.status
@@ -28983,8 +35804,20 @@ export class Repository {
                ON CONFLICT(
                  run_id,contract_revision_id,provider,strategy_id,identity_hint_hash
                ) DO UPDATE SET
-                 execution_attempt_id=EXCLUDED.execution_attempt_id,
-                 lead_json=EXCLUDED.lead_json,
+                 lead_json=EXCLUDED.lead_json || CASE
+                   WHEN playlist_discovery_leads.lead_json->>'queryPlanHash'
+                          =(EXCLUDED.lead_json->>'queryPlanHash')
+                     AND jsonb_typeof(
+                       playlist_discovery_leads.lead_json
+                         ->'observationReceiptHashes'
+                     )='array'
+                   THEN jsonb_build_object(
+                     'observationReceiptHashes',
+                     playlist_discovery_leads.lead_json
+                       ->'observationReceiptHashes'
+                   )
+                   ELSE '{}'::jsonb
+                 END,
                  status=CASE
                    WHEN playlist_discovery_leads.status IN ('qualified','rejected','revoked')
                    THEN playlist_discovery_leads.status
@@ -29015,6 +35848,7 @@ export class Repository {
                   citationHashes: lead.citationHashes.slice(0, 32),
                   predicateCoverage: lead.predicateCoverage.slice(0, 64),
                   semanticRevision,
+                  queryPlanHash: immutable.query_plan_hash,
                 }),
                 lead.rejectionCode === null ? "qualifying" : "rejected",
               ] : [
@@ -29036,27 +35870,78 @@ export class Repository {
                   citationHashes: lead.citationHashes.slice(0, 32),
                   predicateCoverage: lead.predicateCoverage.slice(0, 64),
                   semanticRevision,
+                  queryPlanHash: immutable.query_plan_hash,
                 }),
                 lead.rejectionCode === null ? "qualifying" : "rejected",
               ],
             );
             if (lead.rejectionCode !== null) {
+              const materializedRejectedCandidate =
+                await client.query<{ id: string }>(
+                  `INSERT INTO track_candidates(
+                     id,run_id,canonical_key,duplicate_cluster_key,artist,title,
+                     album,outcome,candidate_stage,pipeline_version,
+                     policy_version)
+                   VALUES($1,$2,$3,NULL,$4,$5,$6,'unsupported','discovered',
+                     'corpus_first_v3','corpus_first_v3_policy_v1')
+                   ON CONFLICT(run_id,canonical_key) DO UPDATE SET
+                     outcome=CASE
+                       WHEN track_candidates.outcome='accepted'
+                       THEN track_candidates.outcome
+                       ELSE 'unsupported'
+                     END
+                   WHERE track_candidates.artist=EXCLUDED.artist
+                     AND track_candidates.title=EXCLUDED.title
+                     AND COALESCE(track_candidates.album,'')
+                           =COALESCE(EXCLUDED.album,'')
+                     AND track_candidates.recording_family_id IS NULL
+                     AND track_candidates.pipeline_version
+                           =EXCLUDED.pipeline_version
+                     AND track_candidates.policy_version
+                           =EXCLUDED.policy_version
+                   RETURNING id`,
+                  [
+                    deterministicUuid({
+                      kind: "scheduler_rejected_candidate",
+                      runId,
+                      candidateKey: lead.candidateKey,
+                    }),
+                    runId,
+                    lead.candidateKey,
+                    lead.artist.slice(0, 240),
+                    lead.title.slice(0, 240),
+                    lead.album?.slice(0, 240) ?? null,
+                  ],
+                );
+              const rejectedCandidateId =
+                materializedRejectedCandidate.rows[0]?.id;
+              if (!rejectedCandidateId) {
+                throw new CanonicalExecutionIntegrityError(
+                  "pipeline_v3_scheduler_rejected_candidate_identity_conflict",
+                );
+              }
               const qualificationHash = sha256Hex(stableStringify({
                 kind: "scheduler_rejection",
                 rejectionCode: lead.rejectionCode,
                 predicateCoverage: lead.predicateCoverage,
               }));
-              await client.query(
+              const rejectedQualification = await client.query<{
+                candidate_id: string | null;
+              }>(
                 `INSERT INTO playlist_qualification_records(
                    id,run_id,contract_revision_id,discovery_lead_id,candidate_id,
                    stable_identity_hash,storefront,predicate_results_json,
                    evidence_record_ids_json,quality_result_json,catalog_result_json,
                    decision,qualification_hash)
-                 VALUES($1,$2,$3,$4,NULL,$5,$6,$7::jsonb,'[]'::jsonb,
-                   $8::jsonb,$9::jsonb,'failed',$10)
+                 VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,'[]'::jsonb,
+                   $9::jsonb,$10::jsonb,'failed',$11)
                  ON CONFLICT(
                    run_id,contract_revision_id,stable_identity_hash,qualification_hash
-                 ) DO NOTHING`,
+                 ) DO UPDATE SET
+                   candidate_id=playlist_qualification_records.candidate_id
+                 WHERE playlist_qualification_records.candidate_id=
+                   EXCLUDED.candidate_id
+                 RETURNING candidate_id`,
                 [
                   deterministicUuid({
                     kind: "playlist_qualification_record",
@@ -29068,6 +35953,7 @@ export class Repository {
                   runId,
                   recoveryAuthority.contractRevisionId,
                   discoveryLeadId,
+                  rejectedCandidateId,
                   lead.candidateKey,
                   plan.storefront,
                   JSON.stringify({
@@ -29084,6 +35970,34 @@ export class Repository {
                   qualificationHash,
                 ],
               );
+              if (!rejectedQualification.rows[0]) {
+                const legacy = await client.query<{
+                  candidate_id: string | null;
+                }>(
+                  `SELECT candidate_id
+                   FROM playlist_qualification_records
+                   WHERE run_id=$1 AND contract_revision_id=$2
+                     AND stable_identity_hash=$3
+                     AND qualification_hash=$4
+                   FOR SHARE`,
+                  [
+                    runId,
+                    recoveryAuthority.contractRevisionId,
+                    lead.candidateKey,
+                    qualificationHash,
+                  ],
+                );
+                if (legacy.rows[0]?.candidate_id === null) {
+                  throw new HttpError(
+                    409,
+                    "Legacy unbound qualification requires a linked successor",
+                    "pipeline_v3_legacy_unbound_qualification_requires_successor",
+                  );
+                }
+                throw new CanonicalExecutionIntegrityError(
+                  "pipeline_v3_qualification_candidate_binding_conflict",
+                );
+              }
             }
           }
         }
@@ -29269,9 +36183,10 @@ export class Repository {
             if (lead.rows[0]) {
               await client.query(
                 `UPDATE playlist_discovery_leads
-                 SET status='qualified',execution_attempt_id=$2,updated_at=now()
-                 WHERE id=$1 AND evidence_eligible=false`,
-                [lead.rows[0].id, recoveryAuthority.executionAttemptId],
+                 SET status='qualified',updated_at=now()
+                 WHERE id=$1 AND evidence_eligible=false
+                   AND status NOT IN ('qualified','rejected','revoked')`,
+                [lead.rows[0].id],
               );
             }
           }
@@ -29335,39 +36250,111 @@ export class Repository {
           );
         }
         const proposedFamilyId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", familyKey: track.recordingFamilyKey });
-        const canonicalKey = `v3:${sha256Hex(stableStringify({ runId, sourceCandidateId: track.candidateId, familyKey: track.recordingFamilyKey }))}`;
+        const stableIdentityHash = sha256Hex(stableStringify({
+          kind: "recording_family",
+          recordingFamilyKey: track.recordingFamilyKey,
+        }));
+        const candidateIdentity = {
+          runId,
+          sourceCandidateId: track.candidateId,
+          recordingFamilyKey: track.recordingFamilyKey,
+          stableIdentityHash,
+        };
+        const canonicalKey =
+          pipelineV3CandidateCanonicalKey(candidateIdentity);
         const family = await client.query<{ id: string }>(
           `INSERT INTO recording_families(
              id,run_id,family_key,canonical_artist,canonical_title,version_class,metadata_json,
              pipeline_version,policy_version)
            VALUES($1,$2,$3,$4,$5,'canonical',$6::jsonb,'corpus_first_v3','corpus_first_v3_policy_v1')
            ON CONFLICT(run_id,family_key) DO UPDATE SET
-             canonical_artist=EXCLUDED.canonical_artist,canonical_title=EXCLUDED.canonical_title,
-             metadata_json=EXCLUDED.metadata_json,updated_at=now()
+             metadata_json=CASE
+               WHEN NULLIF(
+                      recording_families.metadata_json->>'album',
+                      ''
+                    ) IS NULL
+                 AND NULLIF(EXCLUDED.metadata_json->>'album','') IS NOT NULL
+               THEN recording_families.metadata_json
+                    || jsonb_build_object(
+                         'album',
+                         EXCLUDED.metadata_json->>'album'
+                       )
+               ELSE recording_families.metadata_json
+             END,
+             updated_at=recording_families.updated_at
+           WHERE recording_families.canonical_artist
+                   =EXCLUDED.canonical_artist
+             AND recording_families.canonical_title
+                   =EXCLUDED.canonical_title
+             AND (
+               NULLIF(
+                 recording_families.metadata_json->>'album',
+                 ''
+               ) IS NULL
+               OR NULLIF(EXCLUDED.metadata_json->>'album','') IS NULL
+               OR recording_families.metadata_json->>'album'
+                    =EXCLUDED.metadata_json->>'album'
+             )
+             AND recording_families.pipeline_version
+                   =EXCLUDED.pipeline_version
+             AND recording_families.policy_version=EXCLUDED.policy_version
            RETURNING id`,
           [proposedFamilyId, runId, track.recordingFamilyKey, track.artist.slice(0, 240), track.title.slice(0, 240), JSON.stringify({ album: track.album, sourceRank: track.sourceRank })],
         );
-        const familyId = family.rows[0]!.id;
-        const proposedCandidateId = deterministicUuid({ runId, pipelineVersion: "corpus_first_v3", candidateId: track.candidateId, familyKey: track.recordingFamilyKey });
+        const familyId = family.rows[0]?.id;
+        if (!familyId) {
+          throw new CanonicalExecutionIntegrityError(
+            "pipeline_v3_recording_family_identity_conflict",
+          );
+        }
+        const proposedCandidateId =
+          pipelineV3CandidateDatabaseId(candidateIdentity);
         const candidate = await client.query<{ id: string }>(
           `INSERT INTO track_candidates(
              id,run_id,canonical_key,duplicate_cluster_key,artist,title,album,outcome,
              recording_family_id,candidate_stage,pipeline_version,policy_version)
            VALUES($1,$2,$3,$4,$5,$6,$7,'accepted',$8,'discovered','corpus_first_v3','corpus_first_v3_policy_v1')
            ON CONFLICT(run_id,canonical_key) DO UPDATE SET
-             artist=EXCLUDED.artist,title=EXCLUDED.title,album=EXCLUDED.album,
-             recording_family_id=EXCLUDED.recording_family_id,outcome='accepted'
+             recording_family_id=COALESCE(
+               track_candidates.recording_family_id,
+               EXCLUDED.recording_family_id
+             ),
+             outcome='accepted'
+           WHERE track_candidates.artist=EXCLUDED.artist
+             AND track_candidates.title=EXCLUDED.title
+             AND COALESCE(track_candidates.album,'')
+                   =COALESCE(EXCLUDED.album,'')
+             AND (
+               track_candidates.recording_family_id IS NULL
+               OR track_candidates.recording_family_id
+                    =EXCLUDED.recording_family_id
+             )
+             AND track_candidates.pipeline_version
+                   =EXCLUDED.pipeline_version
+             AND track_candidates.policy_version=EXCLUDED.policy_version
            RETURNING id`,
           [proposedCandidateId, runId, canonicalKey, track.recordingFamilyKey.slice(0, 500), track.artist.slice(0, 240), track.title.slice(0, 240), track.album?.slice(0, 240) ?? null, familyId],
         );
-        const candidateId = candidate.rows[0]!.id;
-        await client.query(
+        const candidateId = candidate.rows[0]?.id;
+        if (!candidateId) {
+          throw new CanonicalExecutionIntegrityError(
+            "pipeline_v3_candidate_identity_conflict",
+          );
+        }
+        const familyCandidate = await client.query<{ candidate_id: string }>(
           `INSERT INTO recording_family_candidates(recording_family_id,candidate_id,relationship)
            VALUES($1,$2,'qualified_member') ON CONFLICT(candidate_id) DO UPDATE SET
-             recording_family_id=EXCLUDED.recording_family_id,
-             relationship=EXCLUDED.relationship`,
+             relationship=EXCLUDED.relationship
+           WHERE recording_family_candidates.recording_family_id
+                   =EXCLUDED.recording_family_id
+           RETURNING candidate_id`,
           [familyId, candidateId],
         );
+        if (familyCandidate.rows[0]?.candidate_id !== candidateId) {
+          throw new CanonicalExecutionIntegrityError(
+            "pipeline_v3_recording_family_candidate_identity_conflict",
+          );
+        }
         const proposedCatalogIdentityId = deterministicUuid({ familyId, provider: "apple", storefront: plan.storefront, catalogId: track.appleSongId });
         const catalogIdentity = await client.query<{ id: string }>(
           `INSERT INTO recording_catalog_identities(
@@ -29376,19 +36363,42 @@ export class Repository {
            VALUES($1,$2,'apple',$3,$4,true,$5,$6,$7,$8,$9::jsonb)
            ON CONFLICT(recording_family_id,provider,storefront,catalog_id) DO UPDATE SET
              is_preferred=true,identity_confidence=GREATEST(recording_catalog_identities.identity_confidence,EXCLUDED.identity_confidence),
-             metadata_json=EXCLUDED.metadata_json,updated_at=now()
+             updated_at=now()
+           WHERE recording_catalog_identities.artist=EXCLUDED.artist
+             AND recording_catalog_identities.title=EXCLUDED.title
+             AND COALESCE(recording_catalog_identities.album,'')
+                   =COALESCE(EXCLUDED.album,'')
            RETURNING id`,
           [proposedCatalogIdentityId, familyId, plan.storefront, track.appleSongId.slice(0, 160), Math.max(0, Math.min(1, track.catalogConfidence)), track.artist.slice(0, 240), track.title.slice(0, 240), track.album?.slice(0, 240) ?? null, JSON.stringify({ compatible: true, versionCompatible: true })],
         );
-        const catalogIdentityId = catalogIdentity.rows[0]!.id;
-        await client.query(
+        const catalogIdentityId = catalogIdentity.rows[0]?.id;
+        if (!catalogIdentityId) {
+          throw new CanonicalExecutionIntegrityError(
+            "pipeline_v3_catalog_identity_conflict",
+          );
+        }
+        const catalogMatch = await client.query<{ candidate_id: string }>(
           `INSERT INTO catalog_matches(
              id,run_id,candidate_id,status,basis,score,catalog_id,song_json,alternatives_json,reviewed_at)
            VALUES($1,$2,$3,'accepted','Pipeline V3 governed catalog identity',$4,$5,$6::jsonb,'[]'::jsonb,now())
            ON CONFLICT(candidate_id) DO UPDATE SET status='accepted',basis=EXCLUDED.basis,
-             score=EXCLUDED.score,catalog_id=EXCLUDED.catalog_id,song_json=EXCLUDED.song_json,reviewed_at=now()`,
+             score=EXCLUDED.score,reviewed_at=now()
+           WHERE catalog_matches.run_id=EXCLUDED.run_id
+             AND catalog_matches.catalog_id=EXCLUDED.catalog_id
+             AND COALESCE(catalog_matches.song_json->>'artistName','')
+                   =COALESCE(EXCLUDED.song_json->>'artistName','')
+             AND COALESCE(catalog_matches.song_json->>'name','')
+                   =COALESCE(EXCLUDED.song_json->>'name','')
+             AND COALESCE(catalog_matches.song_json->>'albumName','')
+                   =COALESCE(EXCLUDED.song_json->>'albumName','')
+           RETURNING candidate_id`,
           [deterministicUuid({ runId, candidateId, kind: "catalog_match" }), runId, candidateId, Math.max(0, Math.min(1, track.catalogConfidence)), track.appleSongId.slice(0, 100), JSON.stringify({ id: track.appleSongId, name: track.title, artistName: track.artist, albumName: track.album ?? "" })],
         );
+        if (catalogMatch.rows[0]?.candidate_id !== candidateId) {
+          throw new CanonicalExecutionIntegrityError(
+            "pipeline_v3_candidate_catalog_identity_conflict",
+          );
+        }
         const bindings = attestedBindingsByTrack.get(track) ?? [];
         for (const binding of bindings) {
           const canonicalClauses =
@@ -29538,15 +36548,36 @@ export class Repository {
           // Outcomes are immutable. Revocation changes lifecycle state only;
           // the decision participating in the qualification hash is never
           // rewritten.
+          const legacyUnbound = await client.query<{ id: string }>(
+            `SELECT id
+             FROM playlist_qualification_records
+             WHERE run_id=$1 AND contract_revision_id=$2
+               AND stable_identity_hash=$3
+               AND candidate_id IS NULL AND revoked_at IS NULL
+             ORDER BY qualified_at DESC,id DESC
+             LIMIT 1
+             FOR SHARE`,
+            [
+              runId,
+              recoveryAuthority.contractRevisionId,
+              qualification.stableIdentityHash,
+            ],
+          );
+          if (legacyUnbound.rows[0]) {
+            throw new HttpError(
+              409,
+              "Legacy unbound qualification requires a linked successor",
+              "pipeline_v3_legacy_unbound_qualification_requires_successor",
+            );
+          }
           await client.query(
             `UPDATE playlist_qualification_records
-             SET candidate_id=COALESCE(candidate_id,$5),
-                 revoked_at=COALESCE(revoked_at,now())
+             SET revoked_at=COALESCE(revoked_at,now())
              WHERE run_id=$1 AND contract_revision_id=$2
                AND stable_identity_hash=$3
                AND decision='qualified' AND revoked_at IS NULL
                AND qualification_hash<>$4
-               AND (candidate_id IS NULL OR candidate_id=$5)`,
+               AND candidate_id=$5`,
             [
               runId,
               recoveryAuthority.contractRevisionId,
@@ -29576,12 +36607,11 @@ export class Repository {
                run_id,contract_revision_id,stable_identity_hash,qualification_hash
              ) DO UPDATE SET
                discovery_lead_id=EXCLUDED.discovery_lead_id,
-               candidate_id=COALESCE(
-                 playlist_qualification_records.candidate_id,
-                 EXCLUDED.candidate_id
-               ),
+               candidate_id=playlist_qualification_records.candidate_id,
                storefront=EXCLUDED.storefront,
                revoked_at=NULL
+             WHERE playlist_qualification_records.candidate_id
+                     =EXCLUDED.candidate_id
              RETURNING candidate_id,storefront,predicate_results_json,
                evidence_record_ids_json,quality_result_json,catalog_result_json,
                decision,qualification_hash`,
@@ -31917,7 +38947,55 @@ export class Repository {
     contractRevision: number;
     contractHash: string;
     answerLineageHash: string;
-    queryPlanRevisionId: string;
+    /**
+     * Compatibility field retained for existing V3 canary consumers. V2 has
+     * no query-plan revision and therefore returns null rather than
+     * presenting a selection-plan identity as a query-plan identity.
+     */
+    queryPlanRevisionId: string | null;
+    executionPlan:
+      | {
+          kind: "query_plan_v3";
+          revisionId: string;
+          planHash: string;
+        }
+      | {
+          kind: "selection_plan_v2";
+          revisionId: null;
+          planHash: string;
+        };
+    workerConsumption: ({
+      route: "corpus_first_v3";
+      planKind: "query_plan_v3";
+      status: GuidanceWorkerConsumptionReceiptV5["status"];
+      questionSetHash: string;
+      questionHash: string;
+      selectedOptionId: string;
+      axis: string;
+      queryPlanHash: string;
+      selectionPlanHash: null;
+      contractSemanticHash: string;
+      executionField: GuidanceWorkerConsumptionReceiptV5["executionField"];
+      effectHash: string | null;
+      consumerId: string | null;
+      resultEffectHash: string | null;
+      receiptHash: string;
+    } | {
+      route: "catalog_first_v2";
+      planKind: "selection_plan_v2";
+      status: GuidanceV5V2WorkerConsumptionReceipt["status"];
+      questionSetHash: string;
+      questionHash: string;
+      selectedOptionId: string;
+      axis: string;
+      queryPlanHash: null;
+      selectionPlanHash: string;
+      contractSemanticHash: string;
+      executionField: GuidanceV5V2WorkerConsumptionReceipt["executionField"];
+      consumerId: string | null;
+      resultEffectHash: string | null;
+      receiptHash: string;
+    }) | null;
     guidanceLineage: Array<{
       questionSetHash: string;
       baseContractHash: string;
@@ -31953,20 +39031,62 @@ export class Repository {
       revision: number;
       contract_hash: string;
       answer_lineage_hash: string;
-      query_plan_revision_id: string;
+      pipeline_version: string;
+      selection_plan_json: SelectionPlan | null;
+      query_plan_revision_id: string | null;
+      query_plan_hash: string | null;
     }>(
       `SELECT contract.id,contract.revision,contract.contract_hash,
-              contract.answer_lineage_hash,active_plan.query_plan_revision_id
+              contract.answer_lineage_hash,run.pipeline_version,
+              run.selection_plan_json,
+              active_plan.query_plan_revision_id,
+              query_plan.plan_hash query_plan_hash
        FROM research_runs run
+       LEFT JOIN LATERAL (
+         SELECT access.brief_request_id
+         FROM run_accesses access
+         WHERE access.run_id=run.id
+           AND access.brief_request_id IS NOT NULL
+           AND access.deleted_at IS NULL
+         ORDER BY access.created_at,access.id
+         LIMIT 1
+       ) origin ON true
+       LEFT JOIN brief_requests brief
+         ON brief.id=origin.brief_request_id
        JOIN playlist_contract_revisions contract
-         ON contract.id=run.active_playlist_contract_revision_id
-       JOIN run_active_query_plans active_plan ON active_plan.run_id=run.id
+         ON contract.id=COALESCE(
+           run.active_playlist_contract_revision_id,
+           brief.active_playlist_contract_revision_id
+         )
+       LEFT JOIN run_active_query_plans active_plan
+         ON active_plan.run_id=run.id
+       LEFT JOIN query_plan_revisions query_plan
+         ON query_plan.id=active_plan.query_plan_revision_id
        WHERE run.id=$1 AND run.deleted_at IS NULL`,
       [runId],
     );
     const active = contract.rows[0];
     if (!active) return null;
-    const [attempts, reconciliation, guidance] = await Promise.all([
+    // The immutable active-plan binding is the V3 authority. The persisted
+    // pipeline label is retained for legacy compatibility and older canary
+    // fixtures, so it cannot be the only discriminator.
+    const isV3 = Boolean(
+      active.query_plan_revision_id && active.query_plan_hash,
+    );
+    const isV2 = !isV3
+      && active.pipeline_version === "catalog_first_v2"
+      && active.selection_plan_json !== null;
+    if (!isV3 && !isV2) {
+      return null;
+    }
+    const executionPlanHash = isV3
+      ? active.query_plan_hash!
+      : sha256Hex(stableStringify(active.selection_plan_json));
+    const workerConsumptionPhase = isV3
+      ? guidanceWorkerConsumptionCheckpointKeyV5(executionPlanHash)
+      : GUIDANCE_V5_V2_WORKER_CONSUMPTION_CHECKPOINT;
+    const [attempts, reconciliation, guidance, workerConsumption] =
+      await Promise.all([
       this.pool.query<{
         stage: string;
         status: string;
@@ -32038,6 +39158,13 @@ export class Repository {
          ORDER BY answers.accepted_at,answers.id`,
         [active.id],
       ),
+      this.pool.query<{ state_json: unknown }>(
+        `SELECT state_json
+         FROM research_checkpoints
+         WHERE run_id=$1 AND phase=$2
+         LIMIT 1`,
+        [runId, workerConsumptionPhase],
+      ),
     ]);
     const publication = reconciliation.rows[0] ?? null;
     const expectedCount = Number(publication?.expected_count ?? 0);
@@ -32057,6 +39184,94 @@ export class Repository {
       ?? "unverified";
     const observedHash = safeHash(publication?.observed_ordered_ids_hash);
     const contractHash = safeHash(active.contract_hash) ?? "unverified";
+    const workerConsumptionState =
+      workerConsumption.rows[0]?.state_json ?? null;
+    let publicWorkerConsumption: ({
+      route: "corpus_first_v3";
+      planKind: "query_plan_v3";
+      status: GuidanceWorkerConsumptionReceiptV5["status"];
+      questionSetHash: string;
+      questionHash: string;
+      selectedOptionId: string;
+      axis: string;
+      queryPlanHash: string;
+      selectionPlanHash: null;
+      contractSemanticHash: string;
+      executionField: GuidanceWorkerConsumptionReceiptV5["executionField"];
+      effectHash: string | null;
+      consumerId: string | null;
+      resultEffectHash: string | null;
+      receiptHash: string;
+    } | {
+      route: "catalog_first_v2";
+      planKind: "selection_plan_v2";
+      status: GuidanceV5V2WorkerConsumptionReceipt["status"];
+      questionSetHash: string;
+      questionHash: string;
+      selectedOptionId: string;
+      axis: string;
+      queryPlanHash: null;
+      selectionPlanHash: string;
+      contractSemanticHash: string;
+      executionField: GuidanceV5V2WorkerConsumptionReceipt["executionField"];
+      consumerId: string | null;
+      resultEffectHash: string | null;
+      receiptHash: string;
+    }) | null = null;
+    if (workerConsumptionState !== null) {
+      if (isV3) {
+        assertGuidanceWorkerConsumptionReceiptV5(workerConsumptionState);
+        if (workerConsumptionState.queryPlanHash !== executionPlanHash
+          || workerConsumptionState.contractSemanticHash !== contractHash) {
+          throw new Error(
+            "guidance_v5_public_worker_consumption_binding_mismatch",
+          );
+        }
+        publicWorkerConsumption = {
+          route: "corpus_first_v3",
+          planKind: "query_plan_v3",
+          status: workerConsumptionState.status,
+          questionSetHash: workerConsumptionState.questionSetHash,
+          questionHash: workerConsumptionState.questionHash,
+          selectedOptionId: workerConsumptionState.selectedOptionId,
+          axis: workerConsumptionState.axis,
+          queryPlanHash: workerConsumptionState.queryPlanHash,
+          selectionPlanHash: null,
+          contractSemanticHash: workerConsumptionState.contractSemanticHash,
+          executionField: workerConsumptionState.executionField,
+          effectHash: workerConsumptionState.effectHash,
+          consumerId: workerConsumptionState.consumerId,
+          resultEffectHash: workerConsumptionState.resultEffectHash,
+          receiptHash: workerConsumptionState.receiptHash,
+        };
+      } else {
+        assertGuidanceV5V2WorkerConsumptionReceipt(workerConsumptionState);
+        if (workerConsumptionState.selectionPlanHash !== executionPlanHash
+          || workerConsumptionState.successorContractSemanticHash
+            !== contractHash) {
+          throw new Error(
+            "guidance_v5_v2_public_worker_consumption_binding_mismatch",
+          );
+        }
+        publicWorkerConsumption = {
+          route: "catalog_first_v2",
+          planKind: "selection_plan_v2",
+          status: workerConsumptionState.status,
+          questionSetHash: workerConsumptionState.questionSetHash,
+          questionHash: workerConsumptionState.questionHash,
+          selectedOptionId: workerConsumptionState.selectedOptionId,
+          axis: workerConsumptionState.axis,
+          queryPlanHash: null,
+          selectionPlanHash: workerConsumptionState.selectionPlanHash,
+          contractSemanticHash:
+            workerConsumptionState.successorContractSemanticHash,
+          executionField: workerConsumptionState.executionField,
+          consumerId: workerConsumptionState.v2ConsumerId,
+          resultEffectHash: workerConsumptionState.resultEffectHash,
+          receiptHash: workerConsumptionState.receiptHash,
+        };
+      }
+    }
     const safeClauseIds = (value: unknown): string[] => {
       if (!Array.isArray(value)) return [];
       const ids = value.flatMap((question) => {
@@ -32074,6 +39289,16 @@ export class Repository {
       contractHash,
       answerLineageHash: safeHash(active.answer_lineage_hash) ?? "unverified",
       queryPlanRevisionId: active.query_plan_revision_id,
+      executionPlan: isV3 ? {
+        kind: "query_plan_v3",
+        revisionId: active.query_plan_revision_id!,
+        planHash: executionPlanHash,
+      } : {
+        kind: "selection_plan_v2",
+        revisionId: null,
+        planHash: executionPlanHash,
+      },
+      workerConsumption: publicWorkerConsumption,
       guidanceLineage: guidance.rows.map((row) => ({
         questionSetHash: safeHash(row.question_set_hash) ?? "unverified",
         baseContractHash: safeHash(row.base_contract_hash) ?? "unverified",

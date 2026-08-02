@@ -17,11 +17,14 @@ import {
   FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1,
   type FinalPublicAssignmentProbeFixtureV1,
   releaseFixtureSha256,
+  validateReleaseFixtureGuidancePayload,
   validateSitesControlPlaneSource,
 } from "./release-fixtures.ts";
 import {
   pipelineV3RolloutGroup,
 } from "../server/query-plan-v3.ts";
+import { signReleaseCanaryMetadata } from "../server/release-canary-metadata.ts";
+import { sha256Hex, stableStringify } from "../server/security.ts";
 import { createRunSpecV3 } from "../server/selection-plan-v3.ts";
 import {
   PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
@@ -35,12 +38,12 @@ import {
 
 const CONFIRMATION_FLAG = "--confirm-production-browser";
 const PRODUCTION_ORIGIN = "https://9enio.com";
-const DEADLINE_MS = 3 * 60_000;
+const DEADLINE_MS = 20 * 60_000;
 const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const FINAL_ROLLOUT_STAGE =
-  /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive):(?:0|1|10|50|100)->100$/u;
+  /^editorial_influence:(?:0|1|10|50|100)->100$/u;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -49,6 +52,13 @@ function record(value: unknown, label: string): JsonRecord {
     throw new Error(`${label} must be an object`);
   }
   return value as JsonRecord;
+}
+
+function publicRunPayload(value: unknown): JsonRecord {
+  const root = record(value, "public run response");
+  return root.run && typeof root.run === "object" && !Array.isArray(root.run)
+    ? record(root.run, "public run response run")
+    : root;
 }
 
 function exactKeys(
@@ -181,12 +191,30 @@ function remaining(deadlineAt: number, maximum: number): number {
   return Math.max(1, Math.min(value, maximum));
 }
 
+function browserReleaseCanary(input: {
+  fixtureId: string;
+  operation: "brief" | "run";
+  sourceRevision: string;
+  secret: string;
+}): ReturnType<typeof signReleaseCanaryMetadata> {
+  return signReleaseCanaryMetadata({
+    version: "genio-release-canary/v1",
+    canaryId: `v254-final-${
+      createHash("sha256").update(input.fixtureId).digest("hex").slice(0, 20)
+    }`,
+    environment: "production",
+    audience: PRODUCTION_ORIGIN,
+    operation: input.operation,
+    sourceRevision: input.sourceRevision,
+    issuedAt: new Date().toISOString(),
+    cacheMode: "reuse_disabled",
+  }, input.secret);
+}
+
 export function assertFinalPublicAssignmentProbeFixtureClassifications(): void {
   const fixtureIds = new Set<string>();
   const intentGroups = new Set<string>();
-  const governedIntentGroups = Object.keys(
-    PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS,
-  );
+  const governedIntentGroups = Object.keys(PUBLIC_ROLLOUT_INTENT_PERCENT_FLAGS);
   for (const fixture of FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1) {
     const plan = createRunSpecV3({
       prompt: fixture.prompt,
@@ -196,7 +224,6 @@ export function assertFinalPublicAssignmentProbeFixtureClassifications(): void {
     const classifiedGroup = pipelineV3RolloutGroup(plan);
     if (
       fixtureIds.has(fixture.fixtureId)
-      || intentGroups.has(fixture.intentGroup)
       || classifiedGroup !== fixture.intentGroup
       || plan.criticalAmbiguities.length !== 0
     ) {
@@ -208,14 +235,16 @@ export function assertFinalPublicAssignmentProbeFixtureClassifications(): void {
     intentGroups.add(fixture.intentGroup);
   }
   if (
-    fixtureIds.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
-    || intentGroups.size !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
-    || governedIntentGroups.length
-      !== FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length
-    || governedIntentGroups.some((group) => !intentGroups.has(group))
+    FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1.length !== 2
+    || fixtureIds.size !== 2
+    || intentGroups.size !== 1
+    || !intentGroups.has("editorial_influence")
+    || governedIntentGroups.filter(
+      (group) => group !== "editorial_influence",
+    ).some((group) => intentGroups.has(group))
   ) {
     throw new Error(
-      "final public assignment fixtures do not cover every rollout intent",
+      "final browser assignment fixture must cover only editorial_influence",
     );
   }
 }
@@ -228,42 +257,217 @@ export interface BrowserPublicAssignmentProbeResultV1 {
   rolloutEvidenceHash: string | null;
   rolloutStage: string | null;
   assignmentHash: string | null;
+  assignmentReceiptHash: string | null;
   getStatus: number | null;
   contractVersion: number | null;
-  cleanupStatus: number | null;
+  guidancePayload: unknown;
+  questionVisible: boolean;
+  selectedOptionVisible: boolean;
+  answerStatus: number | null;
+  finalBriefStatus: string | null;
+  runCreateStatus: number | null;
+  runReused: boolean | null;
+  runAccessIdValid: boolean;
+  runAccessIdHash: string | null;
+  runUiVisible: boolean;
+  noPublishedUi: boolean;
+  runGetStatus: number | null;
+  resultGetStatus: number | null;
+  executionRouteReceipt: unknown;
+  resultPayload: unknown;
+  manifestCanaryEvidence: unknown;
 }
 
 export interface FinalPublicAssignmentProbeEvidenceV1 {
   fixtureId: string;
   intentGroup: FinalPublicAssignmentProbeFixtureV1["intentGroup"];
   targetTrackCount: number;
-  rolloutEvidenceHash: string;
-  rolloutStage: string;
-  assignmentHash: string;
+  rolloutEvidenceHash: string | null;
+  rolloutStage: string | null;
+  assignmentHash: string | null;
+  assignmentAuthority:
+    | "signed_public_rollout"
+    | "signed_release_canary"
+    | "signed_public_direct_exposure";
+  assignmentReceiptHash: string;
+  publicPercentageBypass: boolean;
+  organicAssignment: boolean;
   contractVersion: 3;
-  cleanupStatus: 204;
+  guidancePolicyVersion: "adaptive_guidance_v5";
+  questionSetHash: string;
+  questionHash: string;
+  axis: "influence_scope";
+  selectedOptionId: "balanced_influence";
+  answerAccepted: true;
+  successorContractHash: string;
+  queryPlanHash: string;
+  executionRouteReceiptHash: string;
+  runAccessIdHash: string;
+  workerConsumptionReceiptHash: string;
+  workerExecutionEffectHash: string;
+  workerResultEffectHash: string;
+  manifestCanaryEvidenceHash: string;
+  qualifiedManifestHash: string;
+  selectedTrackCount: 25;
+  reserveTrackCount: number;
+  attemptCount: number;
+  executorIdentityHashes: string[];
+  configurationHashes: string[];
+  manifestOnly: true;
+  appleWriteAccess: "forbidden";
+  autoPublish: false;
+  manifestRows: 0;
+  matchingJobs: 0;
+  publicationJobs: 0;
+  publicationVolumeRows: 0;
+  orphanPlaylistRows: 0;
+  noPublishedUi: true;
+  runReused: false;
+  realUiPath: true;
 }
 
 export function validateBrowserPublicAssignmentProbeResultV1(input: {
   fixture: FinalPublicAssignmentProbeFixtureV1;
   result: BrowserPublicAssignmentProbeResultV1;
-  expectedRolloutEvidenceHash: string;
-  expectedRolloutStage: string;
+  assignmentMode?:
+    | "public_rollout"
+    | "pre_exposure_release_canary"
+    | "direct_exposure";
+  expectedRolloutEvidenceHash: string | null;
+  expectedRolloutStage: string | null;
 }): FinalPublicAssignmentProbeEvidenceV1 {
   const { result } = input;
+  const preExposure = input.assignmentMode === "pre_exposure_release_canary";
+  const directExposure = input.assignmentMode === "direct_exposure";
+  const guidance = validateReleaseFixtureGuidancePayload(
+    "irish-influence-recovery-25-v1",
+    result.guidancePayload,
+  );
+  const route = record(
+    result.executionRouteReceipt,
+    "public assignment probe execution route receipt",
+  );
+  const publicResult = record(
+    result.resultPayload,
+    "public assignment probe result",
+  );
+  const manifestCanary = record(
+    result.manifestCanaryEvidence,
+    "public assignment probe manifest-only evidence",
+  );
+  const executionProof = record(
+    publicResult.executionProof,
+    "public assignment probe execution proof",
+  );
+  const workerConsumption = record(
+    executionProof.workerConsumption,
+    "public assignment probe worker consumption",
+  );
+  const zeroWrite = record(
+    manifestCanary.zeroWriteProof,
+    "public assignment probe zero-write proof",
+  );
+  const contractHash = typeof executionProof.contractHash === "string"
+    ? executionProof.contractHash
+    : "";
+  const routeReceiptHash = typeof route.receiptHash === "string"
+    ? route.receiptHash
+    : "";
+  const runAccessIdHash = result.runAccessIdHash ?? "";
+  const assignmentReceiptHash = result.assignmentReceiptHash ?? "";
+  const assignmentMatches = preExposure
+    ? result.rolloutEvidenceHash === null
+      && result.rolloutStage === null
+      && result.assignmentHash === null
+      && SHA256.test(assignmentReceiptHash)
+      && route.assignmentKind === "signed_release_canary"
+    : directExposure
+      ? result.rolloutEvidenceHash === input.expectedRolloutEvidenceHash
+        && result.rolloutStage
+          === "editorial_influence:0->100:fully_exposed_unproven"
+        && typeof result.assignmentHash === "string"
+        && SHA256.test(result.assignmentHash)
+        && route.assignmentKind === "signed_public_direct_exposure"
+        && assignmentReceiptHash === result.assignmentHash
+      : result.rolloutEvidenceHash === input.expectedRolloutEvidenceHash
+      && result.rolloutStage === input.expectedRolloutStage
+      && typeof result.assignmentHash === "string"
+      && SHA256.test(result.assignmentHash)
+      && route.assignmentKind === "signed_public_rollout"
+      && assignmentReceiptHash === result.assignmentHash;
   if (
     (result.postStatus !== 200 && result.postStatus !== 202)
     || result.requestIdValid !== true
-    || result.rolloutEvidenceHash !== input.expectedRolloutEvidenceHash
-    || result.rolloutStage !== input.expectedRolloutStage
-    || typeof result.assignmentHash !== "string"
-    || !SHA256.test(result.assignmentHash)
+    || !assignmentMatches
     || result.getStatus !== 200
     || result.contractVersion !== 3
-    || result.cleanupStatus !== 204
+    || result.questionVisible !== true
+    || result.selectedOptionVisible !== true
+    || (result.answerStatus !== 200 && result.answerStatus !== 202)
+    || result.finalBriefStatus !== "complete"
+    || (result.runCreateStatus !== 200 && result.runCreateStatus !== 202)
+    || result.runReused !== false
+    || result.runAccessIdValid !== true
+    || result.runUiVisible !== true
+    || result.noPublishedUi !== true
+    || result.runGetStatus !== 200
+    || result.resultGetStatus !== 200
+    || route.version !== "execution_route_receipt_v1"
+    || route.trafficClass !== "synthetic"
+    || route.guidanceVersion !== "adaptive_guidance_v5"
+    || route.executionRoute !== "corpus_first_v3"
+    || route.queryPlanSchema !== 6
+    || !SHA256.test(assignmentReceiptHash)
+    || route.intentGroup !== "editorial_influence"
+    || !SHA256.test(routeReceiptHash)
+    || !SHA256.test(contractHash)
+    || !SHA256.test(runAccessIdHash)
+    || publicResult.status !== "complete"
+    || publicResult.totalTracks !== 0
+    || publicResult.completedTracks !== 0
+    || publicResult.manifest !== null
+    || executionProof.contractHash !== contractHash
+    || workerConsumption.status !== "consumed"
+    || workerConsumption.questionSetHash !== guidance.questionSetHash
+    || workerConsumption.questionHash !== guidance.questionHash
+    || workerConsumption.selectedOptionId !== "balanced_influence"
+    || workerConsumption.axis !== "influence_scope"
+    || workerConsumption.contractSemanticHash !== contractHash
+    || workerConsumption.executionField !== "rankingObjectives"
+    || !SHA256.test(String(workerConsumption.queryPlanHash ?? ""))
+    || !SHA256.test(String(workerConsumption.effectHash ?? ""))
+    || !SHA256.test(String(workerConsumption.resultEffectHash ?? ""))
+    || !SHA256.test(String(workerConsumption.receiptHash ?? ""))
+    || manifestCanary.schemaVersion
+      !== "genio-release-manifest-canary-evidence/v1"
+    || manifestCanary.environment !== "production"
+    || manifestCanary.sourceRevision !== route.releaseRevision
+    || manifestCanary.executionMode !== "shadow"
+    || manifestCanary.publicationBoundary !== "database_fenced"
+    || manifestCanary.appleWriteAccess !== "forbidden"
+    || manifestCanary.outcome !== "exact_ready"
+    || manifestCanary.requestedTrackCount !== input.fixture.targetTrackCount
+    || manifestCanary.selectedTrackCount !== input.fixture.targetTrackCount
+    || !Number.isSafeInteger(manifestCanary.reserveTrackCount)
+    || Number(manifestCanary.reserveTrackCount) < 1
+    || !SHA256.test(String(manifestCanary.evidenceHash ?? ""))
+    || !SHA256.test(String(manifestCanary.qualifiedManifestHash ?? ""))
+    || !Array.isArray(manifestCanary.attempts)
+    || manifestCanary.attempts.length < 1
+    || !Array.isArray(manifestCanary.executorIdentityHashes)
+    || manifestCanary.executorIdentityHashes.length < 1
+    || !Array.isArray(manifestCanary.configurationHashes)
+    || manifestCanary.configurationHashes.length !== 1
+    || zeroWrite.autoPublish !== false
+    || zeroWrite.manifestRows !== 0
+    || zeroWrite.matchingJobs !== 0
+    || zeroWrite.publicationJobs !== 0
+    || zeroWrite.publicationVolumeRows !== 0
+    || zeroWrite.orphanPlaylistRows !== 0
+    || guidance.selectedOptionId !== "balanced_influence"
   ) {
     throw new Error(
-      `public assignment probe ${input.fixture.fixtureId} did not prove an exact contract-3 assignment and cleanup`,
+      `public assignment probe ${input.fixture.fixtureId} did not prove exact manifest-only UI execution and the Apple write fence`,
     );
   }
   return {
@@ -273,8 +477,48 @@ export function validateBrowserPublicAssignmentProbeResultV1(input: {
     rolloutEvidenceHash: result.rolloutEvidenceHash,
     rolloutStage: result.rolloutStage,
     assignmentHash: result.assignmentHash,
+    assignmentAuthority: preExposure
+      ? "signed_release_canary"
+      : directExposure
+        ? "signed_public_direct_exposure"
+        : "signed_public_rollout",
+    assignmentReceiptHash,
+    publicPercentageBypass: preExposure,
+    organicAssignment: !preExposure && !directExposure,
     contractVersion: 3,
-    cleanupStatus: 204,
+    guidancePolicyVersion: "adaptive_guidance_v5",
+    questionSetHash: guidance.questionSetHash,
+    questionHash: guidance.questionHash,
+    axis: "influence_scope",
+    selectedOptionId: "balanced_influence",
+    answerAccepted: true,
+    successorContractHash: contractHash,
+    queryPlanHash: String(workerConsumption.queryPlanHash),
+    executionRouteReceiptHash: routeReceiptHash,
+    runAccessIdHash,
+    workerConsumptionReceiptHash: String(workerConsumption.receiptHash),
+    workerExecutionEffectHash: String(workerConsumption.effectHash),
+    workerResultEffectHash: String(workerConsumption.resultEffectHash),
+    manifestCanaryEvidenceHash: String(manifestCanary.evidenceHash),
+    qualifiedManifestHash: String(manifestCanary.qualifiedManifestHash),
+    selectedTrackCount: 25,
+    reserveTrackCount: Number(manifestCanary.reserveTrackCount),
+    attemptCount: manifestCanary.attempts.length,
+    executorIdentityHashes:
+      [...manifestCanary.executorIdentityHashes] as string[],
+    configurationHashes:
+      [...manifestCanary.configurationHashes] as string[],
+    manifestOnly: true,
+    appleWriteAccess: "forbidden",
+    autoPublish: false,
+    manifestRows: 0,
+    matchingJobs: 0,
+    publicationJobs: 0,
+    publicationVolumeRows: 0,
+    orphanPlaylistRows: 0,
+    noPublishedUi: true,
+    runReused: false,
+    realUiPath: true,
   };
 }
 
@@ -282,8 +526,13 @@ export interface FinalCustomDomainBrowserProducerArgs {
   origin: typeof PRODUCTION_ORIGIN;
   expectedRevision: string;
   expectedVersion: string;
-  expectedPublicRolloutEvidenceHash: string;
-  expectedPublicRolloutStage: string;
+  assignmentMode:
+    | "public_rollout"
+    | "pre_exposure_release_canary"
+    | "direct_exposure";
+  expectedPublicRolloutEvidenceHash: string | null;
+  expectedPublicRolloutStage: string | null;
+  expectedDirectExposureAuthorityHash: string | null;
   candidateTag: string;
   imageDigest: string;
   runtimeSnapshotPath: string;
@@ -313,6 +562,9 @@ export function parseFinalCustomDomainBrowserProducerArgs(
     "--expected-version",
     "--expected-public-rollout-evidence-hash",
     "--expected-public-rollout-stage",
+    "--expected-direct-exposure-authority-hash",
+    "--pre-exposure-clean-nonowner",
+    "--direct-exposure",
     "--candidate-tag",
     "--image-digest",
     "--runtime-snapshot",
@@ -329,11 +581,32 @@ export function parseFinalCustomDomainBrowserProducerArgs(
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]!;
     if (!allowed.has(argument)) throw new Error(`Unknown argument: ${argument}`);
-    if (argument !== CONFIRMATION_FLAG) index += 1;
+    if (
+      argument !== CONFIRMATION_FLAG
+      && argument !== "--pre-exposure-clean-nonowner"
+      && argument !== "--direct-exposure"
+    ) index += 1;
   }
   if (argv.filter((value) => value === CONFIRMATION_FLAG).length !== 1) {
     throw new Error(`Final production browser evidence requires ${CONFIRMATION_FLAG}`);
   }
+  const preExposureCount = argv.filter(
+    (value) => value === "--pre-exposure-clean-nonowner",
+  ).length;
+  if (preExposureCount > 1) {
+    throw new Error("--pre-exposure-clean-nonowner may be provided once");
+  }
+  const directExposureCount = argv.filter(
+    (value) => value === "--direct-exposure",
+  ).length;
+  if (directExposureCount > 1 || preExposureCount + directExposureCount > 1) {
+    throw new Error("browser assignment mode may be selected exactly once");
+  }
+  const assignmentMode = preExposureCount === 1
+    ? "pre_exposure_release_canary"
+    : directExposureCount === 1
+      ? "direct_exposure"
+      : "public_rollout";
   const configuredOrigin = environment.RELEASE_PRODUCTION_ORIGIN?.trim() ?? "";
   const origin = releaseProducerOption(argv, "--origin");
   if (origin !== PRODUCTION_ORIGIN
@@ -342,24 +615,60 @@ export function parseFinalCustomDomainBrowserProducerArgs(
   }
   const expectedRevision = releaseProducerOption(argv, "--expected-revision").toLowerCase();
   const expectedVersion = releaseProducerOption(argv, "--expected-version");
-  const expectedPublicRolloutEvidenceHash = releaseProducerOption(
-    argv,
-    "--expected-public-rollout-evidence-hash",
-  );
-  const expectedPublicRolloutStage = releaseProducerOption(
-    argv,
-    "--expected-public-rollout-stage",
-  );
-  if (!SHA256.test(expectedPublicRolloutEvidenceHash)) {
-    throw new Error(
-      "--expected-public-rollout-evidence-hash must be the exact signed rollout payload hash",
-    );
+  const rolloutHashCount = argv.filter(
+    (value) => value === "--expected-public-rollout-evidence-hash",
+  ).length;
+  const rolloutStageCount = argv.filter(
+    (value) => value === "--expected-public-rollout-stage",
+  ).length;
+  const directAuthorityCount = argv.filter(
+    (value) => value === "--expected-direct-exposure-authority-hash",
+  ).length;
+  if (
+    assignmentMode === "public_rollout"
+      ? rolloutHashCount !== 1
+        || rolloutStageCount !== 1
+        || directAuthorityCount !== 0
+      : assignmentMode === "direct_exposure"
+        ? rolloutHashCount !== 0
+          || rolloutStageCount !== 0
+          || directAuthorityCount !== 1
+        : rolloutHashCount !== 0
+          || rolloutStageCount !== 0
+          || directAuthorityCount !== 0
+  ) {
+    throw new Error(assignmentMode === "public_rollout"
+      ? "--expected-public-rollout-evidence-hash and --expected-public-rollout-stage are required exactly once"
+      : assignmentMode === "direct_exposure"
+        ? "--expected-direct-exposure-authority-hash is required exactly once and public rollout markers are forbidden"
+        : "public rollout and direct exposure markers are forbidden for the pre-exposure browser gate");
   }
-  if (!FINAL_ROLLOUT_STAGE.test(expectedPublicRolloutStage)) {
-    throw new Error(
-      "--expected-public-rollout-stage must encode a governed intent transition to 100%",
-    );
-  }
+  const expectedPublicRolloutEvidenceHash = rolloutHashCount === 1
+    ? releaseProducerOption(argv, "--expected-public-rollout-evidence-hash")
+    : null;
+  const expectedPublicRolloutStage = rolloutStageCount === 1
+    ? releaseProducerOption(argv, "--expected-public-rollout-stage")
+    : null;
+  const expectedDirectExposureAuthorityHash = directAuthorityCount === 1
+    ? releaseProducerOption(
+        argv,
+        "--expected-direct-exposure-authority-hash",
+      ).toLowerCase()
+    : null;
+  if (
+    expectedPublicRolloutEvidenceHash !== null
+    && !SHA256.test(expectedPublicRolloutEvidenceHash)
+  ) throw new Error("--expected-public-rollout-evidence-hash is invalid");
+  if (
+    expectedPublicRolloutStage !== null
+    && !FINAL_ROLLOUT_STAGE.test(expectedPublicRolloutStage)
+  ) throw new Error(
+    "--expected-public-rollout-stage must encode editorial_influence transitioning to 100%",
+  );
+  if (
+    expectedDirectExposureAuthorityHash !== null
+    && !SHA256.test(expectedDirectExposureAuthorityHash)
+  ) throw new Error("--expected-direct-exposure-authority-hash is invalid");
   const candidateTag = releaseProducerOption(argv, "--candidate-tag");
   const imageDigest = releaseProducerOption(argv, "--image-digest");
   releaseProducerCandidate({
@@ -384,8 +693,10 @@ export function parseFinalCustomDomainBrowserProducerArgs(
     origin: PRODUCTION_ORIGIN,
     expectedRevision,
     expectedVersion,
+    assignmentMode,
     expectedPublicRolloutEvidenceHash,
     expectedPublicRolloutStage,
+    expectedDirectExposureAuthorityHash,
     candidateTag,
     imageDigest,
     runtimeSnapshotPath: releaseProducerOption(argv, "--runtime-snapshot"),
@@ -498,8 +809,14 @@ export async function collectFinalCustomDomainBrowserEvidence(input: {
   origin: typeof PRODUCTION_ORIGIN;
   candidateRevision: string;
   candidateVersion: string;
-  expectedPublicRolloutEvidenceHash: string;
-  expectedPublicRolloutStage: string;
+  assignmentMode?:
+    | "public_rollout"
+    | "pre_exposure_release_canary"
+    | "direct_exposure";
+  expectedPublicRolloutEvidenceHash: string | null;
+  expectedPublicRolloutStage: string | null;
+  expectedDirectExposureAuthorityHash?: string | null;
+  releaseCanarySecret: string;
   artifactDirectory: string;
   deadlineAt: number;
 }): Promise<JsonRecord> {
@@ -515,6 +832,19 @@ export async function collectFinalCustomDomainBrowserEvidence(input: {
       locale: "en-US",
       ignoreHTTPSErrors: false,
       storageState: { cookies: [], origins: [] },
+    });
+    const directRailwayRequests: string[] = [];
+    context.on("request", (request) => {
+      const hostname = new URL(request.url()).hostname.toLocaleLowerCase(
+        "en-US",
+      );
+      if (
+        hostname === "railway.app"
+        || hostname.endsWith(".railway.app")
+        || hostname.endsWith(".up.railway.app")
+      ) {
+        directRailwayRequests.push(request.url());
+      }
     });
     const page = await context.newPage();
     const aboutResponse = await page.goto(`${input.origin}/about?release-browser=1`, {
@@ -571,129 +901,435 @@ export async function collectFinalCustomDomainBrowserEvidence(input: {
       timeout: remaining(input.deadlineAt, 30_000),
     });
     const publicAssignmentProbes: FinalPublicAssignmentProbeEvidenceV1[] = [];
+    const canaryCredential = input.releaseCanarySecret;
     for (const fixture of FINAL_PUBLIC_ASSIGNMENT_PROBE_FIXTURES_V1) {
       remaining(input.deadlineAt, 1);
-      const probeResult = await page.evaluate(
-        async ({ prompt, targetTrackCount, timeoutMs }) => {
-          const lifecycleController = new AbortController();
-          const lifecycleTimer = setTimeout(
-            () => lifecycleController.abort(),
-            Math.max(1, timeoutMs - 5_000),
-          );
-          try {
-            const postResponse = await fetch("/api/v1/brief", {
-              method: "POST",
-              cache: "no-store",
-              credentials: "same-origin",
-              headers: {
-                "content-type": "application/json",
-              },
-              body: JSON.stringify({ prompt, targetTrackCount }),
-              signal: lifecycleController.signal,
+      const briefCanary = browserReleaseCanary({
+        fixtureId: fixture.fixtureId,
+        operation: "brief",
+        sourceRevision: input.candidateRevision,
+        secret: canaryCredential,
+      });
+      const runCanary = browserReleaseCanary({
+        fixtureId: fixture.fixtureId,
+        operation: "run",
+        sourceRevision: input.candidateRevision,
+        secret: canaryCredential,
+      });
+      const runCanaryUnsigned = Object.fromEntries(
+        Object.entries(runCanary).filter(([key]) => key !== "signature"),
+      );
+      const releaseCanaryAssignmentReceiptHash = sha256Hex(stableStringify({
+        kind: "authenticated_release_canary_owner_v1",
+        metadata: runCanaryUnsigned,
+      }));
+      const briefRoutePattern = `${input.origin}/api/v1/brief`;
+      const runRoutePattern = `${input.origin}/api/v1/runs`;
+      await page.route(briefRoutePattern, async (route) => {
+        const request = route.request();
+        if (request.method() !== "POST") {
+          await route.continue();
+          return;
+        }
+        await route.continue({
+          postData: JSON.stringify({
+            ...record(request.postDataJSON(), "real UI brief request body"),
+            releaseCanary: briefCanary,
+          }),
+          headers: {
+            ...request.headers(),
+            "content-type": "application/json",
+          },
+        });
+      });
+      await page.route(runRoutePattern, async (route) => {
+        const request = route.request();
+        if (request.method() !== "POST") {
+          await route.continue();
+          return;
+        }
+        await route.continue({
+          postData: JSON.stringify({
+            ...record(request.postDataJSON(), "real UI run request body"),
+            manifestOnly: true,
+            releaseCanary: runCanary,
+          }),
+          headers: {
+            ...request.headers(),
+            "content-type": "application/json",
+          },
+        });
+      });
+      const briefPayloads: Array<{
+        status: number;
+        method: string;
+        value: JsonRecord;
+      }> = [];
+      const captureBriefResponse = async (
+        response: import("@playwright/test").Response,
+      ) => {
+        const url = new URL(response.url());
+        if (
+          url.origin !== input.origin
+          || !url.pathname.startsWith("/api/v1/brief")
+        ) return;
+        try {
+          const value = await response.json() as unknown;
+          if (value && typeof value === "object" && !Array.isArray(value)) {
+            briefPayloads.push({
+              status: response.status(),
+              method: response.request().method(),
+              value: value as JsonRecord,
             });
-            const rolloutEvidenceHash = postResponse.headers.get(
-              "x-genio-public-rollout-evidence-hash",
-            );
-            const rolloutStage = postResponse.headers.get(
-              "x-genio-public-rollout-stage",
-            );
-            const assignmentHash = postResponse.headers.get(
-              "x-genio-public-rollout-assignment-hash",
-            );
-            let requestId: string | null = null;
-            try {
-              const payload: unknown = await postResponse.json();
-              if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-                const candidate = (payload as Record<string, unknown>).requestId;
-                requestId = typeof candidate === "string" ? candidate : null;
-              }
-            } catch {
-              requestId = null;
-            }
-            const requestIdValid = requestId !== null
-              && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu
-                .test(requestId);
-            let getStatus: number | null = null;
-            let contractVersion: number | null = null;
-            let cleanupStatus: number | null = null;
-            if (requestIdValid) {
-              try {
-                const getResponse = await fetch(`/api/v1/brief/${requestId}`, {
-                  cache: "no-store",
-                  credentials: "same-origin",
-                  signal: lifecycleController.signal,
-                });
-                getStatus = getResponse.status;
-                try {
-                  const payload: unknown = await getResponse.json();
-                  if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-                    const candidate = (payload as Record<string, unknown>)
-                      .briefContractVersion;
-                    contractVersion = typeof candidate === "number"
-                      ? candidate
-                      : null;
-                  }
-                } catch {
-                  contractVersion = null;
-                }
-              } finally {
-                const cleanupController = new AbortController();
-                const cleanupTimer = setTimeout(
-                  () => cleanupController.abort(),
-                  Math.min(5_000, timeoutMs),
-                );
-                try {
-                  const cleanupResponse = await fetch(
-                    `/api/v1/brief/${requestId}`,
-                    {
-                      method: "DELETE",
-                      cache: "no-store",
-                      credentials: "same-origin",
-                      signal: cleanupController.signal,
-                    },
-                  );
-                  cleanupStatus = cleanupResponse.status;
-                } catch {
-                  cleanupStatus = null;
-                } finally {
-                  clearTimeout(cleanupTimer);
-                }
-              }
-            }
-            return {
-              postStatus: postResponse.status,
-              requestIdValid,
-              rolloutEvidenceHash,
-              rolloutStage,
-              assignmentHash,
-              getStatus,
-              contractVersion,
-              cleanupStatus,
-            };
-          } finally {
-            clearTimeout(lifecycleTimer);
           }
-        },
+        } catch {
+          // A non-JSON response fails the durable payload assertions below.
+        }
+      };
+      page.on("response", captureBriefResponse);
+      const createNavigation = await page.goto(
+        `${input.origin}/?release-browser=1&fixture=${
+          encodeURIComponent(fixture.fixtureId)
+        }`,
         {
-          prompt: fixture.prompt,
-          targetTrackCount: fixture.targetTrackCount,
-          timeoutMs: remaining(input.deadlineAt, 20_000),
+          waitUntil: "domcontentloaded",
+          timeout: remaining(input.deadlineAt, 45_000),
         },
       );
+      if (!createNavigation || createNavigation.status() !== 200) {
+        throw new Error("production Create UI is unavailable");
+      }
+      const requestField = page.getByRole(
+        "textbox",
+        { name: /playlist request/iu },
+      );
+      await requestField.waitFor({
+        state: "visible",
+        timeout: remaining(input.deadlineAt, 20_000),
+      });
+      await requestField.fill(fixture.prompt);
+      const countButton = page.getByRole(
+        "button",
+        { name: new RegExp(`^${fixture.targetTrackCount} tracks$`, "iu") },
+      );
+      await countButton.click();
+      const initialBriefResponsePromise = page.waitForResponse(
+        (response) => (
+          response.request().method() === "POST"
+          && response.url() === `${input.origin}/api/v1/brief`
+        ),
+        { timeout: remaining(input.deadlineAt, 45_000) },
+      );
+      await page.getByRole("button", { name: /create playlist/iu }).click();
+      const initialBriefResponse = await initialBriefResponsePromise;
+      const initialPayload = record(
+        await initialBriefResponse.json(),
+        "real UI initial brief response",
+      );
+      const requestId = typeof initialPayload.requestId === "string"
+        ? initialPayload.requestId
+        : "";
+      const requestIdValid = UUID.test(requestId);
+      const questionHeading = page.getByRole("heading", {
+        name: /Which kind of influence should/iu,
+      });
+      await questionHeading.waitFor({
+        state: "visible",
+        timeout: remaining(input.deadlineAt, 90_000),
+      });
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        if (briefPayloads.some(({ value }) => (
+          value.status === "awaiting_answers"
+          && Array.isArray(value.questions)
+          && value.questions.length > 0
+        ))) break;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+      }
+      const guidanceResponse = [...briefPayloads].reverse().find(
+        ({ value }) => (
+          value.status === "awaiting_answers"
+          && Array.isArray(value.questions)
+          && value.questions.length > 0
+        ),
+      );
+      const guidanceValue = guidanceResponse?.value ?? {};
+      const guidancePayload = {
+        questionSetHash:
+          typeof guidanceValue.questionSetHash === "string"
+            ? guidanceValue.questionSetHash
+            : "",
+        questions: Array.isArray(guidanceValue.questions)
+          ? guidanceValue.questions
+          : [],
+      };
+      const balancedOption = page.locator("label.guided-option-card")
+        .filter({ hasText: "Balanced" })
+        .first();
+      await balancedOption.waitFor({
+        state: "visible",
+        timeout: remaining(input.deadlineAt, 20_000),
+      });
+      const questionVisible = await questionHeading.isVisible();
+      const selectedOptionVisible = await balancedOption.isVisible();
+      await balancedOption.click();
+      const answerResponsePromise = page.waitForResponse(
+        (response) => (
+          response.request().method() === "POST"
+          && response.url() ===
+            `${input.origin}/api/v1/brief/${requestId}/answers`
+        ),
+        { timeout: remaining(input.deadlineAt, 60_000) },
+      );
+      const runResponsePromise = page.waitForResponse(
+        (response) => (
+          response.request().method() === "POST"
+          && response.url() === `${input.origin}/api/v1/runs`
+        ),
+        { timeout: remaining(input.deadlineAt, 90_000) },
+      );
+      await page.getByRole("button", { name: /create playlist/iu }).click();
+      const answerResponse = await answerResponsePromise;
+      const answerPayload = record(
+        await answerResponse.json(),
+        "real UI guidance answer response",
+      );
+      const runResponse = await runResponsePromise;
+      const runPayload = record(
+        await runResponse.json(),
+        "real UI run creation response",
+      );
+      const runRoot = runPayload.run
+        ? record(runPayload.run, "real UI run")
+        : runPayload;
+      const runAccessId = typeof runRoot.id === "string" ? runRoot.id : "";
+      const runAccessIdValid = UUID.test(runAccessId);
+      const runReused = typeof runPayload.reused === "boolean"
+        ? runPayload.reused
+        : null;
+      const workingHeading = page.getByRole("heading", {
+        name: /Researching your playlist|Review your playlist|Your playlist/iu,
+      });
+      await workingHeading.first().waitFor({
+        state: "visible",
+        timeout: remaining(input.deadlineAt, 60_000),
+      });
+      let runReread: { status: number; value: unknown } = {
+        status: 0,
+        value: {},
+      };
+      let runApi: JsonRecord = {};
+      let manifestCanaryEvidence: unknown = null;
+      while (true) {
+        remaining(input.deadlineAt, 1);
+        runReread = await page.evaluate(async (accessId) => {
+          const response = await fetch(
+            `/api/v1/runs/${encodeURIComponent(accessId)}`,
+            {
+              cache: "no-store",
+              credentials: "same-origin",
+            },
+          );
+          let value: unknown = {};
+          try {
+            value = await response.json();
+          } catch {
+            value = {};
+          }
+          return { status: response.status, value };
+        }, runAccessId);
+        runApi = publicRunPayload(runReread.value);
+        const evidenceReread = await page.evaluate(async (accessId) => {
+          const response = await fetch(
+            `/api/v1/runs/${
+              encodeURIComponent(accessId)
+            }/manifest-canary-evidence`,
+            {
+              cache: "no-store",
+              credentials: "same-origin",
+            },
+          );
+          let value: unknown = {};
+          try {
+            value = await response.json();
+          } catch {
+            value = {};
+          }
+          return { status: response.status, value };
+        }, runAccessId);
+        if (evidenceReread.status === 200) {
+          manifestCanaryEvidence = evidenceReread.value;
+          break;
+        }
+        const evidenceError = evidenceReread.value
+          && typeof evidenceReread.value === "object"
+          && !Array.isArray(evidenceReread.value)
+          ? evidenceReread.value as JsonRecord
+          : {};
+        if (
+          evidenceReread.status !== 409
+          || evidenceError.code !== "release_manifest_canary_incomplete"
+        ) {
+          throw new Error(
+            "fresh public Irish manifest-only evidence endpoint failed closed",
+          );
+        }
+        if ([
+            "failed",
+            "failed_system",
+            "failed_integrity",
+            "cancelled",
+          ].includes(String(runApi.status))) {
+          throw new Error(
+            `fresh public Irish run reached ${String(
+              runApi.status,
+            )} before its exact shadow manifest`,
+          );
+        }
+        await page.waitForTimeout(2_000);
+      }
+      const resultReread = await page.evaluate(async (accessId) => {
+        const response = await fetch(
+          `/api/v1/runs/${encodeURIComponent(accessId)}/result`,
+          {
+            cache: "no-store",
+            credentials: "same-origin",
+          },
+        );
+        let value: unknown = {};
+        try {
+          value = await response.json();
+        } catch {
+          value = {};
+        }
+        return { status: response.status, value };
+      }, runAccessId);
+      const completedHeading = page.getByRole("heading", {
+        name: "Playlist published",
+        exact: true,
+      });
+      const noPublishedUi = !(await completedHeading.isVisible());
+      const completeBrief = [...briefPayloads].reverse().find(
+        ({ value }) => value.status === "complete",
+      );
+      const probeResult: BrowserPublicAssignmentProbeResultV1 = {
+        postStatus: initialBriefResponse.status(),
+        requestIdValid,
+        rolloutEvidenceHash:
+          input.assignmentMode === "direct_exposure"
+            ? initialBriefResponse.headers()[
+              "x-genio-direct-exposure-authority-hash"
+            ] ?? null
+            : initialBriefResponse.headers()[
+              "x-genio-public-rollout-evidence-hash"
+            ] ?? null,
+        rolloutStage:
+          input.assignmentMode === "direct_exposure"
+            ? initialBriefResponse.headers()[
+              "x-genio-direct-exposure-stage"
+            ] ?? null
+            : initialBriefResponse.headers()[
+              "x-genio-public-rollout-stage"
+            ] ?? null,
+        assignmentHash:
+          input.assignmentMode === "direct_exposure"
+            ? initialBriefResponse.headers()[
+              "x-genio-direct-exposure-assignment-hash"
+            ] ?? null
+            : initialBriefResponse.headers()[
+              "x-genio-public-rollout-assignment-hash"
+            ] ?? null,
+        assignmentReceiptHash:
+          input.assignmentMode === "pre_exposure_release_canary"
+            ? releaseCanaryAssignmentReceiptHash
+            : input.assignmentMode === "direct_exposure"
+              ? initialBriefResponse.headers()[
+                "x-genio-direct-exposure-assignment-hash"
+              ] ?? null
+            : initialBriefResponse.headers()[
+              "x-genio-public-rollout-assignment-hash"
+            ] ?? null,
+        getStatus: guidanceResponse?.status ?? null,
+        contractVersion:
+          typeof guidanceValue.briefContractVersion === "number"
+            ? guidanceValue.briefContractVersion
+            : null,
+        guidancePayload,
+        questionVisible,
+        selectedOptionVisible,
+        answerStatus: answerResponse.status(),
+        finalBriefStatus:
+          answerPayload.status === "complete" || completeBrief
+            ? "complete"
+            : null,
+        runCreateStatus: runResponse.status(),
+        runReused,
+        runAccessIdValid,
+        runAccessIdHash: runAccessIdValid
+          ? createHash("sha256").update(runAccessId).digest("hex")
+          : null,
+        runUiVisible: await workingHeading.first().isVisible(),
+        noPublishedUi,
+        runGetStatus: runReread.status,
+        resultGetStatus: resultReread.status,
+        executionRouteReceipt: runApi.executionRouteReceipt ?? null,
+        resultPayload: resultReread.value,
+        manifestCanaryEvidence,
+      };
       publicAssignmentProbes.push(
         validateBrowserPublicAssignmentProbeResultV1({
           fixture,
           result: probeResult,
+          assignmentMode: input.assignmentMode,
           expectedRolloutEvidenceHash:
-            input.expectedPublicRolloutEvidenceHash,
+            input.assignmentMode === "direct_exposure"
+              ? input.expectedDirectExposureAuthorityHash ?? null
+              : input.expectedPublicRolloutEvidenceHash,
           expectedRolloutStage: input.expectedPublicRolloutStage,
         }),
       );
+      page.off("response", captureBriefResponse);
+      await page.unroute(briefRoutePattern);
+      await page.unroute(runRoutePattern);
     }
     remaining(input.deadlineAt, 1);
+    const runScreenshot = await page.screenshot({
+      fullPage: true,
+      path: resolve(directory, "production-guidance-run.png"),
+      timeout: remaining(input.deadlineAt, 30_000),
+    });
     const observedAt = new Date().toISOString();
+    if (directRailwayRequests.length > 0) {
+      throw new Error(
+        "production browser made a direct request to Railway instead of the custom domain",
+      );
+    }
+    const serializedPublicAssignmentProbes =
+      input.assignmentMode !== "public_rollout"
+        ? publicAssignmentProbes
+        : publicAssignmentProbes.map((probe) => {
+            const serialized = { ...probe } as Record<string, unknown>;
+            delete serialized.assignmentAuthority;
+            delete serialized.assignmentReceiptHash;
+            delete serialized.publicPercentageBypass;
+            delete serialized.organicAssignment;
+            delete serialized.queryPlanHash;
+            return serialized;
+          });
     const unsigned = {
-      schemaVersion: "genio-final-custom-domain-browser/v2",
+      schemaVersion: input.assignmentMode === "pre_exposure_release_canary"
+        ? "genio-final-custom-domain-browser/v7"
+        : input.assignmentMode === "direct_exposure"
+          ? "genio-final-custom-domain-browser/v8"
+          : "genio-final-custom-domain-browser/v6",
+      ...(input.assignmentMode !== "public_rollout"
+        ? { assignmentMode: input.assignmentMode }
+        : {}),
+      ...(input.assignmentMode === "direct_exposure"
+        ? {
+            exposureClass: "fully_exposed_unproven" as const,
+            organicReliabilityProven: false as const,
+          }
+        : {}),
       origin: input.origin,
       candidateRevision: input.candidateRevision,
       observedAt,
@@ -702,9 +1338,10 @@ export async function collectFinalCustomDomainBrowserEvidence(input: {
       anonymousPlaylistDirectory: true,
       publicPlaylistContentsVisible: true,
       privacyProjectionPassed: true,
-      screenshotHashes: [aboutScreenshot, directoryScreenshot]
+      noDirectRailwayRequests: true,
+      screenshotHashes: [aboutScreenshot, directoryScreenshot, runScreenshot]
         .map((bytes) => createHash("sha256").update(bytes).digest("hex")),
-      publicAssignmentProbes,
+      publicAssignmentProbes: serializedPublicAssignmentProbes,
     };
     return {
       ...unsigned,
@@ -740,13 +1377,24 @@ async function main(): Promise<void> {
     args,
     receipt: sitesControlPlane,
   });
+  const releaseCanarySecret =
+    process.env.RELEASE_CANARY_HMAC_SECRET?.trim() ?? "";
+  if (Buffer.byteLength(releaseCanarySecret, "utf8") < 32) {
+    throw new Error(
+      "RELEASE_CANARY_HMAC_SECRET is required for the signed public manifest-only probe",
+    );
+  }
   const browserEvidence = await collectFinalCustomDomainBrowserEvidence({
     origin: args.origin,
     candidateRevision: args.expectedRevision,
     candidateVersion: args.expectedVersion,
+    assignmentMode: args.assignmentMode,
     expectedPublicRolloutEvidenceHash:
       args.expectedPublicRolloutEvidenceHash,
     expectedPublicRolloutStage: args.expectedPublicRolloutStage,
+    expectedDirectExposureAuthorityHash:
+      args.expectedDirectExposureAuthorityHash,
+    releaseCanarySecret,
     artifactDirectory: args.browserArtifactDirectory,
     deadlineAt,
   });

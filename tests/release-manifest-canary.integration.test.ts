@@ -465,6 +465,17 @@ databaseDescribe("manifest-only release canary integration", () => {
          SET value='true'
          WHERE key='pipeline_v3_public_assignment_paused'`,
       );
+      await expect(repository.createRunIdempotent(
+        runInput(prepared, marker, true),
+      )).rejects.toMatchObject({
+        statusCode: 409,
+        code: "release_manifest_canary_scope_invalid",
+      });
+      await pool.query(
+        `INSERT INTO settings(key,value)
+         VALUES('pipeline_v3_public_assignment_paused:genre_scene','true')
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+      );
       const created = await repository.createRunIdempotent(
         runInput(prepared, marker, true),
       );
@@ -1003,6 +1014,7 @@ databaseDescribe("manifest-only release canary integration", () => {
         matchingJobs: 0,
         publicationJobs: 0,
         publicationVolumeRows: 0,
+        orphanPlaylistRows: 0,
       },
     });
     expect(evidence.qualifiedManifestHash).toMatch(/^[0-9a-f]{64}$/u);

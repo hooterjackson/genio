@@ -43,6 +43,22 @@ export interface NeverDeadEndProjection {
   terminal: boolean;
 }
 
+const TECHNICAL_REPAIR_PHASES = new Set([
+  "capability_evidence_coverage_audit",
+  "runtime_feasibility_unknown",
+  "v3_semantic_collapse_technical_quarantine",
+  "canonical_contract_unknown",
+  "evidence_verification_unknown",
+]);
+
+export function isTechnicalRepairPhase(
+  phase: string | null | undefined,
+): boolean {
+  const normalized = phase?.trim().toLowerCase() ?? "";
+  return TECHNICAL_REPAIR_PHASES.has(normalized)
+    || normalized.startsWith("v3_semantic_collapse_");
+}
+
 /**
  * Compatibility projection for legacy rows. New orchestration persists stage
  * and blocker independently, but old rows must still render as an honest
@@ -63,6 +79,13 @@ export function projectNeverDeadEndRun(input: {
   }
   if (input.status === "failed_integrity") {
     return { state: "quarantined", nextAction: "contact_support", terminal: false };
+  }
+  if (isTechnicalRepairPhase(phase)) {
+    return {
+      state: "quarantined",
+      nextAction: "contact_support",
+      terminal: false,
+    };
   }
   if (input.status === "waiting_for_apple_authorization") {
     return { state: "blocked_dependency", nextAction: "authorize_apple", terminal: false };

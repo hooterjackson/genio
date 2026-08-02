@@ -1,0 +1,385 @@
+name: v254 owner Irish Apple gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Exact merged v2.5.4 source revision
+        required: true
+        type: string
+      release_version:
+        description: Exact candidate version
+        required: true
+        type: string
+      candidate_tag:
+        description: Immutable RC tag
+        required: true
+        type: string
+      image_digest:
+        description: Immutable promoted backend image digest
+        required: true
+        type: string
+      sites_handoff_run_id:
+        description: Successful connector evidence handoff run
+        required: true
+        type: string
+      sites_handoff_artifact:
+        description: Exact connector evidence handoff artifact
+        required: true
+        type: string
+      backend_promotion_run_id:
+        description: Successful native schema20 promotion run
+        required: true
+        type: string
+      route_authority_run_id:
+        description: Successful owner_gate route authority run
+        required: true
+        type: string
+      route_authority_artifact:
+        description: Exact owner_gate authority artifact
+        required: true
+        type: string
+
+concurrency:
+  group: v254-owner-apple-gate-${{ inputs.source_revision }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  owner-gate:
+    name: fixed-three and owner Irish publications with independent Apple readback
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_PRODUCTION_ORIGIN: https://9enio.com
+      RELEASE_CANARY_HMAC_SECRET: ${{ secrets.RELEASE_CANARY_HMAC_SECRET }}
+      RELEASE_IRISH_RECOVERY_ACCESS_ID: ${{ secrets.RELEASE_IRISH_RECOVERY_ACCESS_ID }}
+      RELEASE_IRISH_RECOVERY_COOKIE: ${{ secrets.RELEASE_IRISH_RECOVERY_COOKIE }}
+      RELEASE_OWNER_BROWSER_COOKIE: ${{ secrets.RELEASE_OWNER_BROWSER_COOKIE }}
+      RELEASE_PRODUCTION_DATABASE_URL: ${{ secrets.RELEASE_PRODUCTION_DATABASE_URL }}
+      APPLE_QA_VERIFIER_DEVELOPER_TOKEN: ${{ secrets.APPLE_QA_VERIFIER_DEVELOPER_TOKEN }}
+      APPLE_QA_VERIFIER_CREDENTIAL_VERSION: ${{ vars.APPLE_QA_VERIFIER_CREDENTIAL_VERSION }}
+      RELEASE_GATE_PRODUCER_KEY_ID: ${{ vars.RELEASE_GATE_PRODUCER_KEY_ID }}
+      RELEASE_SITES_CONTROL_PLANE_TRUSTED_KEY_ID: ${{ vars.RELEASE_SITES_CONTROL_PLANE_KEY_ID }}
+      RELEASE_SITES_CONTROL_PLANE_TRUSTED_KEY_SHA256: ${{ vars.RELEASE_SITES_CONTROL_PLANE_KEY_SHA256 }}
+      SITES_PROJECT_ID: appgprj_6a5565cf7d6c8191ab9f2084e8eda856
+      RELEASE_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/owner-browser
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require exact candidate and proof lineage
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          SITES_RUN_ID: ${{ inputs.sites_handoff_run_id }}
+          SITES_ARTIFACT: ${{ inputs.sites_handoff_artifact }}
+          BACKEND_RUN_ID: ${{ inputs.backend_promotion_run_id }}
+          ROUTE_RUN_ID: ${{ inputs.route_authority_run_id }}
+          ROUTE_ARTIFACT: ${{ inputs.route_authority_artifact }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_WORKFLOW_SHA" = "$SOURCE_REVISION"
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_TAG" =~ ^v"$RELEASE_VERSION"-rc\.[1-9][0-9]*$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$SITES_ARTIFACT" = "v254-sites-connector-handoff-$SOURCE_REVISION"
+          test "$ROUTE_ARTIFACT" = "v254-pre-exposure-route-pause-owner_gate-$SOURCE_REVISION"
+          for RUN_ID in "$SITES_RUN_ID" "$BACKEND_RUN_ID" "$ROUTE_RUN_ID"; do
+            RUN="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID")"
+            test "$(jq -r '.status' <<<"$RUN")" = "completed"
+            test "$(jq -r '.conclusion' <<<"$RUN")" = "success"
+            test "$(jq -r '.head_sha' <<<"$RUN")" = "$SOURCE_REVISION"
+          done
+          SITES="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SITES_RUN_ID")"
+          test "$(jq -r '.path' <<<"$SITES")" = ".github/workflows/v254-sites-connector-handoff.yml"
+          BACKEND="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BACKEND_RUN_ID")"
+          test "$(jq -r '.path' <<<"$BACKEND")" = ".github/workflows/native-schema20-release.yml"
+          ROUTE="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ROUTE_RUN_ID")"
+          test "$(jq -r '.path' <<<"$ROUTE")" = ".github/workflows/v254-pre-exposure-route-pause.yml"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.sites_handoff_artifact }}
+          path: ${{ runner.temp }}/sites
+          run-id: ${{ inputs.sites_handoff_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-schema20-promotion-${{ inputs.source_revision }}
+          path: ${{ runner.temp }}/backend
+          run-id: ${{ inputs.backend_promotion_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.route_authority_artifact }}
+          path: ${{ runner.temp }}/route
+          run-id: ${{ inputs.route_authority_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Install exact dependencies and browser
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Bind backend promotion and owner route receipts
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          BACKEND="$RUNNER_TEMP/backend/native-schema20-promotion.json"
+          ROUTE="$RUNNER_TEMP/route/v254-editorial-route-authority.json"
+          jq -e \
+            --arg sha "$SOURCE_REVISION" \
+            --arg version "$RELEASE_VERSION" \
+            --arg digest "$IMAGE_DIGEST" \
+            '.schemaVersion == "genio-native-schema20-promotion/v1"
+             and .sourceRevision == $sha
+             and .version == $version
+             and .imageDigest == $digest
+             and .environment == "production"
+             and (.semanticBehaviorManifestHash | test("^[0-9a-f]{64}$"))
+             and (.semanticExecutionConfigurationHash | test("^[0-9a-f]{64}$"))
+             and (.receiptHash | test("^[0-9a-f]{64}$"))' \
+            "$BACKEND"
+          BACKEND_RECEIPT_HASH="$(jq -er '.receiptHash' "$BACKEND")"
+          BACKEND_SEMANTIC_HASH="$(
+            jq -er '.semanticExecutionConfigurationHash' "$BACKEND"
+          )"
+          jq -e \
+            --arg sha "$SOURCE_REVISION" \
+            --arg version "$RELEASE_VERSION" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg promotion "$BACKEND_RECEIPT_HASH" \
+            --arg semantic "$BACKEND_SEMANTIC_HASH" \
+            '.schemaVersion == "genio-v254-editorial-route-authority/v1"
+             and .phase == "owner_gate"
+             and .sourceRevision == $sha
+             and .version == $version
+             and .imageDigest == $digest
+             and .promotionReceiptHash == $promotion
+             and .semanticExecutionConfigurationHash == $semantic
+             and .applied == true
+             and .database.hardSwitchDisabled == false
+             and .database.globalPublicPause == true
+             and .database.intentPublicPause == true
+             and (.behaviorManifestHash | test("^[0-9a-f]{64}$"))
+             and (.ownerGateReceiptHash | test("^[0-9a-f]{64}$"))
+             and .publicCanaryReceiptHash == null
+             and (.receiptHash | test("^[0-9a-f]{64}$"))' \
+            "$ROUTE"
+
+      - name: Reverify exact Sites connector handoff
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types \
+            scripts/v254-sites-connector-handoff.ts \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --version "$RELEASE_VERSION" \
+            --source-revision "$SOURCE_REVISION" \
+            --image-digest "$IMAGE_DIGEST" \
+            --project-id "$SITES_PROJECT_ID" \
+            --sites-control-plane-evidence "$RUNNER_TEMP/sites/sites-control-plane.json" \
+            --sites-control-plane-attestation "$RUNNER_TEMP/sites/sites-control-plane.attestation.json" \
+            --sites-control-plane-public-key "$RUNNER_TEMP/sites/sites-control-plane-public-key.pem" \
+            --output "$RUNNER_TEMP/owner-sites-connector-handoff.json"
+          jq -e \
+            --arg source "$SOURCE_REVISION" \
+            --arg version "$RELEASE_VERSION" \
+            --arg tag "$CANDIDATE_TAG" \
+            --arg image "$IMAGE_DIGEST" \
+            --arg project "$SITES_PROJECT_ID" \
+            --arg key_id "$RELEASE_SITES_CONTROL_PLANE_TRUSTED_KEY_ID" \
+            --arg key_sha "$RELEASE_SITES_CONTROL_PLANE_TRUSTED_KEY_SHA256" \
+            '
+              .schemaVersion == "genio-v254-sites-connector-handoff/v1"
+              and .candidate.tag == $tag
+              and .candidate.version == $version
+              and .candidate.sourceRevision == $source
+              and .candidate.sitesSourceRevision == $source
+              and .candidate.imageDigest == $image
+              and .projectId == $project
+              and .connectorProduced == true
+              and .importedVia == "bounded_workflow_dispatch_input"
+              and .trustedKeyId == $key_id
+              and .trustedKeySha256 == $key_sha
+              and (.sitesControlPlaneEvidenceHash | test("^[0-9a-f]{64}$"))
+              and (.sitesControlPlaneAttestationPayloadHash | test("^[0-9a-f]{64}$"))
+              and (.sitesControlPlaneAttestationHash | test("^[0-9a-f]{64}$"))
+              and (.archiveSha256 | test("^[0-9a-f]{64}$"))
+              and (.handoffHash | test("^[0-9a-f]{64}$"))
+              and (.versionId | type == "string" and length > 0)
+              and (.deploymentId | type == "string" and length > 0)
+            ' "$RUNNER_TEMP/owner-sites-connector-handoff.json"
+          jq -e -s '
+            .[0] as $upstream
+            | .[1] as $reverified
+            | (
+                $upstream
+                | del(.verifiedAt, .handoffHash)
+              ) == (
+                $reverified
+                | del(.verifiedAt, .handoffHash)
+              )
+          ' \
+            "$RUNNER_TEMP/sites/v254-sites-connector-handoff.json" \
+            "$RUNNER_TEMP/owner-sites-connector-handoff.json"
+
+      - name: Materialize protected proof inputs
+        env:
+          RELEASE_SECRET_VERSIONS_BASE64: ${{ secrets.RELEASE_SECRET_VERSIONS_BASE64 }}
+          RELEASE_GATE_PRODUCER_PRIVATE_KEY_BASE64: ${{ secrets.RELEASE_GATE_PRODUCER_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$RELEASE_SECRET_VERSIONS_BASE64" | base64 --decode \
+            > "$RUNNER_TEMP/release-secret-versions.json"
+          printf '%s' "$RELEASE_GATE_PRODUCER_PRIVATE_KEY_BASE64" | base64 --decode \
+            > "$RUNNER_TEMP/release-gate-producer-private-key.pem"
+
+      - name: Capture exact full runtime and Sites snapshot
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types scripts/release-runtime-snapshot.ts \
+            --origin https://9enio.com \
+            --environment production \
+            --scope full \
+            --expected-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --secret-versions "$RUNNER_TEMP/release-secret-versions.json" \
+            --output "$RUNNER_TEMP/full-runtime-snapshot.json"
+          jq -e \
+            --arg source "$SOURCE_REVISION" \
+            --arg version "$RELEASE_VERSION" \
+            '
+              .schemaVersion == "genio-release-runtime-snapshot/v3"
+              and .environment == "production"
+              and .scope == "full"
+              and .candidate.sourceRevision == $source
+              and .candidate.version == $version
+              and .sitesObservation.sourceRevision == $source
+              and .sitesObservation.version == $version
+              and .sitesObservation.candidateMatched == true
+              and .executorFencing.ready == true
+              and .executorFencing.incompleteJobs == 0
+              and .executorFencing.mismatchedActiveAttempts == 0
+              and .executorFencing.uncoveredJobs == 0
+              and .runtime.databaseSchemaVersion == "20"
+              and .runtime.workerProtocol == "playlist-pipeline-v12"
+              and (.snapshotHash | test("^[0-9a-f]{64}$"))
+            ' "$RUNNER_TEMP/full-runtime-snapshot.json"
+
+      - name: Publish the code-owned fixed-three control once and reread Apple order
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          RELEASE_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/owner-browser/fixed-three
+          # The fixed control is a signed release canary inside the protected
+          # owner gate, but it must not receive any Irish-only selectors.
+          RELEASE_IRISH_RECOVERY_ACCESS_ID: ""
+          RELEASE_IRISH_RECOVERY_COOKIE: ""
+          RELEASE_OWNER_BROWSER_COOKIE: ""
+          RELEASE_PRODUCTION_DATABASE_URL: ""
+        run: |
+          set -euo pipefail
+          unset RELEASE_IRISH_RECOVERY_ACCESS_ID
+          unset RELEASE_IRISH_RECOVERY_COOKIE
+          unset RELEASE_OWNER_BROWSER_COOKIE
+          unset RELEASE_PRODUCTION_DATABASE_URL
+          node --experimental-transform-types scripts/hosted-publication-smoke.ts \
+            --confirm-live-write \
+            --origin https://9enio.com \
+            --fixture-id fixed-three-track-control-v1 \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --expected-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --image-digest "$IMAGE_DIGEST" \
+            --environment production \
+            --cache-mode reuse_disabled \
+            --runtime-snapshot "$RUNNER_TEMP/full-runtime-snapshot.json" \
+            --source-output "$RUNNER_TEMP/production-fixed-three-track.source.json" \
+            --output "$RUNNER_TEMP/production-fixed-three-track.gate.json" \
+            --attestation-output "$RUNNER_TEMP/production-fixed-three-track.attestation.json" \
+            --producer-signing-key "$RUNNER_TEMP/release-gate-producer-private-key.pem" \
+            --producer-key-id "$RELEASE_GATE_PRODUCER_KEY_ID"
+
+      - name: Publish the owner Irish playlist once and reread Apple order
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          RELEASE_BROWSER_ARTIFACT_DIR: ${{ runner.temp }}/owner-browser/irish
+        run: |
+          set -euo pipefail
+          node --experimental-transform-types scripts/hosted-publication-smoke.ts \
+            --confirm-live-write \
+            --origin https://9enio.com \
+            --fixture-id irish-influence-recovery-25-v1 \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --expected-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --image-digest "$IMAGE_DIGEST" \
+            --environment production \
+            --cache-mode reuse_disabled \
+            --runtime-snapshot "$RUNNER_TEMP/full-runtime-snapshot.json" \
+            --source-output "$RUNNER_TEMP/production-affected-regression.source.json" \
+            --output "$RUNNER_TEMP/production-affected-regression.gate.json" \
+            --attestation-output "$RUNNER_TEMP/production-affected-regression.attestation.json" \
+            --producer-signing-key "$RUNNER_TEMP/release-gate-producer-private-key.pem" \
+            --producer-key-id "$RELEASE_GATE_PRODUCER_KEY_ID"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: v254-owner-apple-gate-${{ inputs.source_revision }}
+          path: |
+            ${{ runner.temp }}/production-fixed-three-track.source.json
+            ${{ runner.temp }}/production-fixed-three-track.gate.json
+            ${{ runner.temp }}/production-fixed-three-track.attestation.json
+            ${{ runner.temp }}/production-affected-regression.source.json
+            ${{ runner.temp }}/production-affected-regression.gate.json
+            ${{ runner.temp }}/production-affected-regression.attestation.json
+            ${{ runner.temp }}/full-runtime-snapshot.json
+            ${{ runner.temp }}/owner-sites-connector-handoff.json
+            ${{ runner.temp }}/sites/v254-sites-connector-handoff.json
+            ${{ runner.temp }}/sites/sites-control-plane.json
+            ${{ runner.temp }}/sites/sites-control-plane.attestation.json
+            ${{ runner.temp }}/sites/sites-control-plane-public-key.pem
+            ${{ runner.temp }}/owner-browser
+          if-no-files-found: error
+          retention-days: 30

@@ -40,6 +40,27 @@ describe("never-dead-end policy", () => {
     });
   });
 
+  test("projects evidence coverage collapse as technical repair, not a user scope decision", () => {
+    for (const status of ["needs_decision", "no_compatible_tracks"] as const) {
+      expect(projectNeverDeadEndRun({
+        status,
+        phase: "capability_evidence_coverage_audit",
+      })).toEqual({
+        state: "quarantined",
+        nextAction: "contact_support",
+        terminal: false,
+      });
+    }
+    expect(projectNeverDeadEndRun({
+      status: "needs_decision",
+      phase: "v3_semantic_collapse_technical_quarantine",
+    })).toEqual({
+      state: "quarantined",
+      nextAction: "contact_support",
+      terminal: false,
+    });
+  });
+
   test("bounds dependency retries at 24 hours", () => {
     const blockedAt = new Date("2026-07-23T00:00:00.000Z");
     expect(dependencyRetryDecision({

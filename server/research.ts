@@ -128,9 +128,13 @@ import {
 } from "./adaptive-guidance-v4.ts";
 import {
   ADAPTIVE_GUIDANCE_POLICY_VERSION_V5,
+  guidanceAxisProposalFromScoutV5,
   guidanceCheckpointV5,
+  type GuidanceAxisProposalV5,
+  type GuidanceScoutFailureV5,
 } from "./adaptive-guidance-v5.ts";
 import {
+  publicGuidanceExecutionDecisionV5,
   publicGuidanceQuestionV4,
   publicGuidanceQuestionV5,
 } from "./adaptive-guidance-contract-bridge.ts";
@@ -153,6 +157,15 @@ import {
 import {
   semanticExecutionConfigurationHash,
 } from "./runtime-release.ts";
+import {
+  GUIDANCE_V5_V2_EXECUTION_AUTHORITY_CHECKPOINT,
+  GUIDANCE_V5_V2_WORKER_CONSUMPTION_CHECKPOINT,
+  projectGuidanceV5SuccessorToSelectionPlanV2,
+  verifyGuidanceV5V2WorkerConsumption,
+} from "./guidance-v5-v2-execution.ts";
+import type {
+  PersistedPublicRolloutAssignmentV1,
+} from "./public-rollout-assignment.ts";
 
 export type { HostedCitationAttestation } from "./citation-attestation.ts";
 
@@ -310,6 +323,8 @@ export interface ResearchRepository extends PipelineV3WorkerRepository {
     briefContractVersion?: 1 | 2 | 3;
     questionSetHash?: string | null;
     guidancePreferences?: PlaylistGuidancePreference[];
+    publicRolloutAssignment?: PersistedPublicRolloutAssignmentV1 | null;
+    selectionPlan?: SelectionPlan | null;
   } | null>;
   saveBriefResult(briefRequestId: string, result: {
     status: "awaiting_answers" | "complete" | "failed";
@@ -811,6 +826,28 @@ function isBudgetError(error: unknown): boolean {
     || value.code === "provider_cost_overrun";
 }
 
+class ProviderCostReconciliationError extends Error {
+  override readonly name = "ProviderCostReconciliationError";
+
+  constructor(cause: unknown) {
+    super("Provider cost reconciliation failed", { cause });
+  }
+}
+
+function guidanceScoutCanFailOpen(error: unknown): boolean {
+  if (error instanceof ProviderCostReconciliationError) return false;
+  if (isBudgetError(error)
+    || error instanceof ProviderRequestError
+    || error instanceof SyntaxError) {
+    return true;
+  }
+  const name = error && typeof error === "object"
+    && typeof (error as { name?: unknown }).name === "string"
+    ? (error as { name: string }).name
+    : "";
+  return name === "TimeoutError" || name === "AbortError";
+}
+
 function guidanceScoutFailureIssue(error: unknown): string {
   if (isBudgetError(error)) return "scout:budget_unavailable";
   if (error instanceof ProviderRequestError && error.status !== null) {
@@ -822,6 +859,22 @@ function guidanceScoutFailureIssue(error: unknown): string {
   if (name === "TimeoutError") return "scout:timeout";
   if (name === "AbortError") return "scout:aborted";
   return "scout:provider_unavailable";
+}
+
+function guidanceScoutFailureV5FromIssue(
+  issue: string | null | undefined,
+): GuidanceScoutFailureV5 {
+  const normalized = issue?.toLocaleLowerCase("en-US") ?? "";
+  if (normalized.includes("budget")) return "budget_exhausted";
+  if (normalized.includes("timeout") || normalized.includes("abort")) {
+    return "timeout";
+  }
+  if (normalized.includes("invalid")
+    || normalized.includes("malformed")
+    || normalized.includes("schema")) {
+    return "malformed_output";
+  }
+  return "provider_unavailable";
 }
 
 function briefInterpretationCanFailOpen(error: unknown): boolean {
@@ -2654,6 +2707,32 @@ export class ResearchOrchestrator {
         providerAuthority.claimToken = claimed.claimToken;
         v2WriteFence = providerAuthority;
       }
+      if (pipelineV2
+        && initialRun.guidanceTelemetry?.guidancePolicyVersion
+          === ADAPTIVE_GUIDANCE_POLICY_VERSION_V5) {
+        if (!pipeline.selectionPlan || !v2WriteFence) {
+          throw new Error(
+            "Guidance V5 V2 worker execution authority is unavailable",
+          );
+        }
+        const authority = await this.repository.getResearchCheckpoint(
+          runId,
+          GUIDANCE_V5_V2_EXECUTION_AUTHORITY_CHECKPOINT,
+        );
+        const receipt = verifyGuidanceV5V2WorkerConsumption({
+          authority,
+          selectionPlan: pipeline.selectionPlan,
+          jobId: v2WriteFence.jobId,
+          workerId: v2WriteFence.workerId,
+          leaseEpoch: v2WriteFence.leaseEpoch,
+        });
+        await this.repository.saveResearchCheckpoint(
+          runId,
+          GUIDANCE_V5_V2_WORKER_CONSUMPTION_CHECKPOINT,
+          receipt,
+          v2WriteFence,
+        );
+      }
       if (pipeline.route === "corpus_first_v3") {
         await this.pipelineV3.process({
           runId,
@@ -3769,7 +3848,12 @@ export async function processBriefInterpretationJob(
         ),
         storefront: process.env.APPLE_STOREFRONT ?? "us",
       });
-      if (request.briefContractVersion === 3) {
+      const canonicalGuidanceV5 =
+        request.guidanceTelemetry?.guidancePolicyVersion
+          === ADAPTIVE_GUIDANCE_POLICY_VERSION_V5;
+      let activeGuidanceContract: PlaylistContractRevisionV1 | null = null;
+      if (request.briefContractVersion === 3
+        || (request.briefContractVersion === 2 && canonicalGuidanceV5)) {
         // Guidance V4 has already atomically compiled the answers into the
         // active immutable successor contract. Re-running the legacy V3
         // question-ID decoder here rejects valid V4 answers (for example
@@ -3794,6 +3878,7 @@ export async function processBriefInterpretationJob(
             )) {
           throw new Error("Canonical playlist interpretation failed finalization integrity");
         }
+        activeGuidanceContract = contract;
       } else {
         const v3Plan = resolveRunSpecV3(
           v3Spec,
@@ -3806,12 +3891,20 @@ export async function processBriefInterpretationJob(
           throw new Error("Critical playlist scope is unresolved");
         }
       }
-      const selectionPlan = createSelectionPlanV2({
+      const legacySelectionPlan = createSelectionPlanV2({
         prompt: request.prompt,
         brief: executionBrief,
         guidancePreferences: request.guidancePreferences ?? [],
         storefront: process.env.APPLE_STOREFRONT ?? "us",
       });
+      const selectionPlan = request.briefContractVersion === 2
+        && canonicalGuidanceV5
+        && activeGuidanceContract
+        ? projectGuidanceV5SuccessorToSelectionPlanV2({
+            successorContract: activeGuidanceContract,
+            basePlan: request.selectionPlan ?? legacySelectionPlan,
+          })
+        : legacySelectionPlan;
       await repository.saveBriefResult(briefRequestId, {
         status: "complete",
         expectedStatus: "finalizing",
@@ -3865,8 +3958,11 @@ export async function processBriefInterpretationJob(
         });
         providerUsageReconciled = true;
       } catch (error) {
-        if (isBudgetError(error)) providerUsageReconciled = true;
-        throw error;
+        if (isBudgetError(error)) {
+          providerUsageReconciled = true;
+          throw error;
+        }
+        throw new ProviderCostReconciliationError(error);
       }
     };
     try {
@@ -3923,6 +4019,7 @@ export async function processBriefInterpretationJob(
     });
     const contractTwo = request.briefContractVersion === 2;
     const contractThree = request.briefContractVersion === 3;
+    const guidanceV5Enabled = process.env.GUIDANCE_V5_ENABLED === "true";
     const requestClassification = guidanceRequestClassificationV2(v3Spec);
     const preliminarySelectionPlan = createSelectionPlanV2({
       prompt: request.prompt,
@@ -3931,7 +4028,7 @@ export async function processBriefInterpretationJob(
       storefront: process.env.APPLE_STOREFRONT ?? "us",
     });
 
-    if (contractThree) {
+    if (contractThree || (contractTwo && guidanceV5Enabled)) {
       if (!repository.getActivePlaylistContractRevision
         || !repository.savePlaylistContractRevision
         || !repository.savePlaylistFeasibilitySnapshot) {
@@ -4017,7 +4114,128 @@ export async function processBriefInterpretationJob(
           : preliminarySelectionPlan.scopeKind === "factual_frontier"
             ? "factual"
             : "curated";
-      const guidanceV5Enabled = process.env.GUIDANCE_V5_ENABLED === "true";
+      let v5Scout: {
+        axisProposal: GuidanceAxisProposalV5 | null;
+        scoutFailure: GuidanceScoutFailureV5 | null;
+        sourceHints: PlaylistGuidanceSourceHint[];
+        telemetry: PlaylistGuidanceTelemetry;
+      } = {
+        axisProposal: null,
+        scoutFailure: null,
+        sourceHints: [],
+        telemetry: {
+          generationMode: "no_material_questions",
+          requestClassification,
+          guidancePolicyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V5,
+          proposedQuestionCount: 0,
+          acceptedQuestionCount: 0,
+          webSearchCalls: 0,
+          validationIssues: [],
+        },
+      };
+      const v5ScoutEligible = guidanceV5Enabled
+        && (requestShape === "curated" || requestShape === "factual");
+      const v5ScoutProviderReachable = interpretationFallbackIssue === null
+        || interpretationFallbackIssue
+          === "interpretation:invalid_structured_output";
+      if (v5ScoutEligible && !v5ScoutProviderReachable) {
+        v5Scout = {
+          ...v5Scout,
+          scoutFailure: guidanceScoutFailureV5FromIssue(
+            interpretationFallbackIssue,
+          ),
+          telemetry: {
+            ...v5Scout.telemetry,
+            generationMode: "scout_unavailable",
+            validationIssues: interpretationFallbackIssue
+              ? [interpretationFallbackIssue]
+              : [],
+          },
+        };
+      } else if (v5ScoutEligible) {
+        try {
+          const scoutResult = await meteredBriefCall({
+            operation: "brief.question_scout",
+            maximumCostUsd: GUIDANCE_SCOUT_MAX_COST_USD,
+            invoke: (context) => scoutPlaylistGuidance(
+              interpretationPrompt,
+              canonicalBrief,
+              request.model,
+              context,
+              musicIntentEnvelopeV1(v3Spec),
+            ),
+          });
+          const scoutValidation = validateProductionGuidedScoutV3({
+            spec: v3Spec,
+            questions: scoutResult.questions,
+            sourceHints: scoutResult.sourceHints,
+            usage: {
+              searchCount: scoutResult.telemetry.webSearchCalls,
+              durationMs: scoutResult.durationMs,
+              costUsd: scoutResult.costUsd,
+            },
+          });
+          const acceptedScoutQuestions = [
+            ...scoutValidation.acceptedQuestions,
+          ];
+          const axisProposal = guidanceAxisProposalFromScoutV5(
+            acceptedScoutQuestions,
+          );
+          const acceptedSourceUrls = new Set(
+            acceptedScoutQuestions.flatMap(
+              ({ grounding }) => grounding?.sourceUrls ?? [],
+            ),
+          );
+          const validationIssues = [
+            ...scoutValidation.usageIssues.map(
+              (issue) => `scout:v5:usage:${issue}`,
+            ),
+            ...scoutValidation.questionResults.flatMap((result) => (
+              result.issues.map(
+                (issue) => `scout:v5:${result.questionId}:${issue}`,
+              )
+            )),
+            ...scoutResult.telemetry.validationIssues,
+          ].slice(0, 12);
+          const scoutUnavailable =
+            scoutResult.telemetry.generationMode === "scout_unavailable";
+          v5Scout = {
+            axisProposal,
+            scoutFailure: scoutUnavailable
+              ? guidanceScoutFailureV5FromIssue(validationIssues[0])
+              : null,
+            sourceHints: axisProposal
+              ? scoutResult.sourceHints
+                .filter(({ url }) => acceptedSourceUrls.has(url))
+                .slice(0, 2)
+              : [],
+            telemetry: {
+              ...scoutResult.telemetry,
+              requestClassification,
+              guidancePolicyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V5,
+              acceptedQuestionCount: acceptedScoutQuestions.length,
+              validationIssues,
+            },
+          };
+        } catch (error) {
+          if (!guidanceScoutCanFailOpen(error)) throw error;
+          const issue = guidanceScoutFailureIssue(error);
+          v5Scout = {
+            ...v5Scout,
+            scoutFailure: guidanceScoutFailureV5FromIssue(issue),
+            telemetry: {
+              ...v5Scout.telemetry,
+              generationMode: "scout_unavailable",
+              validationIssues: [
+                ...(interpretationFallbackIssue
+                  ? [interpretationFallbackIssue]
+                  : []),
+                issue,
+              ].slice(0, 12),
+            },
+          };
+        }
+      }
       const checkpoint = guidanceV5Enabled
         ? guidanceCheckpointV5({
             prompt: request.prompt,
@@ -4037,6 +4255,12 @@ export async function processBriefInterpretationJob(
               }).hash,
             semanticConfigurationHash:
               semanticExecutionConfigurationHash(process.env),
+            expectedRolloutGroup:
+              contractThree
+                ? request.publicRolloutAssignment?.intentGroup
+                : undefined,
+            axisProposal: v5Scout.axisProposal,
+            scoutFailure: v5Scout.scoutFailure,
           })
         : guidanceCheckpointV4({
         prompt: request.prompt,
@@ -4052,23 +4276,39 @@ export async function processBriefInterpretationJob(
         compilationTimestamp: new Date().toISOString(),
       });
       const questions = guidanceV5Enabled
-        ? checkpoint.decisions.map((decision) => (
-            publicGuidanceQuestionV5(
-              decision as import("./adaptive-guidance-v5.ts").GuidanceDecisionV5,
-            )
-          ))
+        ? checkpoint.mode === "execution_decision"
+          && "executionDecision" in checkpoint
+          && checkpoint.executionDecision
+          ? [publicGuidanceExecutionDecisionV5(
+              checkpoint.executionDecision,
+            )]
+          : checkpoint.decisions.map((decision) => (
+              publicGuidanceQuestionV5(
+                decision as import("./adaptive-guidance-v5.ts").GuidanceDecisionV5,
+              )
+            ))
         : checkpoint.decisions.map((decision) => (
             publicGuidanceQuestionV4(
               decision as import("./adaptive-guidance-v4.ts").GuidanceDecisionV4,
             )
           ));
-      const generationMode = questions.length > 0
-        ? guidanceV5Enabled
-          ? "generalized_axis_registry"
-          : "deterministic_critical"
-        : "no_material_questions";
-      if (guidanceV5Enabled && questions.length === 0) {
-        throw new Error("Guidance V5 requires one executable question");
+      const scoutAxisSelected = guidanceV5Enabled
+        && v5Scout.axisProposal !== null
+        && checkpoint.decisions[0]?.axis
+          === v5Scout.axisProposal.axisId;
+      const generationMode = guidanceV5Enabled
+        ? checkpoint.mode === "execution_decision"
+          ? "typed_execution_decision"
+          : scoutAxisSelected
+            ? "grounded_scout"
+            : "generalized_axis_registry"
+        : questions.length > 0
+          ? "deterministic_critical"
+          : "no_material_questions";
+      if (guidanceV5Enabled && questions.length !== 1) {
+        throw new Error(
+          "Guidance V5 checkpoint must expose exactly one public action",
+        );
       }
       const guidancePolicyVersion = guidanceV5Enabled
         ? ADAPTIVE_GUIDANCE_POLICY_VERSION_V5
@@ -4078,12 +4318,23 @@ export async function processBriefInterpretationJob(
         requestClassification,
         guidancePolicyVersion,
         questionSetHash: checkpoint.checkpointHash,
-        proposedQuestionCount: checkpoint.decisions.length,
+        proposedQuestionCount: Math.max(
+          questions.length,
+          guidanceV5Enabled
+            ? v5Scout.telemetry.proposedQuestionCount
+            : 0,
+        ),
         acceptedQuestionCount: questions.length,
-        webSearchCalls: 0,
-        validationIssues: Object.entries(checkpoint.rejectedDecisionReasons)
-          .map(([id, reason]) => `${id}:${reason}`)
-          .slice(0, 12),
+        webSearchCalls: guidanceV5Enabled
+          ? v5Scout.telemetry.webSearchCalls
+          : 0,
+        validationIssues: [
+          ...(guidanceV5Enabled
+            ? v5Scout.telemetry.validationIssues
+            : []),
+          ...Object.entries(checkpoint.rejectedDecisionReasons)
+            .map(([id, reason]) => `${id}:${reason}`),
+        ].slice(0, 12),
       };
       const guidanceContract: PlaylistGuidanceQuestionSetContract = {
         questionSetHash: checkpoint.checkpointHash,
@@ -4099,7 +4350,13 @@ export async function processBriefInterpretationJob(
         baseContractSemanticHash: activeContract.semanticHash,
         guidanceRound: "initial",
         trigger: checkpoint.decisions[0]?.trigger ?? "nuance",
-        axis: checkpoint.decisions[0]?.axis ?? null,
+        axis: checkpoint.decisions[0]?.axis
+          ?? (
+            checkpoint.mode === "execution_decision"
+            && "executionDecision" in checkpoint
+              ? checkpoint.executionDecision?.axis ?? null
+              : null
+          ),
         feasibilitySnapshotId: feasibilitySnapshot.id,
         checkpointMode: checkpoint.mode,
         ...("confirmationKind" in checkpoint
@@ -4118,7 +4375,9 @@ export async function processBriefInterpretationJob(
         expectedStatus: "queued",
         brief: canonicalBrief,
         questions,
-        guidanceSourceHints: [],
+        guidanceSourceHints: scoutAxisSelected
+          ? v5Scout.sourceHints
+          : [],
         guidanceTelemetry,
         guidanceContract,
         error: null,
@@ -4203,6 +4462,7 @@ export async function processBriefInterpretationJob(
           : scoutResult.telemetry,
       };
     } catch (error) {
+      if (!guidanceScoutCanFailOpen(error)) throw error;
       // Follow-up discovery is optional. A timeout, provider degradation, or
       // exhausted scout-only allowance must never strand an otherwise valid
       // playlist request.

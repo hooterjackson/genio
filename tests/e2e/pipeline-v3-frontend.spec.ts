@@ -108,6 +108,101 @@ test("a subject-specific scout asks one grounded question at a time", async ({ p
   await expect(page.getByRole("heading", { name: /what should connect baile funk to drill/i })).toBeVisible();
 });
 
+test("route drift fails closed while truthful evidence units remain distinct", async ({ page }) => {
+  const run = partialRun({
+    id: "run-route-drift",
+    status: "researching",
+    phase: "source_discovery",
+    pipelineVersion: "catalog_first_v2",
+    partialAction: null,
+    actionRequired: null,
+    pipelineOutcome: null,
+    sourceCount: 1_005,
+    candidateCount: 1_005,
+    unresolvedCount: 77,
+    executionRouteReceipt: {
+      version: "execution_route_receipt_v1",
+      trafficClass: "public",
+      contractVersion: 3,
+      guidanceVersion: "adaptive_guidance_v5",
+      executionRoute: "corpus_first_v3",
+      queryPlanSchema: 6,
+      queryPlanHash: "1".repeat(64),
+      capabilitySnapshotHash: "2".repeat(64),
+      releaseRevision: "3".repeat(40),
+      executorConfigurationHash: "4".repeat(64),
+      assignmentKind: "signed_public_direct_exposure",
+      intentGroup: "editorial_influence",
+      receiptHash: "5".repeat(64),
+    },
+    evidenceCoverage: {
+      observationCount: 1_005,
+      qualificationObservationCount: 77,
+      legacyUnboundQualificationCount: 0,
+      uniqueLeadCount: 189,
+      materializedCandidateCount: 77,
+      candidates: 77,
+      identityBound: 77,
+      appleResolvedCount: 73,
+      versionCompatible: 73,
+      storefrontPlayable: 73,
+      obligationCounts: {
+        historical_influence: { pass: 0, fail: 0, unknown: 77 },
+      },
+      evidencePassed: 0,
+      evidenceUnknown: 77,
+      evidenceFailed: 0,
+      selected: 0,
+      manifested: 0,
+      appendedCount: 0,
+      reconciledPublished: null,
+    },
+    resolution: {
+      generation: 2,
+      state: "executing",
+      workMotion: "running",
+      nextAction: "none",
+      terminal: false,
+      contractRevisionId: "contract-revision",
+      contractRevision: 1,
+      contractHash: "6".repeat(64),
+      blocker: null,
+    },
+  });
+  await page.route("**/api/v1/runs/run-route-drift", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(run),
+    });
+  });
+
+  await page.goto("/?run=run-route-drift");
+
+  await expect(page.getByRole("heading", {
+    name: "Your playlist needs technical repair",
+  })).toBeVisible();
+  const indicator = page.getByTestId("working-indicator");
+  await expect(indicator).toHaveAttribute("data-motion", "action-required");
+  await expect(indicator.locator(".working-live-state"))
+    .toContainText("ROUTE UNVERIFIED");
+  await expect(indicator.locator(".working-live-state"))
+    .not.toContainText("LIVE");
+  await expect(indicator.locator(".working-facts"))
+    .toContainText("SOURCES189");
+  await expect(indicator.locator(".working-facts"))
+    .toContainText("DISCOVERED77");
+  await expect(indicator.locator(".working-facts"))
+    .toContainText("OBSERVATIONS1,005");
+  await expect(page.getByTestId("route-authority-error")).toContainText(
+    "The execution route presented by this screen could not be verified",
+  );
+  await expect(page.getByTestId("technical-evidence-coverage")).toHaveCount(0);
+  await expect(page.getByRole("link", {
+    name: "REPORT TECHNICAL ISSUE →",
+  })).toBeVisible();
+});
+
 test("a shortfall pauses durably and continues only after the visitor chooses it", async ({ page }) => {
   let currentRun: Record<string, unknown> = partialRun();
   let continueBody: Record<string, unknown> | null = null;

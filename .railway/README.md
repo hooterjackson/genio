@@ -179,6 +179,32 @@ configuration aggregate is recomputed from the API, interactive-worker, and
 deep-worker hashes. A bare SHA-256 environment value is never accepted as
 phase-convergence proof.
 
+## Native schema-20 point releases
+
+Once schema 20, proof architecture 1/native, and protocol 12 are already
+authoritative, a code-only point release must not fabricate bridge, expand,
+migration, or backfill evidence. Use the protected
+`native schema20 point release` workflow. It consumes the successful
+`genio-exact-sha-image/v1` receipt and fresh signed candidate evidence, then:
+
+1. verifies that production is healthy, quiescent, owner-only, and has zero
+   uncovered jobs;
+2. stages only non-secret release identity variables with deploys skipped;
+3. connects the same immutable GHCR digest to the existing interactive worker,
+   then the existing deep worker;
+4. requires those worker IDs to be the only fresh heartbeats and to advance
+   across observations at least 30 seconds apart;
+5. connects the existing API last; and
+6. requires exact liveness, readiness, schema-20/protocol-12 health, and
+   backend convergence while Sites remains on the prior proven revision.
+
+The Railway control-plane phase is `redeploy_native`; the runtime remains
+`activate`. This phase is production-only, requires schema 20 and fresh signed
+candidate evidence, preserves the existing activation/public-rollout
+authority, and has no pre-deploy command. The workflow never invokes
+`railway up`, `--from-source`, a service-create command, or a production image
+build.
+
 The signed expand envelope also contains the authoritative activation
 preflight. It must be produced from the fixed complete cohort-inventory query
 inside a read-only repeatable-read database snapshot, prove the global
@@ -205,6 +231,13 @@ For each intent, advance exactly `0 → 1 → 10 → 50 → 100`; only a signed
 from the current production runtime, a fresh signed production-promotion
 envelope, and (after the first transition) the immediately previous signed
 rollout envelope:
+
+The v2.5.4 Irish/editorial recovery uses the independent
+`editorial_influence` intent group and
+`PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT`. Keep `genre_scene` unchanged while
+that repaired route is accepted and exposed. The commands below use
+`genre_scene` only as a generic rollout example; substitute the exact signed
+intent group for the candidate being advanced.
 
 ```bash
 pnpm release:rollout:intent-canary:produce -- \

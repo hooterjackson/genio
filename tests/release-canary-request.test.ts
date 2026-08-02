@@ -32,30 +32,42 @@ const environment = {
 };
 
 describe("authenticated release canary requests", () => {
-  test("limits production manifest-only execution to an owner while public assignment is paused", () => {
+  test("requires a signed canary and a production assignment pause", () => {
     expect(manifestOnlyReleaseCanaryAllowed({
       releaseEnvironment: "staging",
-      owner: false,
+      signedCanary: true,
       publicAssignmentPaused: false,
     })).toBe(true);
     expect(manifestOnlyReleaseCanaryAllowed({
       releaseEnvironment: "production",
-      owner: true,
+      signedCanary: true,
       publicAssignmentPaused: true,
     })).toBe(true);
     expect(manifestOnlyReleaseCanaryAllowed({
       releaseEnvironment: "production",
-      owner: true,
+      signedCanary: true,
       publicAssignmentPaused: false,
     })).toBe(false);
     expect(manifestOnlyReleaseCanaryAllowed({
       releaseEnvironment: "production",
-      owner: false,
+      signedCanary: true,
+      publicAssignmentPaused: false,
+      signedDirectExposureActive: true,
+    })).toBe(true);
+    expect(manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: "production",
+      signedCanary: false,
+      publicAssignmentPaused: false,
+      signedDirectExposureActive: true,
+    })).toBe(false);
+    expect(manifestOnlyReleaseCanaryAllowed({
+      releaseEnvironment: "production",
+      signedCanary: false,
       publicAssignmentPaused: true,
     })).toBe(false);
     expect(manifestOnlyReleaseCanaryAllowed({
       releaseEnvironment: null,
-      owner: true,
+      signedCanary: true,
       publicAssignmentPaused: true,
     })).toBe(false);
   });

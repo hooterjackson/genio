@@ -8,10 +8,26 @@ const releaseWorkflowUrl = new URL(
   "../.github/workflows/release-candidate.yml",
   import.meta.url,
 );
+const migrationJournalUrl = new URL(
+  "../postgres-migrations/meta/_journal.json",
+  import.meta.url,
+);
 const productionPostgresImage =
   "ghcr.io/railwayapp-templates/postgres-ssl:18@sha256:764fabc5fceb7166414c425a57bed8722a08cfb7fff508efb21a86eb31e172a6";
 
 describe("CI unit and PostgreSQL test partition", () => {
+  test("journals the schema-20-compatible Guidance V5.1 checkpoint migration", async () => {
+    const journal = JSON.parse(
+      await readFile(migrationJournalUrl, "utf8"),
+    ) as {
+      entries?: Array<{ idx: number; tag: string }>;
+    };
+    expect(journal.entries?.at(-1)).toEqual(expect.objectContaining({
+      idx: 24,
+      tag: "0024_guidance_v5_execution_decision",
+    }));
+  });
+
   test("fetches the annotated release history in every job that runs Git-bound suites", async () => {
     const workflow = await readFile(ciWorkflowUrl, "utf8");
     for (const [jobName, nextJobName] of [
@@ -95,5 +111,19 @@ describe("CI unit and PostgreSQL test partition", () => {
     expect(section).toContain("pnpm db:migrate");
     expect(section).toContain("pnpm test:database");
     expect(section).not.toContain("pnpm test:coverage");
+  });
+
+  test("makes the stitched API-worker-database-browser suite part of the exact-SHA aggregate", async () => {
+    const workflow = await readFile(ciWorkflowUrl, "utf8");
+    const stitchedStart = workflow.indexOf("  stitched-system:\n");
+    const aggregateStart = workflow.indexOf("  aggregate-exact-sha:\n");
+    expect(stitchedStart).toBeGreaterThan(-1);
+    expect(aggregateStart).toBeGreaterThan(stitchedStart);
+    const stitched = workflow.slice(stitchedStart, aggregateStart);
+    const aggregate = workflow.slice(aggregateStart);
+    expect(stitched).toContain("DATABASE_URL: postgresql://needle:needle@127.0.0.1:5432/needle");
+    expect(stitched).toContain("pnpm test:e2e:system");
+    expect(stitched).toContain("pnpm exec playwright install --with-deps chromium-headless-shell");
+    expect(aggregate).toMatch(/needs:[\s\S]*- stitched-system/u);
   });
 });

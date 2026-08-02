@@ -10,6 +10,7 @@ import {
 import { evaluateCandidateMembershipV3 } from "../server/pipeline-v3-policy.ts";
 import type { SelectionConstraint } from "../shared/types.ts";
 import { MUSIC_CONCEPT_POLICY_VERSION } from "../server/music-concepts-v3.ts";
+import { createQueryPlanV3 } from "../server/query-plan-v3.ts";
 
 function genreCandidateMemberships(genres: readonly string[]) {
   return {
@@ -597,6 +598,43 @@ describe("Pipeline V3 typed planning", () => {
     expect(spec.membershipPredicates).toContainEqual(expect.objectContaining({
       axis: "geography",
       values: ["France"],
+    }));
+  });
+
+  test("preserves broad Irish membership and influence ranking for the exact production typo", () => {
+    const spec = createRunSpecV3({
+      prompt: "Infuential irish music",
+      requestedTrackCount: 25,
+      storefront: "US",
+    });
+    const irishMembership = spec.membershipPredicates.find((predicate) => (
+      predicate.axis === "geography"
+      && predicate.values.includes("Ireland")
+    ));
+    expect(irishMembership).toMatchObject({
+      operator: "require",
+      geographyRelationship: "unspecified",
+      source: "user",
+    });
+    expect(spec.rankingObjectives).toContainEqual(expect.objectContaining({
+      dimension: "influence",
+      direction: "maximize",
+    }));
+
+    const resolved = resolveRunSpecV3(spec, []);
+    const queryPlan = createQueryPlanV3(
+      resolved,
+      "00000000-0000-4000-8000-000000000001",
+    );
+    expect(queryPlan.semanticClauses).toContainEqual(expect.objectContaining({
+      role: "membership",
+      axis: "geography",
+      values: ["Ireland"],
+      geographyRelationship: "unspecified",
+    }));
+    expect(queryPlan.rankingObjectives).toContainEqual(expect.objectContaining({
+      kind: "influence",
+      weight: 0.9,
     }));
   });
 

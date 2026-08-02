@@ -335,6 +335,7 @@ databaseDescribe("release migration 0018 upgrade", () => {
       PIPELINE_V3_PRODUCTION_EVIDENCE_APPROVED: "true",
       PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
       PIPELINE_V3_GENRE_SCENE_EVIDENCE_APPROVED: "true",
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
       PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
     };
     const targetConfiguration: PublicRolloutConfiguration = {
@@ -348,6 +349,7 @@ databaseDescribe("release migration 0018 upgrade", () => {
       PIPELINE_V3_CURATED_HOSTED_EVIDENCE_APPROVED: "true",
       PIPELINE_V3_OWNER_CANARY_GROUPS: "genre_scene",
       PIPELINE_V3_OWNER_CANARY_MAX_TRACKS: "50",
+      PIPELINE_V3_EDITORIAL_INFLUENCE_PERCENT: "0",
       PIPELINE_V3_GENRE_SCENE_PERCENT: "100",
       PIPELINE_V3_MOOD_ACTIVITY_PERCENT: "0",
       PIPELINE_V3_SIMILARITY_PERCENT: "0",

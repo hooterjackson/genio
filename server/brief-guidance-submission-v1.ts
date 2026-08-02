@@ -1,4 +1,5 @@
 import type {
+  BriefGuidanceExecutionActionView,
   PlaylistGuidanceQuestion,
 } from "../shared/types.ts";
 import type {
@@ -18,10 +19,16 @@ export type BriefAnswersPreflightV1 =
       storefront: string | null;
       questionSetHash: string | null;
       questions: PlaylistGuidanceQuestion[];
+      executionAction?: BriefGuidanceExecutionActionView;
     }
   | {
       status: "prior";
-      resultStatus: "finalizing" | "complete";
+      resultStatus:
+        | "finalizing"
+        | "complete"
+        | "review_required"
+        | "cancelled";
+      executionAction?: BriefGuidanceExecutionActionView;
     }
   | {
       status: "prior_awaiting_answers";
@@ -44,6 +51,12 @@ export type BriefAnswersSubmissionV1 =
   | {
       status: "finalizing" | "complete";
       created: boolean;
+      executionAction?: BriefGuidanceExecutionActionView;
+    }
+  | {
+      status: "review_required" | "cancelled";
+      created: boolean;
+      executionAction: BriefGuidanceExecutionActionView;
     }
   | {
       status: "stale_question_set";
@@ -82,7 +95,7 @@ export async function submitBriefGuidanceAnswersV1(input: {
     storefront: string;
   }) => Promise<CustomArtistIdentityResolutionV1>;
   submit: (input: {
-    authority: CustomGuidanceTrackCountAuthorityV1;
+    authority?: CustomGuidanceTrackCountAuthorityV1;
     resolvedExactArtistIdentities: readonly ResolvedExactArtistIdentityV1[];
   }) => Promise<BriefAnswersSubmissionV1>;
   submitAmbiguity?: (input: {
@@ -97,11 +110,28 @@ export async function submitBriefGuidanceAnswersV1(input: {
     preflight: BriefAnswersPreflightV1,
   ): BriefGuidanceSubmissionOutcomeV1 | null => {
     if (preflight.status === "prior") {
+      if (preflight.resultStatus === "review_required"
+        || preflight.resultStatus === "cancelled") {
+        if (!preflight.executionAction) {
+          throw new Error("guidance_execution_decision_replay_missing_action");
+        }
+        return {
+          status: "submitted",
+          submission: {
+            status: preflight.resultStatus,
+            created: false,
+            executionAction: preflight.executionAction,
+          },
+        };
+      }
       return {
         status: "submitted",
         submission: {
           status: preflight.resultStatus,
           created: false,
+          ...(preflight.executionAction
+            ? { executionAction: preflight.executionAction }
+            : {}),
         },
       };
     }
@@ -125,12 +155,18 @@ export async function submitBriefGuidanceAnswersV1(input: {
   const initialReplay = replay(initial);
   if (initialReplay) return initialReplay;
 
-  const authority = await input.authorizeNewWork();
+  const authority = initial.status === "ready"
+    && initial.executionAction?.startsResearch === false
+    ? undefined
+    : await input.authorizeNewWork();
   const admitted = await input.preflight(authority);
   const admittedReplay = replay(admitted);
   if (admittedReplay) return admittedReplay;
   if (admitted.status !== "ready") {
     throw new Error("invalid_brief_guidance_preflight_state");
+  }
+  if (admitted.executionAction?.startsResearch === true && !authority) {
+    throw new Error("guidance_execution_decision_missing_work_authority");
   }
 
   let resolvedExactArtistIdentities: readonly ResolvedExactArtistIdentityV1[] = [];
@@ -162,7 +198,7 @@ export async function submitBriefGuidanceAnswersV1(input: {
         return {
           status: "submitted",
           submission: await input.submitAmbiguity({
-            authority,
+            authority: authority!,
             ambiguity: resolution,
           }),
         };

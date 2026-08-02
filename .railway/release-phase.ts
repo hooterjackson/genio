@@ -36,6 +36,7 @@ export const RELEASE_DEPLOYMENT_PHASES = [
   "bridge",
   "expand",
   "activate",
+  "redeploy_native",
   "rollout",
 ] as const;
 export type ReleaseDeploymentPhase = typeof RELEASE_DEPLOYMENT_PHASES[number];
@@ -770,12 +771,15 @@ export function railwayReleasePhaseConfiguration(
   const phaseValue = required(environment, "GENIO_RELEASE_PHASE");
   if (!(RELEASE_DEPLOYMENT_PHASES as readonly string[]).includes(phaseValue)) {
     throw new Error(
-      "GENIO_RELEASE_PHASE must be bootstrap, bridge, expand, activate, or rollout",
+      "GENIO_RELEASE_PHASE must be bootstrap, bridge, expand, activate, redeploy_native, or rollout",
     );
   }
   const phase = phaseValue as PromotionReleaseDeploymentPhase;
   if (releaseEnvironment === "staging" && phase === "rollout") {
     throw new Error("public rollout is production-only");
+  }
+  if (phase === "redeploy_native" && releaseEnvironment !== "production") {
+    throw new Error("redeploy_native is accepted only for production");
   }
   const verifiedCandidateEvidenceHash = releaseEnvironment === "production"
     ? signedCandidateEvidenceHash(environment)
@@ -788,7 +792,12 @@ export function railwayReleasePhaseConfiguration(
     throw new Error("GENIO_EXPECTED_DATABASE_SCHEMA_VERSION must be an integer from 13 through 20");
   }
   if (
-    (phase === "expand" || phase === "activate" || phase === "rollout")
+    (
+      phase === "expand"
+      || phase === "activate"
+      || phase === "redeploy_native"
+      || phase === "rollout"
+    )
     && expectedDatabaseSchemaVersion !== EXPANDED_DATABASE_SCHEMA_VERSION
   ) {
     throw new Error(
@@ -816,7 +825,11 @@ export function railwayReleasePhaseConfiguration(
   let publicRolloutRollbackWarrantHash: string | null = null;
   let publicRolloutRollbackWarrantEnvelopeBase64: string | null = null;
   let publicRolloutVerificationKeyBase64: string | null = null;
-  if (releaseEnvironment === "production" && phase !== "bridge") {
+  if (
+    releaseEnvironment === "production"
+    && phase !== "bridge"
+    && phase !== "redeploy_native"
+  ) {
     const bridgeEvidence = signedPromotionPhaseEvidence({
       environment,
       fileEnvironmentName: "GENIO_BRIDGE_CONVERGENCE_EVIDENCE_FILE",

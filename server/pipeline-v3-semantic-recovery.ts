@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type {
   CandidateQualificationV3,
+  EvidenceAcquisitionAttemptV3,
   RawTrackCandidateV3,
   RetrievalStageCountersV3,
 } from "./pipeline-v3-retrieval.ts";
@@ -110,9 +111,42 @@ export interface PipelineCandidateLeadArtifactV3 {
 }
 
 export interface RetrievalPredicateDiagnosticsV3 {
+  /** Cumulative qualification calls, including re-evaluation of one lead. */
   readonly qualificationsObserved: number;
+  /** Distinct provider candidate identities evaluated in this result. */
+  readonly uniqueQualificationsObserved?: number;
   readonly scopeFailures: number;
   readonly failedMembershipPredicateIds: Readonly<Record<string, number>>;
+  /**
+   * Persistable aggregate of the exact tri-state assessments emitted for each
+   * canonical clause. It contains no provider prose or candidate identity and
+   * lets the resolution boundary distinguish evidence unknown from musical
+   * failure without trying to infer an obligation from one coarse counter.
+   */
+  readonly canonicalClauseDispositionCounts?: Readonly<Record<
+    string,
+    Readonly<{ pass: number; fail: number; unknown: number }>
+  >>;
+  /**
+   * Exact provider acquisition calls observed for a canonical obligation.
+   * This is intentionally distinct from clause evaluation: evaluating a
+   * candidate as unknown does not prove that any capable evidence producer
+   * was called.
+   */
+  readonly evidenceAcquisitionAttempts?:
+    readonly EvidenceAcquisitionAttemptV3[];
+  /**
+   * Server-observed evidence-shape failures, aggregated by the immutable
+   * verification obligation. These counts are diagnostics, not musical
+   * failures: a healthy producer returning proof for the wrong subject/axis
+   * or a malformed attestation must quarantine the execution rather than
+   * becoming scarcity or user refinement.
+   */
+  readonly evidenceBindingDefects?: readonly {
+    readonly obligationId: string;
+    readonly malformedEvidenceCount: number;
+    readonly wrongAxisEvidenceCount: number;
+  }[];
   /**
    * Canonical clause assessments actually produced by qualification. This is
    * the authoritative acquisition ledger for semantic-collapse auditing:

@@ -1,0 +1,427 @@
+name: native schema20 point release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Full merged Git SHA already built by exact SHA image
+        required: true
+        type: string
+      release_version:
+        description: Stable release version embedded in the image
+        required: true
+        type: string
+      candidate_tag:
+        description: RC tag bound by the exact-SHA candidate receipt
+        required: true
+        type: string
+      image_digest:
+        description: Immutable exact-SHA GHCR image digest
+        required: true
+        type: string
+      exact_sha_image_run_id:
+        description: Successful exact SHA image workflow run ID
+        required: true
+        type: string
+      prior_sites_revision:
+        description: Full revision currently served by Sites
+        required: true
+        type: string
+      prior_sites_version:
+        description: Version currently served by Sites
+        required: true
+        type: string
+      prior_sites_version_id:
+        description: Saved Sites version ID currently serving production
+        required: true
+        type: string
+      prior_sites_deployment_id:
+        description: Sites deployment ID currently serving production
+        required: true
+        type: string
+      prior_sites_control_plane_evidence_hash:
+        description: SHA-256 of the independently verified prior Sites control-plane evidence
+        required: true
+        type: string
+
+concurrency:
+  group: native-schema20-production-release
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  promote:
+    name: workers first, API last
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      V254_IRISH_INFLUENCE_INCIDENT_BINDING_BASE64: ${{ secrets.V254_IRISH_INFLUENCE_INCIDENT_BINDING_BASE64 }}
+      RELEASE_VERIFICATION_KEY_SHA256: ${{ vars.RELEASE_VERIFICATION_KEY_SHA256 }}
+      RELEASE_VERIFICATION_KEY_ID: ${{ vars.RELEASE_VERIFICATION_KEY_ID }}
+      RELEASE_SECRET_VERSIONS_HASH: ${{ vars.RELEASE_SECRET_VERSIONS_HASH }}
+      # Code-owned production targets. The orchestrator also verifies each ID's
+      # existing Railway name and refuses stopped, renamed, or missing targets.
+      RAILWAY_PROJECT_ID: 7e7a44ee-3e54-453c-9120-3cb1f33db76e
+      RAILWAY_INTERACTIVE_SERVICE_ID: 3affc435-074d-4f6f-806f-1c2b552a8b17
+      RAILWAY_DEEP_SERVICE_ID: a3469457-f56e-4871-8a10-5ea6c052640c
+      RAILWAY_API_SERVICE_ID: 11ba75aa-2495-4f28-bbde-64c43efbe731
+    steps:
+      - name: Validate immutable release selectors
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          EXACT_SHA_IMAGE_RUN_ID: ${{ inputs.exact_sha_image_run_id }}
+          PRIOR_SITES_REVISION: ${{ inputs.prior_sites_revision }}
+          PRIOR_SITES_VERSION: ${{ inputs.prior_sites_version }}
+          PRIOR_SITES_VERSION_ID: ${{ inputs.prior_sites_version_id }}
+          PRIOR_SITES_DEPLOYMENT_ID: ${{ inputs.prior_sites_deployment_id }}
+          PRIOR_SITES_CONTROL_PLANE_EVIDENCE_HASH: ${{ inputs.prior_sites_control_plane_evidence_hash }}
+        run: |
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$CANDIDATE_TAG" =~ ^v"$RELEASE_VERSION"-rc\.[1-9][0-9]*$ ]]
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$EXACT_SHA_IMAGE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PRIOR_SITES_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PRIOR_SITES_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$PRIOR_SITES_VERSION_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,255}$ ]]
+          [[ "$PRIOR_SITES_DEPLOYMENT_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,255}$ ]]
+          [[ "$PRIOR_SITES_CONTROL_PLANE_EVIDENCE_HASH" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RELEASE_VERIFICATION_KEY_ID" =~ ^[0-9A-Za-z][0-9A-Za-z._:+/-]{0,159}$ ]]
+          [[ "$RELEASE_VERIFICATION_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RELEASE_SECRET_VERSIONS_HASH" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RAILWAY_PROJECT_ID" =~ ^[0-9a-f-]{36}$ ]]
+          [[ "$RAILWAY_INTERACTIVE_SERVICE_ID" =~ ^[0-9a-f-]{36}$ ]]
+          [[ "$RAILWAY_DEEP_SERVICE_ID" =~ ^[0-9a-f-]{36}$ ]]
+          [[ "$RAILWAY_API_SERVICE_ID" =~ ^[0-9a-f-]{36}$ ]]
+          test -n "$RAILWAY_TOKEN"
+          test -n "$V254_IRISH_INFLUENCE_INCIDENT_BINDING_BASE64"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require exact merged source
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(node -p 'require("./package.json").version')" = "$RELEASE_VERSION"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$SOURCE_REVISION" "origin/$DEFAULT_BRANCH"
+
+      - name: Verify exact SHA image workflow provenance
+        env:
+          EXACT_SHA_IMAGE_RUN_ID: ${{ inputs.exact_sha_image_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: |
+          RUN="$(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$EXACT_SHA_IMAGE_RUN_ID"
+          )"
+          test "$(jq -r '.path' <<<"$RUN")" = ".github/workflows/exact-sha-image.yml"
+          test "$(jq -r '.event' <<<"$RUN")" = "workflow_dispatch"
+          test "$(jq -r '.status' <<<"$RUN")" = "completed"
+          test "$(jq -r '.conclusion' <<<"$RUN")" = "success"
+          test "$(jq -r '.head_sha' <<<"$RUN")" = "$SOURCE_REVISION"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: exact-sha-image-${{ inputs.source_revision }}
+          path: ${{ runner.temp }}/exact-sha-image
+          run-id: ${{ inputs.exact_sha_image_run_id }}
+          github-token: ${{ github.token }}
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.7.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Install exact lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Install pinned Railway CLI
+        run: |
+          npm install --global @railway/cli@4.65.0
+          test "$(railway --version)" = "railway 4.65.0"
+
+      - name: Apply and receipt-bind the schema-20 Guidance V5.1 migration
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: |
+          set -euo pipefail
+          railway run \
+            --service Postgres \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --no-local -- \
+            /bin/sh -eu -c \
+              'test -n "${DATABASE_PUBLIC_URL:-}"; DATABASE_URL="$DATABASE_PUBLIC_URL" PGSSLMODE=no-verify pnpm db:migrate'
+          railway run \
+            --service Postgres \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --no-local -- \
+            pnpm release:v254:guidance-migration-receipt -- \
+              --source-revision "$SOURCE_REVISION" \
+              --migration-file postgres-migrations/0024_guidance_v5_execution_decision.sql \
+              --output "$RUNNER_TEMP/v254-guidance-migration-receipt.json"
+          jq -e \
+            --arg revision "$SOURCE_REVISION" \
+            '.schemaVersion == "genio-v254-guidance-migration-receipt/v1"
+             and .sourceRevision == $revision
+             and .migrationTag == "0024_guidance_v5_execution_decision"
+             and .databaseSchemaVersion == "20"
+             and .guidanceCheckpointVersion == "5.1"
+             and .constraintValidated == true
+             and .executionDecisionAccepted == true
+             and .migrationFileSha256 == .drizzleMigrationHash
+             and (.receiptHash | test("^[0-9a-f]{64}$"))' \
+            "$RUNNER_TEMP/v254-guidance-migration-receipt.json"
+
+      - name: Contain affected editorial-influence work
+        run: |
+          railway run \
+            --service Postgres \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --no-local -- \
+            pnpm release:v254:contain -- pause \
+            > "$RUNNER_TEMP/v254-containment-pause.json"
+          railway run \
+            --service Postgres \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --no-local -- \
+            pnpm release:v254:contain -- contain-dry-run \
+            > "$RUNNER_TEMP/v254-containment-dry-run.json"
+          CONTAINMENT_HASH="$(
+            jq -er '.receiptHash | select(test(\"^[0-9a-f]{64}$\"))' \
+              "$RUNNER_TEMP/v254-containment-dry-run.json"
+          )"
+          OWNER_REVIEW_PROOF_HASH="$(
+            jq -er \
+              '.ownerReviewPromotionProofHash
+               | select(test("^[0-9a-f]{64}$"))' \
+              "$RUNNER_TEMP/v254-containment-dry-run.json"
+          )"
+          jq -e \
+            '.mode == "contain-dry-run"
+             and .safeToApply == true
+             and (has("receipt") | not)
+             and (has("observed") | not)
+             and ([
+               .. | objects | keys[] | select(
+                 . == "run_id"
+                 or . == "runId"
+                 or . == "access_id"
+                 or . == "accessId"
+                 or . == "contract_revision_id"
+                 or . == "contractRevisionId"
+                 or . == "query_plan_revision_id"
+                 or . == "queryPlanRevisionId"
+                 or . == "execution_attempt_id"
+                 or . == "executionAttemptId"
+                 or . == "blocker_id"
+                 or . == "blockerId"
+               )
+             ] | length == 0)
+             and (.ownerReviewCandidateCount
+               | type == "number" and . >= 0 and floor == .)
+             and (.ownerReviewDispositionCount
+               | type == "number" and . >= 0 and floor == .)
+             and (.ownerReviewUndispositionedCount
+               | type == "number" and . >= 0 and floor == .)
+             and (.ownerReviewUnresolvedExecutableWorkCount
+               | type == "number" and . >= 0 and floor == .)
+             and (.ownerReviewUnresolvedPublicationWorkCount
+               | type == "number" and . >= 0 and floor == .)
+             and (.ownerReviewPromotionSafe | type == "boolean")
+             and .ownerReviewCandidateCount
+               == .ownerReviewPromotionProof.candidateCount
+             and .ownerReviewDispositionCount
+               == .ownerReviewPromotionProof.dispositionCount
+             and .ownerReviewUndispositionedCount
+               == .ownerReviewPromotionProof.undispositionedCount
+             and (.expectedMutationCountsHash
+               | test("^[0-9a-f]{64}$"))
+             and (.actualMutationCountsHash
+               | test("^[0-9a-f]{64}$"))
+             and (.actualMutationCounts
+               | [.[]] | all(. == 0))' \
+            "$RUNNER_TEMP/v254-containment-dry-run.json"
+          railway run \
+            --service Postgres \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --no-local -- \
+            pnpm release:v254:contain -- contain-apply "$CONTAINMENT_HASH" \
+            > "$RUNNER_TEMP/v254-containment.json"
+          jq -e \
+            --arg receipt_hash "$CONTAINMENT_HASH" \
+            --arg owner_review_proof_hash "$OWNER_REVIEW_PROOF_HASH" \
+            '.mode == "contain-apply"
+             and (.applied == true or .applied == false)
+             and .receiptHash == $receipt_hash
+             and .ownerReviewPromotionProofHash
+               == $owner_review_proof_hash
+             and .ownerReviewPromotionSafe == true
+             and (
+               .ownerReviewCandidateCount == 0
+               or (
+                 .ownerReviewDispositionCount
+                   == .ownerReviewCandidateCount
+                 and .ownerReviewUndispositionedCount == 0
+                 and .ownerReviewUnresolvedExecutableWorkCount == 0
+                 and .ownerReviewUnresolvedPublicationWorkCount == 0
+               )
+             )
+             and .affectedRunCount >= 1
+             and .hardSwitchRemainsEngaged == true
+             and .intentPublicPauseRemainsEngaged == true
+             and .expectedMutationCounts == .actualMutationCounts
+             and .actualMutationCounts == .mutationCounts
+             and (.expectedMutationCountsHash
+               | test("^[0-9a-f]{64}$"))
+             and (.actualMutationCountsHash
+               | test("^[0-9a-f]{64}$"))
+             and (.mutationCountsHash
+               | test("^[0-9a-f]{64}$"))
+             and .safeRoutesResumed == true' \
+            "$RUNNER_TEMP/v254-containment.json"
+
+      - name: Promote one immutable image through existing services
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          PRIOR_SITES_REVISION: ${{ inputs.prior_sites_revision }}
+          PRIOR_SITES_VERSION: ${{ inputs.prior_sites_version }}
+        run: |
+          pnpm release:native:promote -- \
+            --exact-sha-image-receipt "$RUNNER_TEMP/exact-sha-image/exact-sha-image-receipt.json" \
+            --candidate-evidence "$RUNNER_TEMP/exact-sha-image/native-v254-candidate-evidence.json" \
+            --containment-receipt "$RUNNER_TEMP/v254-containment.json" \
+            --guidance-migration-receipt "$RUNNER_TEMP/v254-guidance-migration-receipt.json" \
+            --release-verification-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --source-revision "$SOURCE_REVISION" \
+            --version "$RELEASE_VERSION" \
+            --secret-versions-hash "$RELEASE_SECRET_VERSIONS_HASH" \
+            --expected-image-repository ghcr.io/hooterjackson/genio \
+            --origin https://9enio.com \
+            --prior-sites-revision "$PRIOR_SITES_REVISION" \
+            --prior-sites-version "$PRIOR_SITES_VERSION" \
+            --project-id "$RAILWAY_PROJECT_ID" \
+            --environment production \
+            --interactive-service "$RAILWAY_INTERACTIVE_SERVICE_ID" \
+            --deep-service "$RAILWAY_DEEP_SERVICE_ID" \
+            --api-service "$RAILWAY_API_SERVICE_ID" \
+            --deployment-timeout-seconds 600 \
+            --poll-interval-seconds 10 \
+            --output "$RUNNER_TEMP/native-schema20-promotion.json"
+
+      - name: Sign the native promotion authority with the protected release key
+        env:
+          RELEASE_PUBLIC_ROLLOUT_EVIDENCE_SIGNING_KEY_BASE64: ${{ secrets.RELEASE_PUBLIC_ROLLOUT_EVIDENCE_SIGNING_KEY_BASE64 }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          PRIOR_SITES_REVISION: ${{ inputs.prior_sites_revision }}
+          PRIOR_SITES_VERSION: ${{ inputs.prior_sites_version }}
+          PRIOR_SITES_VERSION_ID: ${{ inputs.prior_sites_version_id }}
+          PRIOR_SITES_DEPLOYMENT_ID: ${{ inputs.prior_sites_deployment_id }}
+          PRIOR_SITES_CONTROL_PLANE_EVIDENCE_HASH: ${{ inputs.prior_sites_control_plane_evidence_hash }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "$RELEASE_PUBLIC_ROLLOUT_EVIDENCE_SIGNING_KEY_BASE64"
+          printf '%s' "$RELEASE_PUBLIC_ROLLOUT_EVIDENCE_SIGNING_KEY_BASE64" \
+            | base64 --decode > "$RUNNER_TEMP/release-signing-key.pem"
+          pnpm release:native:promotion-authority -- \
+            --promotion-receipt "$RUNNER_TEMP/native-schema20-promotion.json" \
+            --candidate-tag "$CANDIDATE_TAG" \
+            --expected-source-revision "$SOURCE_REVISION" \
+            --expected-version "$RELEASE_VERSION" \
+            --expected-image-digest "$IMAGE_DIGEST" \
+            --prior-sites-project-id appgprj_6a5565cf7d6c8191ab9f2084e8eda856 \
+            --prior-sites-version-id "$PRIOR_SITES_VERSION_ID" \
+            --prior-sites-deployment-id "$PRIOR_SITES_DEPLOYMENT_ID" \
+            --prior-sites-version "$PRIOR_SITES_VERSION" \
+            --prior-sites-revision "$PRIOR_SITES_REVISION" \
+            --prior-sites-control-plane-evidence-hash "$PRIOR_SITES_CONTROL_PLANE_EVIDENCE_HASH" \
+            --signing-key "$RUNNER_TEMP/release-signing-key.pem" \
+            --key-id "$RELEASE_VERIFICATION_KEY_ID" \
+            --expected-key-sha256 "$RELEASE_VERIFICATION_KEY_SHA256" \
+            --output "$RUNNER_TEMP/native-schema20-rollout-promotion-authority.json" \
+            > "$RUNNER_TEMP/native-schema20-rollout-promotion-authority-result.json"
+          jq -e \
+            --arg revision "$SOURCE_REVISION" \
+            '.payload.candidate.sourceRevision == $revision
+             and .payload.sites.candidateMatched == false
+             and (.payloadHash | test("^[0-9a-f]{64}$"))' \
+            "$RUNNER_TEMP/native-schema20-rollout-promotion-authority.json"
+          rm "$RUNNER_TEMP/release-signing-key.pem"
+
+      - name: Fail closed on sensitive promotion artifacts
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const paths = [
+            process.env.RUNNER_TEMP + "/native-schema20-promotion.json",
+            process.env.RUNNER_TEMP + "/native-schema20-rollout-promotion-authority.json",
+            process.env.RUNNER_TEMP + "/v254-guidance-migration-receipt.json",
+            process.env.RUNNER_TEMP + "/v254-containment-pause.json",
+            process.env.RUNNER_TEMP + "/v254-containment-dry-run.json",
+            process.env.RUNNER_TEMP + "/v254-containment.json",
+          ];
+          const forbiddenKey = /(?:prompt|rawPrompt|runId|run_id|accessId|access_id|contractRevisionId|contract_revision_id|queryPlanRevisionId|query_plan_revision_id|executionAttemptId|execution_attempt_id|blockerId|blocker_id|credential|secret|token|authorization)/i;
+          const forbiddenValue = /(?:Bearer\s+|gh[opusr]_|sk-[A-Za-z0-9]|-----BEGIN (?:OPENSSH |RSA |EC |)PRIVATE KEY-----)/;
+          const visit = (value) => {
+            if (typeof value === "string" && forbiddenValue.test(value)) throw new Error("sensitive promotion artifact value");
+            if (Array.isArray(value)) return value.forEach(visit);
+            if (!value || typeof value !== "object") return;
+            for (const [key, child] of Object.entries(value)) {
+              if (forbiddenKey.test(key)) throw new Error("sensitive promotion artifact key");
+              visit(child);
+            }
+          };
+          paths.forEach((path) => visit(JSON.parse(fs.readFileSync(path, "utf8"))));
+          NODE
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-schema20-promotion-${{ inputs.source_revision }}
+          path: |
+            ${{ runner.temp }}/native-schema20-promotion.json
+            ${{ runner.temp }}/v254-containment-pause.json
+            ${{ runner.temp }}/v254-containment-dry-run.json
+            ${{ runner.temp }}/v254-containment.json
+            ${{ runner.temp }}/v254-guidance-migration-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-schema20-rollout-promotion-authority-${{ inputs.source_revision }}
+          path: |
+            ${{ runner.temp }}/native-schema20-rollout-promotion-authority.json
+            ${{ runner.temp }}/native-schema20-rollout-promotion-authority-result.json
+          if-no-files-found: error
+          retention-days: 30

@@ -18,7 +18,7 @@ import {
 
 const SHA256 = /^[0-9a-f]{64}$/u;
 const GROUP =
-  /^(?:genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive)$/u;
+  /^(?:editorial_influence|genre_scene|mood_activity_theme|similarity|artist_catalogue|fixed_container|factual_relationship|exhaustive)$/u;
 const PERCENTAGES = ["0", "1", "10", "50", "100"] as const;
 
 export interface PublicRolloutDatabaseTransition {
@@ -601,6 +601,22 @@ export async function applyPublicRolloutDatabaseTransition(
         `release-evidence:${transition.evidenceHash.slice(0, 24)}`,
       ],
     );
+    // Assignment admission and the signed cohort authority must move in the
+    // same serializable transaction. Otherwise a valid advance can remain
+    // actionlessly paused, or a rollback can leave public assignment open
+    // after its percentage and kill switch have returned to zero.
+    for (const pauseKey of [
+      "pipeline_v3_public_assignment_paused",
+      `pipeline_v3_public_assignment_paused:${transition.intentGroup}`,
+    ]) {
+      await client.query(
+        `INSERT INTO settings(key,value,updated_at)
+         VALUES($1,$2,now())
+         ON CONFLICT(key) DO UPDATE SET
+           value=excluded.value,updated_at=excluded.updated_at`,
+        [pauseKey, disabled ? "true" : "false"],
+      );
+    }
     await client.query(
       `INSERT INTO settings(key,value,updated_at)
        VALUES($1,$2,now())

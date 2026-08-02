@@ -17,8 +17,12 @@ import {
 import {
   ADAPTIVE_GUIDANCE_POLICY_VERSION_V5,
   assertGuidanceDecisionV5,
+  assertGuidanceExecutionDecisionV5,
   compileGuidanceSelectionV5,
+  type GuidanceConsumerReceiptV5,
   type GuidanceDecisionV5,
+  type GuidanceExecutionActionKindV5,
+  type GuidanceExecutionDecisionV5,
 } from "./adaptive-guidance-v5.ts";
 import type {
   PlaylistContractPatchOperationV1,
@@ -68,6 +72,9 @@ export function publicGuidanceQuestionV3(
       label: option.label,
       description: option.description,
       recommended: option.recommended,
+      ...(option.recommendationReason
+        ? { recommendationReason: option.recommendationReason }
+        : {}),
       feasibility: feasibility(option.expectedFeasibilityDirection),
       contractPatch: {
         operations: option.patch.operations.map((operation) => (
@@ -113,6 +120,9 @@ export function publicGuidanceQuestionV4(
       label: option.label,
       description: option.description,
       recommended: option.recommended,
+      ...(option.recommendationReason
+        ? { recommendationReason: option.recommendationReason }
+        : {}),
       ...(option.explicitNoop === true ? { explicitNoop: true } : {}),
       feasibility: feasibility(option.expectedFeasibilityDirection),
       contractPatch: {
@@ -159,6 +169,8 @@ export function publicGuidanceQuestionV5(
     simulationPolicyVersion: decision.simulationPolicyVersion,
     capabilitySnapshotHash: decision.capabilitySnapshotHash,
     semanticConfigurationHash: decision.semanticConfigurationHash,
+    consumerRegistryHash: decision.consumerRegistryHash,
+    rolloutGroup: decision.rolloutGroup,
     ...(decision.interpretationSummary
       ? {
           interpretationSummary: structuredClone(
@@ -176,6 +188,9 @@ export function publicGuidanceQuestionV5(
         label: option.label,
         description: option.description,
         recommended: option.recommended,
+        ...(option.recommendationReason
+          ? { recommendationReason: option.recommendationReason }
+          : {}),
         ...(option.explicitNoop === true ? { explicitNoop: true } : {}),
         feasibility: feasibility(option.expectedFeasibilityDirection),
         contractPatch: {
@@ -191,11 +206,169 @@ export function publicGuidanceQuestionV5(
           : null,
         optionSimulation: {
           patchHash: simulation.patchHash,
+          baseRolloutGroup: simulation.baseRolloutGroup,
+          successorRolloutGroup: simulation.successorRolloutGroup,
           successorSemanticHash: simulation.successorSemanticHash,
+          beforeQueryPlanHash: simulation.beforeQueryPlanHash,
+          afterQueryPlanHash: simulation.afterQueryPlanHash,
+          consumerReceipt: simulation.consumerReceipt
+            ? { ...simulation.consumerReceipt }
+            : null,
+          simulationReceiptHash: simulation.simulationReceiptHash,
           valid: true,
         },
       };
     }),
+  };
+}
+
+/**
+ * Project a saturated-contract action into the existing question transport
+ * without pretending that it is a contract patch. The answer endpoint must
+ * route `execution_decision` through `compileGuidanceExecutionActionV5`; the
+ * ordinary guidance patch compiler rejects it.
+ */
+export function publicGuidanceExecutionDecisionV5(
+  decision: GuidanceExecutionDecisionV5,
+): PlaylistGuidanceQuestion {
+  assertGuidanceExecutionDecisionV5(decision);
+  return {
+    id: decision.id,
+    header: decision.header,
+    question: decision.question,
+    schemaVersion: 5,
+    policyVersion: decision.policyVersion,
+    questionHash: decision.decisionHash,
+    guidanceMode: "execution_decision",
+    trigger: "nuance",
+    axis: decision.axis,
+    criticality: decision.criticality,
+    selectionMode: decision.selectionMode,
+    allowCustom: decision.allowCustom,
+    decisionKey: decision.axis,
+    baseContractRevisionId: decision.baseContractRevisionId,
+    baseContractSemanticHash: decision.baseContractSemanticHash,
+    capabilitySnapshotHash: decision.capabilitySnapshotHash,
+    semanticConfigurationHash: decision.semanticConfigurationHash,
+    allowedPatchOperations: [],
+    affectedClauseIds: [],
+    materialityScore: 100,
+    interpretationSummary: structuredClone(
+      decision.interpretationSummary,
+    ),
+    whyMaterial: decision.whyMaterial,
+    groundingMode: "inference",
+    options: decision.options.map((option) => ({
+      id: option.id,
+      label: option.label,
+      description: option.description,
+      recommended: option.recommended,
+      ...(option.recommendationReason
+        ? { recommendationReason: option.recommendationReason }
+        : {}),
+      feasibility: "moderate",
+      executionAction: { ...option.action },
+    })),
+  };
+}
+
+export function guidanceExecutionDecisionV5FromPublicQuestion(
+  question: PlaylistGuidanceQuestion,
+): GuidanceExecutionDecisionV5 {
+  if (question.schemaVersion !== 5
+    || question.policyVersion !== ADAPTIVE_GUIDANCE_POLICY_VERSION_V5
+    || question.guidanceMode !== "execution_decision"
+    || (
+      question.id !== "v5-execution:confirmed-contract"
+      && question.id !== "v5-execution:unresolved-review"
+    )
+    || question.axis !== "execution_readiness"
+    || question.selectionMode !== "single"
+    || question.criticality !== "required"
+    || question.allowCustom !== false
+    || typeof question.questionHash !== "string"
+    || typeof question.baseContractRevisionId !== "string"
+    || typeof question.baseContractSemanticHash !== "string"
+    || typeof question.capabilitySnapshotHash !== "string"
+    || typeof question.semanticConfigurationHash !== "string"
+    || !question.interpretationSummary
+    || question.options.some((option) => (
+      option.contractPatch !== undefined
+      || option.executionEffect !== undefined
+      || option.optionSimulation !== undefined
+      || option.executionAction === undefined
+    ))) {
+    throw new Error("invalid_contract5_execution_decision_question");
+  }
+  const decision: GuidanceExecutionDecisionV5 = {
+    schemaVersion: 1,
+    policyVersion: ADAPTIVE_GUIDANCE_POLICY_VERSION_V5,
+    mode: "execution_decision",
+    id: question.id,
+    axis: "execution_readiness",
+    header: question.header,
+    question: question.question,
+    whyMaterial: question.whyMaterial ?? "",
+    selectionMode: "single",
+    criticality: "required",
+    allowCustom: false,
+    baseContractRevisionId: question.baseContractRevisionId,
+    baseContractSemanticHash: question.baseContractSemanticHash,
+    capabilitySnapshotHash: question.capabilitySnapshotHash,
+    semanticConfigurationHash: question.semanticConfigurationHash,
+    interpretationSummary: structuredClone(
+      question.interpretationSummary,
+    ),
+    options: question.options.map((option) => ({
+      id: option.id,
+      label: option.label,
+      description: option.description,
+      recommended: option.recommended,
+      ...(option.recommendationReason
+        ? { recommendationReason: option.recommendationReason }
+        : {}),
+      action: {
+        kind: option.executionAction!
+          .kind as GuidanceExecutionActionKindV5,
+        startsResearch: option.executionAction!.startsResearch,
+      },
+    })),
+    decisionHash: question.questionHash,
+  };
+  assertGuidanceExecutionDecisionV5(decision);
+  return decision;
+}
+
+export function compileGuidanceExecutionActionV5(
+  decision: GuidanceExecutionDecisionV5,
+  input: {
+    readonly decisionHash: string;
+    readonly optionId: string;
+  },
+): {
+  readonly decisionHash: string;
+  readonly optionId: string;
+  readonly kind: GuidanceExecutionActionKindV5;
+  readonly startsResearch: boolean;
+  readonly actionHash: string;
+} {
+  assertGuidanceExecutionDecisionV5(decision);
+  if (input.decisionHash !== decision.decisionHash) {
+    throw new Error("stale_guidance_v5_execution_decision");
+  }
+  const option = decision.options.find(({ id }) => id === input.optionId);
+  if (!option) {
+    throw new Error("unknown_guidance_v5_execution_action");
+  }
+  const body = {
+    decisionHash: decision.decisionHash,
+    optionId: option.id,
+    kind: option.action.kind,
+    startsResearch: option.action.startsResearch,
+  };
+  return {
+    ...body,
+    actionHash: sha256Hex(stableStringify(body)),
   };
 }
 
@@ -244,6 +417,9 @@ export function guidanceDecisionV3FromPublicQuestion(
         label: option.label,
         description: option.description,
         recommended: option.recommended,
+        ...(option.recommendationReason
+          ? { recommendationReason: option.recommendationReason }
+          : {}),
         expectedFeasibilityDirection: option.contractPatch.expectedFeasibilityDirection,
         patch: {
           operations: option.contractPatch.operations.map((operation) => (
@@ -309,6 +485,9 @@ export function guidanceDecisionV4FromPublicQuestion(
         label: option.label,
         description: option.description,
         recommended: option.recommended,
+        ...(option.recommendationReason
+          ? { recommendationReason: option.recommendationReason }
+          : {}),
         ...(
           option.explicitNoop === true
           || (
@@ -356,27 +535,51 @@ export function guidanceDecisionV5FromPublicQuestion(
     || typeof question.axisRegistryVersion !== "string"
     || typeof question.simulationPolicyVersion !== "string"
     || typeof question.capabilitySnapshotHash !== "string"
-    || typeof question.semanticConfigurationHash !== "string") {
+    || typeof question.semanticConfigurationHash !== "string"
+    || typeof question.consumerRegistryHash !== "string"
+    || typeof question.rolloutGroup !== "string") {
     throw new Error("invalid_contract5_guidance_question");
   }
   const options = question.options.map((option) => {
     if (!option.contractPatch || !option.optionSimulation) {
       throw new Error("missing_contract5_guidance_patch_or_simulation");
     }
+    const operations = option.contractPatch.operations.map((operation) => (
+      structuredClone(
+        operation,
+      ) as unknown as PlaylistContractPatchOperationV1
+    ));
+    const expectedPatchHash = sha256Hex(stableStringify({
+      operations,
+      affectedClauseIds: option.contractPatch.affectedClauseIds,
+      explicitNoop: option.explicitNoop === true,
+    }));
+    if (option.optionSimulation.patchHash !== expectedPatchHash) {
+      throw new Error("contract5_guidance_public_patch_hash_mismatch");
+    }
+    const noop = operations.length === 0;
+    if (
+      noop !== (
+        option.optionSimulation.successorSemanticHash === null
+        && option.executionEffect === null
+        && option.optionSimulation.consumerReceipt === null
+      )
+    ) {
+      throw new Error("contract5_guidance_public_effect_shape_mismatch");
+    }
     return {
       id: option.id,
       label: option.label,
       description: option.description,
       recommended: option.recommended,
+      ...(option.recommendationReason
+        ? { recommendationReason: option.recommendationReason }
+        : {}),
       ...(option.explicitNoop === true ? { explicitNoop: true } : {}),
       expectedFeasibilityDirection:
         option.contractPatch.expectedFeasibilityDirection,
       patch: {
-        operations: option.contractPatch.operations.map((operation) => (
-          structuredClone(
-            operation,
-          ) as unknown as PlaylistContractPatchOperationV1
-        )),
+        operations,
         affectedClauseIds: [...option.contractPatch.affectedClauseIds],
       },
     };
@@ -413,6 +616,9 @@ export function guidanceDecisionV5FromPublicQuestion(
       question.simulationPolicyVersion as GuidanceDecisionV5["simulationPolicyVersion"],
     capabilitySnapshotHash: question.capabilitySnapshotHash,
     semanticConfigurationHash: question.semanticConfigurationHash,
+    consumerRegistryHash: question.consumerRegistryHash,
+    rolloutGroup:
+      question.rolloutGroup as GuidanceDecisionV5["rolloutGroup"],
     simulations: question.options.map((option) => {
       if (!option.optionSimulation) {
         throw new Error("missing_contract5_guidance_simulation");
@@ -420,11 +626,24 @@ export function guidanceDecisionV5FromPublicQuestion(
       return {
         optionId: option.id,
         patchHash: option.optionSimulation.patchHash,
+        baseRolloutGroup:
+          option.optionSimulation.baseRolloutGroup as GuidanceDecisionV5["rolloutGroup"],
+        successorRolloutGroup:
+          option.optionSimulation.successorRolloutGroup as GuidanceDecisionV5["rolloutGroup"],
         successorSemanticHash:
           option.optionSimulation.successorSemanticHash,
+        beforeQueryPlanHash: option.optionSimulation.beforeQueryPlanHash,
+        afterQueryPlanHash: option.optionSimulation.afterQueryPlanHash,
         executionEffect: option.executionEffect
           ? { ...option.executionEffect }
           : null,
+        consumerReceipt: option.optionSimulation.consumerReceipt
+          ? structuredClone(
+              option.optionSimulation.consumerReceipt,
+            ) as GuidanceConsumerReceiptV5
+          : null,
+        simulationReceiptHash:
+          option.optionSimulation.simulationReceiptHash,
         valid: true,
       };
     }),

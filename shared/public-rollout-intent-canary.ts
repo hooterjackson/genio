@@ -35,6 +35,11 @@ const codeOwnedIntentFixtureHash = (
 });
 
 export const PUBLIC_ROLLOUT_INTENT_CANARY_FIXTURES = Object.freeze({
+  editorial_influence: Object.freeze({
+    fixtureId: "irish-influence-25-v1",
+    fixtureHash: codeOwnedIntentFixtureHash("irish-influence-25-v1", 25),
+    targetTrackCount: 25,
+  }),
   genre_scene: Object.freeze({
     fixtureId: "smooth-reggaeton-heat-50-v1",
     // This is the exact code-owned RELEASE_FIXTURES descriptor hash. It binds
@@ -533,6 +538,13 @@ function validatePayload(value: unknown): {
     || execution.workerRevision !== candidate.sourceRevision
     || execution.workerIdentityHash !== executorIdentityHash
     || execution.contractSemanticHash !== contractSemanticHash
+    || (
+      group === "editorial_influence"
+      && (
+        typeof execution.guidanceLineageHash !== "string"
+        || !/^[0-9a-f]{64}$/u.test(execution.guidanceLineageHash)
+      )
+    )
     || (
       execution.guidanceLineageHash !== null
       && (

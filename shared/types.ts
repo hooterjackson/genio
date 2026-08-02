@@ -48,6 +48,13 @@ export type RunNextAction =
   | "answer_rescue_guidance"
   | "wait_for_dependency"
   | "resume_research"
+  /**
+   * Capability-authenticated browser action projected only when a quarantined
+   * Contract-3 run has a generation- and incident-fenced repair replay.
+   * Schema-19 continues to store `contact_support`; this additive action does
+   * not weaken the persisted state/action constraint.
+   */
+  | "replay_after_repair"
   | "authorize_apple"
   | "decide_verified_partial"
   | "review_contract"
@@ -67,7 +74,13 @@ export interface RunResolutionView {
   state: NeverDeadEndRunState;
   nextAction: RunNextAction;
   terminal: boolean;
+  /**
+   * Database identity used by transition and repair fences. This is distinct
+   * from the immutable semantic revision identifier embedded in Contract 3.
+   */
   contractRevisionId: string | null;
+  /** Immutable `contract_json.revisionId` used to bind semantic decisions. */
+  contractSemanticRevisionId?: string | null;
   contractRevision: number | null;
   contractHash: string | null;
   /**
@@ -94,6 +107,82 @@ export interface RunResolutionView {
     /** Public-safe optimistic lock for a retained dependency decision. */
     versionHash: string | null;
   } | null;
+}
+
+/** Public-safe authorization envelope for a fresh, non-reusing repair replay. */
+export interface RunRepairReplayActionView {
+  kind: "repair_replay";
+  expectedGeneration: number;
+  incidentReference: string;
+  contractRevisionId: string;
+  contractSemanticHash: string;
+  available: boolean;
+  availabilityReason:
+    | "ready"
+    | "repair_pending"
+    | "route_paused"
+    | "already_started";
+  successorBriefRequestId?: string | null;
+  resultReuse: false;
+  autoPublication: false;
+}
+
+/** Public-safe proof that the selected executor route was admitted immutably. */
+export interface RunExecutionRouteReceiptView {
+  version: "execution_route_receipt_v1";
+  trafficClass: "public" | "owner_canary" | "synthetic" | "replay";
+  contractVersion: 1 | 2 | 3;
+  guidanceVersion: string;
+  executionRoute: string;
+  queryPlanSchema: number | null;
+  queryPlanHash: string | null;
+  capabilitySnapshotHash: string | null;
+  releaseRevision: string;
+  executorConfigurationHash: string;
+  assignmentKind:
+    | "signed_public_rollout"
+    | "signed_public_direct_exposure"
+    | "signed_owner_canary"
+    | "signed_release_canary"
+    | "authenticated_legacy_repair"
+    | "legacy_control";
+  intentGroup: string | null;
+  receiptHash: string;
+}
+
+/** Monotone, public-safe execution counters; no source prose or credentials. */
+export interface RunEvidenceCoverageView {
+  /** Cumulative provider observations represented by the active discovery leads. */
+  observationCount: number;
+  /** Every active-authority qualification observation, including unknown/fail. */
+  qualificationObservationCount: number;
+  /** Immutable pre-recovery observations that cannot be bound to a candidate. */
+  legacyUnboundQualificationCount: number;
+  /** Deduplicated discovery identities, not cumulative provider observations. */
+  uniqueLeadCount: number;
+  /** Distinct candidates materialized for the active contract/query plan. */
+  materializedCandidateCount: number;
+  /** Backward-compatible alias for materializedCandidateCount. */
+  candidates: number;
+  /** Family/stage identity binding retained for compatibility diagnostics. */
+  identityBound: number;
+  /** Exact candidate -> recording family -> Apple storefront/catalog binding. */
+  appleResolvedCount: number;
+  versionCompatible: number;
+  storefrontPlayable: number;
+  obligationCounts: Record<string, {
+    pass: number;
+    fail: number;
+    unknown: number;
+  }>;
+  evidencePassed: number;
+  evidenceUnknown: number;
+  evidenceFailed: number;
+  selected: number;
+  manifested: number;
+  /** Tracks observed appended in the latest Apple reconciliation attempt. */
+  appendedCount: number;
+  reconciledPublished: number | null;
 }
 
 /** Public-safe, hash-bound decision offered at an automated research boundary. */
@@ -1272,6 +1361,8 @@ export interface PlaylistGuidanceOption {
   description: string;
   /** Exactly the first option is recommended. */
   recommended: boolean;
+  /** Hash-bound server explanation shown only for the recommended option. */
+  recommendationReason?: string;
   /**
    * An intentional no-op in a correctness-blocking decision. This must
    * survive the public round trip because it is part of the signed question
@@ -1298,12 +1389,47 @@ export interface PlaylistGuidanceOption {
       | "playlistQuotaRules"
       | "playlistQualityPolicy";
     consumerId: string;
+    beforeConsumerResultHash: string;
+    afterConsumerResultHash: string;
     effectHash: string;
   } | null;
   optionSimulation?: {
     patchHash: string;
+    baseRolloutGroup: string;
+    successorRolloutGroup: string;
     successorSemanticHash: string | null;
+    beforeQueryPlanHash: string;
+    afterQueryPlanHash: string;
+    consumerReceipt: {
+      registryVersion: string;
+      registryHash: string;
+      capabilitySnapshotHash: string;
+      axis: string;
+      field:
+        | "membershipPredicates"
+        | "rankingObjectives"
+        | "orderingPolicy"
+        | "playlistQuotaRules"
+        | "playlistQualityPolicy";
+      consumerId: string;
+      receiptHash: string;
+    } | null;
+    simulationReceiptHash: string;
     valid: true;
+  };
+  /**
+   * A server-owned action offered only by a V5 execution decision after the
+   * musical contract is already saturated or the bounded guidance lineage is
+   * exhausted. It is deliberately disjoint from `contractPatch`: selecting
+   * one of these options must be handled by the brief state machine and can
+   * never be compiled as executable playlist semantics.
+   */
+  executionAction?: {
+    kind:
+      | "execute_confirmed_contract"
+      | "review_interpretation"
+      | "cancel_request";
+    startsResearch: boolean;
   };
   /**
    * Machine-readable effect of selecting this answer. Optional only so runs
@@ -1375,6 +1501,10 @@ export interface PlaylistGuidanceQuestion {
   simulationPolicyVersion?: string;
   capabilitySnapshotHash?: string;
   semanticConfigurationHash?: string;
+  /** Capability-bound registry used to prove each option has a live consumer. */
+  consumerRegistryHash?: string;
+  /** Rollout cohort preserved by the base contract and every option. */
+  rolloutGroup?: string;
   /** Present for a custom-answer confirmation successor question. */
   interpretationSummary?: {
     mustHave: readonly string[];
@@ -1440,7 +1570,8 @@ export interface PlaylistGuidanceQuestionSetContract {
   checkpointMode?:
     | "correctness_blocking"
     | "nuance_optional"
-    | "interpretation_confirmation";
+    | "interpretation_confirmation"
+    | "execution_decision";
   confirmationKind?: "unresolved_review";
   interpretationSummary?: {
     mustHave: readonly string[];
@@ -1801,6 +1932,9 @@ export interface ResearchRunView {
   guidanceAction?: RunGuidanceActionView | null;
   explore?: ExplorePreferenceView | null;
   resolution?: RunResolutionView;
+  repairReplayAction?: RunRepairReplayActionView | null;
+  executionRouteReceipt?: RunExecutionRouteReceiptView | null;
+  evidenceCoverage?: RunEvidenceCoverageView;
 }
 
 /** Public-safe, hash-bound action required before publishing an underfilled manifest. */
@@ -1855,6 +1989,9 @@ export interface PublicResearchRunView {
   guidanceAction?: RunGuidanceActionView | null;
   explore?: ExplorePreferenceView | null;
   resolution?: RunResolutionView;
+  repairReplayAction?: RunRepairReplayActionView | null;
+  executionRouteReceipt?: RunExecutionRouteReceiptView | null;
+  evidenceCoverage?: RunEvidenceCoverageView;
   createdAt?: string;
   updatedAt?: string;
   completedAt?: string | null;
@@ -1875,6 +2012,7 @@ export interface PublicBriefStatusView {
     | "correctness_blocking"
     | "nuance_optional"
     | "interpretation_confirmation"
+    | "execution_decision"
     | null;
   confirmationKind?: "unresolved_review" | null;
   interpretationSummary?: {
@@ -1884,10 +2022,29 @@ export interface PublicBriefStatusView {
     flow: readonly string[];
     count: number;
   } | null;
+  executionAction?: BriefGuidanceExecutionActionView | null;
   brief?: PlaylistBrief;
   questions: PlaylistGuidanceQuestion[];
   answers?: PlaylistGuidanceAnswer[];
   error?: string;
+}
+
+/**
+ * Hash-bound result of the saturated-contract execution decision.
+ *
+ * This is deliberately distinct from an executable contract patch: review and
+ * cancel are durable no-work outcomes, while only execute_confirmed_contract
+ * may advance the brief to research admission.
+ */
+export interface BriefGuidanceExecutionActionView {
+  decisionHash: string;
+  optionId: string;
+  kind:
+    | "execute_confirmed_contract"
+    | "review_interpretation"
+    | "cancel_request";
+  startsResearch: boolean;
+  actionHash: string;
 }
 
 export interface RunResultView {
