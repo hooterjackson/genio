@@ -5926,7 +5926,7 @@ export class Repository {
                 )
                 FROM research_checkpoints consumption
                 WHERE consumption.run_id=run.id
-                  AND consumption.phase=$5
+                  AND consumption.phase=$6
               ),'[]'::jsonb) existing_consumptions,
               COALESCE((
                 SELECT value='true' FROM settings
